@@ -156,13 +156,20 @@ class ProjectState:
     def _get_connection(self) -> sqlite3.Connection:
         """
         Get or create database connection.
-        
+
         Returns:
             SQLite connection object.
+
+        Note:
+            Uses check_same_thread=False to allow connections to be used
+            across threads (e.g., in Flask's threaded request handlers).
+            This is safe because SQLite handles its own locking.
         """
-        # TODO: Implement connection management
         if self.connection is None:
-            self.connection = sqlite3.connect(str(self.db_path))
+            self.connection = sqlite3.connect(
+                str(self.db_path),
+                check_same_thread=False
+            )
             self.connection.row_factory = sqlite3.Row
         return self.connection
 
