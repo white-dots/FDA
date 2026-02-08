@@ -10,27 +10,82 @@ The FDA System consists of three specialized AI agents:
 2. **Executor Agent** - Task execution, delivery tracking, and blocker management
 3. **Librarian Agent** - Knowledge management, reporting, and organizational memory
 
+Plus integrations for:
+- **Telegram** - Bot for queries and proactive notifications
+- **Discord** - Voice channel participation with speech-to-text and text-to-speech
+- **Office 365** - Calendar integration via device code login
+
 ## Quick Start
 
 ### Installation
 
 ```bash
-# Clone and install in development mode
-cd /path/to/fda-system
+# Clone the repository
+git clone https://github.com/white-dots/FDA.git
+cd FDA
+
+# Create virtual environment (recommended)
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+# Install the package
 pip install -e .
+
+# Install optional dependencies for communication features
+pip install -e ".[all]"  # Everything
+# Or individually:
+pip install -e ".[telegram]"  # Telegram bot
+pip install -e ".[discord]"   # Discord voice bot
+pip install -e ".[web]"       # Web setup UI
+```
+
+### Web-Based Setup (Recommended)
+
+The easiest way to configure FDA is through the web interface:
+
+```bash
+# Start the setup server
+fda setup
+
+# Then open http://localhost:9999 in your browser
+```
+
+The web UI lets you:
+- Configure all API tokens (Anthropic, Telegram, Discord, OpenAI)
+- Test connections
+- Generate Discord bot invite links
+- View system health status
+
+### CLI Setup (Alternative)
+
+```bash
+# Set your Anthropic API key
+export ANTHROPIC_API_KEY=sk-ant-...
+
+# Initialize a new project
+fda init /path/to/project
+
+# Configure Telegram (interactive)
+fda telegram setup
+
+# Configure Discord (interactive)
+fda discord setup
+
+# Connect Office 365 calendar
+fda calendar login
 ```
 
 ### Basic Usage
 
 ```bash
-# Initialize a new project
-fda init /path/to/project
-
 # Start the system
 fda start --daemon
 
 # Ask the FDA agent
 fda ask "What are our current blockers?"
+
+# Show project status
+fda status
 
 # Prepare for a meeting
 fda meeting-prep --id event_12345
@@ -42,6 +97,52 @@ fda report daily
 fda journal search "kubernetes deployment"
 ```
 
+### Start Communication Bots
+
+```bash
+# Start Telegram bot (run in separate terminal)
+fda telegram start
+
+# Start Discord bot (run in separate terminal)
+fda discord start
+
+# Get Discord bot invite link
+fda discord invite
+```
+
+## VM Deployment
+
+For deploying FDA on a virtual machine:
+
+```bash
+# 1. SSH into your VM
+ssh user@your-vm-ip
+
+# 2. Install Python 3.9+
+sudo apt update && sudo apt install python3.9 python3.9-venv python3-pip
+
+# 3. Clone and install
+git clone https://github.com/white-dots/FDA.git
+cd FDA
+python3.9 -m venv venv
+source venv/bin/activate
+pip install -e ".[all]"
+
+# 4. Start the web setup (accessible from your browser)
+fda setup --host 0.0.0.0 --port 9999
+
+# 5. Open http://your-vm-ip:9999 to configure
+
+# 6. Start the bots (use screen/tmux for persistence)
+screen -S telegram
+fda telegram start
+# Ctrl+A, D to detach
+
+screen -S discord
+fda discord start
+# Ctrl+A, D to detach
+```
+
 ## Architecture
 
 ### Package Structure
@@ -51,40 +152,30 @@ fda/
 ├── __init__.py              # Package exports
 ├── config.py                # Global configuration and constants
 ├── cli.py                   # Command-line interface
-├── fda_agent.py            # FDA agent implementation
-├── executor_agent.py       # Executor agent implementation
-├── librarian_agent.py      # Librarian agent implementation
-├── scheduler.py            # Event and task scheduling
-├── outlook.py              # Microsoft Outlook calendar integration
-├── comms/                  # Inter-agent communication
-│   ├── __init__.py
-│   └── message_bus.py      # File-based message bus with locking
-├── data/                   # Data source adapters
-│   ├── __init__.py
-│   ├── base.py            # Abstract DataAdapter
-│   ├── api_adapter.py     # REST API adapter
-│   ├── excel_adapter.py   # Excel/CSV file adapter
-│   └── db_adapter.py      # Database adapter (week 2)
-├── journal/               # Project knowledge management
-│   ├── __init__.py
-│   ├── writer.py          # Markdown entry writing
-│   ├── index.py           # Entry indexing and search
-│   └── retriever.py       # Two-pass retrieval with decay
-└── state/                 # Project state management
-    ├── __init__.py
-    └── project_state.py   # SQLite state persistence
+├── setup_server.py          # Web-based setup UI (port 9999)
+├── base_agent.py            # Base class for all agents
+├── fda_agent.py             # FDA agent implementation
+├── executor_agent.py        # Executor agent implementation
+├── librarian_agent.py       # Librarian agent implementation
+├── telegram_bot.py          # Telegram bot integration
+├── discord_bot.py           # Discord voice bot integration
+├── scheduler.py             # Event and task scheduling
+├── outlook.py               # Microsoft Outlook calendar integration
+├── comms/                   # Inter-agent communication
+│   └── message_bus.py       # File-based message bus with locking
+├── data/                    # Data source adapters
+│   ├── api_adapter.py       # REST API adapter
+│   ├── excel_adapter.py     # Excel/CSV file adapter
+│   └── db_adapter.py        # Database adapter
+├── journal/                 # Project knowledge management
+│   ├── writer.py            # Markdown entry writing
+│   ├── index.py             # Entry indexing and search
+│   └── retriever.py         # Two-pass retrieval with decay
+└── state/                   # Project state management
+    └── project_state.py     # SQLite state persistence
 ```
 
 ## Core Components
-
-### Configuration (config.py)
-
-Centralized configuration with typed constants:
-
-- **Models**: Claude Opus 4.5 for FDA, Claude 3.5 Sonnet for other agents
-- **Paths**: Project root, journal directory, state database
-- **Defaults**: Check intervals, meeting prep timing, retrieval settings
-- **Decay Rates**: Relevance scoring weights (fast/medium/slow)
 
 ### Agents
 
@@ -112,7 +203,24 @@ Knowledge organization and reporting.
 - `generate_meeting_brief(event)` - Generate meeting materials
 - `write_journal_entry(entry)` - Write markdown with frontmatter
 - `update_index()` - Maintain searchable index
-- `alert_fda(message)` - Send alerts to FDA
+
+### Communication Integrations
+
+#### Telegram Bot
+- `/start` - Register for notifications
+- `/ask <question>` - Ask FDA about the project
+- `/status` - Get project status
+- `/tasks` - List current tasks
+- `/alerts` - Show unacknowledged alerts
+- Proactive alert notifications to registered users
+
+#### Discord Voice Bot
+- `!join` - Join your voice channel
+- `!leave` - Leave voice channel
+- `!ask <question>` - Ask FDA (responds in voice)
+- `!status` - Show project status
+- `!say <text>` - Speak text in voice channel
+- Automatic session transcripts logged to journal
 
 ### Data Adapters
 
@@ -120,21 +228,9 @@ Pluggable adapters for data sources:
 
 - **APIAdapter** - REST API integration with configurable endpoints
 - **ExcelAdapter** - Excel/CSV file watching and reading with pandas
-- **DBAdapter** - Database connectivity (week 2)
+- **DBAdapter** - Database connectivity
 
-All adapters implement the `DataAdapter` abstract base class with:
-- `test_connection()` - Validate data source access
-- `pull_latest(metric)` - Fetch latest metrics
-- `get_schema()` - Describe available data
-
-### Communication (message_bus.py)
-
-File-based inter-agent message bus:
-- **Persistence**: JSON-based with atomic file locking (fcntl)
-- **Features**: Priority levels (low/medium/high), message types, threading
-- **Methods**: `send()`, `get_pending()`, `mark_read()`, `get_thread()`
-
-### State Management (project_state.py)
+### State Management
 
 SQLite-based persistent state with tables for:
 - **context** - Key-value project configuration
@@ -143,157 +239,125 @@ SQLite-based persistent state with tables for:
 - **alerts** - System alerts and notifications
 - **decisions** - Recorded decisions with rationale
 - **meeting_prep** - Meeting preparation records
+- **telegram_users** - Registered Telegram users
+- **discord_sessions** - Voice session history
 
 ### Journal System
 
-Markdown-based project knowledge repository:
-
-**Writer**: Creates entries with YAML frontmatter
-- Automatic filename generation from timestamps
+Markdown-based project knowledge repository with:
+- Automatic YAML frontmatter generation
 - Tag-based organization
-- Relevance decay settings
-
-**Index**: JSON-based searchable index
-- Full-text search support
-- Tag filtering
-- Date range queries
-
-**Retriever**: Two-pass ranked retrieval
-- Pass 1: Filter by tags and keywords
-- Pass 2: Score using (0.6 × relevance + 0.4 × recency)
+- Two-pass ranked retrieval (relevance + recency scoring)
 - Exponential decay for aging entries
-
-### Scheduling (scheduler.py)
-
-Threading-based event scheduler:
-- Daily checkin at specified times
-- Periodic calendar monitoring
-- Generic task registration
-- Graceful shutdown with timer cancellation
-
-### Calendar Integration (outlook.py)
-
-Microsoft Outlook calendar via Graph API:
-- OAuth authentication (MSAL)
-- Event retrieval and filtering
-- Meeting time extraction
-- Integration with meeting preparation
 
 ## Command-Line Interface
 
-Comprehensive CLI with subcommands:
-
 ```bash
-# Project initialization
-fda init <path>
-
-# System control
-fda start [--daemon]
+# Project management
+fda init <path>              # Initialize project
+fda start [--daemon]         # Start system
+fda status                   # Show status
+fda config                   # Show configuration
 
 # Interaction
-fda ask <question>
-
-# Monitoring
-fda status
-
-# Meeting management
-fda meeting-prep --id <event_id>
-
-# Reporting
+fda ask <question>           # Ask FDA
+fda meeting-prep --id <id>   # Prepare for meeting
 fda report {daily|weekly|monthly|project}
 
-# Knowledge management
-fda journal search <query>
+# Task management
+fda task add <title> --owner <name>
+fda task list [--status pending|in_progress|completed|blocked]
+fda task update <id> --status <status>
 
-# Configuration
-fda config
+# Journal
+fda journal search <query>
+fda journal write --author <name> --tags <tags> --summary <text> --content <text>
+
+# Telegram
+fda telegram setup           # Configure bot token
+fda telegram status          # Show bot status
+fda telegram start           # Start bot
+fda telegram test            # Send test message
+
+# Discord
+fda discord setup            # Configure bot token
+fda discord status           # Show bot status
+fda discord start            # Start bot
+fda discord invite           # Get invite link
+
+# Calendar
+fda calendar login           # Log in to Office 365
+fda calendar logout          # Log out
+fda calendar status          # Check connection
+fda calendar today           # Show today's events
+fda calendar upcoming        # Show upcoming events
+
+# Setup
+fda setup [--port 9999]      # Start web setup UI
 ```
 
-## Implementation Notes
+## Dependencies
 
-### Type Hints
-All functions use Python 3.9+ type annotations with proper imports.
-
-### Docstrings
-Comprehensive docstrings for modules, classes, and all public methods.
-
-### Error Handling
-Placeholder implementations raise `NotImplementedError` with TODO comments.
-
-### Dependencies
-
+### Core
 - **anthropic** - Claude API client
-- **pandas** - Data manipulation and analysis
+- **pandas** - Data manipulation
 - **openpyxl** - Excel file handling
 - **msal** - Microsoft authentication
 - **requests** - HTTP library
 
+### Optional
+- **python-telegram-bot** - Telegram integration
+- **discord.py[voice]** - Discord integration
+- **openai** - Whisper STT and TTS for voice
+- **pynacl** - Voice encryption for Discord
+- **flask** - Web setup UI
+
+Install with:
+```bash
+pip install -e ".[all]"  # Everything
+pip install -e ".[telegram]"  # Just Telegram
+pip install -e ".[discord]"  # Just Discord
+pip install -e ".[web]"  # Just web UI
+```
+
+## Configuration
+
+### Environment Variables
+
+```bash
+# Required
+ANTHROPIC_API_KEY=sk-ant-...
+
+# Telegram (optional - can use fda telegram setup instead)
+TELEGRAM_BOT_TOKEN=123456789:ABCDefGHI...
+
+# Discord (optional - can use fda discord setup instead)
+DISCORD_BOT_TOKEN=your_discord_bot_token
+DISCORD_CLIENT_ID=your_client_id
+
+# OpenAI for voice features (optional)
+OPENAI_API_KEY=sk-...
+```
+
+### Model Configuration
+
+Defined in `fda/config.py`:
+- `MODEL_FDA`: Claude Opus 4.5 for FDA agent
+- `MODEL_EXECUTOR`: Claude 3.5 Sonnet for executor
+- `MODEL_LIBRARIAN`: Claude 3.5 Sonnet for librarian
+
 ## Development
 
-### File Locations
-
-All files are located at:
-```
-/sessions/kind-optimistic-bell/mnt/jaeheukjung/Documents/agenthub/fda-system/
-```
-
-### Key Files by Purpose
-
-| File | Purpose |
-|------|---------|
-| `pyproject.toml` | Package metadata and dependencies |
-| `fda/config.py` | Constants and configuration |
-| `fda/cli.py` | Command-line interface |
-| `fda/state/project_state.py` | Persistent state storage |
-| `fda/journal/` | Knowledge management |
-| `fda/data/` | Data source integration |
-| `fda/comms/message_bus.py` | Inter-agent communication |
-
-### Documentation
-
-- **SCAFFOLD_SUMMARY.md** - Detailed component overview
-- **IMPLEMENTATION_EXAMPLES.md** - Code patterns and implementation samples
-- **README.md** - This file
-
-## Next Steps
-
-### Week 1
-- Implement core agent loops
-- Set up database schema and state management
-- Create basic task queue
-
-### Week 2
-- Implement database adapter
-- Add full Claude API integration
-- Build scheduler functionality
-
-### Week 3
-- Implement all agent methods
-- Add Outlook calendar integration
-- Build comprehensive tests
-
-### Testing
 ```bash
 # Install dev dependencies
 pip install -e ".[dev]"
 
-# Run tests (once implemented)
+# Run tests
 pytest
 
 # Check code quality
 black . && ruff check .
 ```
-
-## Configuration
-
-Environment variables and defaults are defined in `fda/config.py`. Key settings:
-
-- `MODEL_FDA`: Claude model for FDA agent (Opus 4.5)
-- `MODEL_EXECUTOR`: Claude model for executor (Sonnet 3.5)
-- `MODEL_LIBRARIAN`: Claude model for librarian (Sonnet 3.5)
-- `DEFAULT_DAILY_CHECKIN_TIME`: "09:00" (9 AM)
-- `DEFAULT_CHECK_INTERVAL_MINUTES`: 15
-- `DEFAULT_MEETING_PREP_LEAD_TIME_MINUTES`: 30
 
 ## License
 
@@ -301,7 +365,5 @@ Proprietary - Jae Heuk Jung
 
 ## Support
 
-For implementation questions, refer to:
-1. **SCAFFOLD_SUMMARY.md** - Architecture overview
-2. **IMPLEMENTATION_EXAMPLES.md** - Code patterns
-3. Class docstrings in source files
+- GitHub Issues: https://github.com/white-dots/FDA/issues
+- Documentation files: `SCAFFOLD_SUMMARY.md`, `IMPLEMENTATION_EXAMPLES.md`
