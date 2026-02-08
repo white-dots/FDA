@@ -577,8 +577,24 @@ SETUP_PAGE_HTML = """
             resultDiv.className = 'test-result';
             resultDiv.textContent = 'Testing...';
 
+            // Get the current value from the input field
+            let body = {};
+            if (service === 'anthropic') {
+                body.key = document.getElementById('anthropic-key').value;
+            } else if (service === 'telegram') {
+                body.token = document.getElementById('telegram-token').value;
+            } else if (service === 'discord') {
+                body.token = document.getElementById('discord-token').value;
+            } else if (service === 'openai') {
+                body.key = document.getElementById('openai-key').value;
+            }
+
             try {
-                const response = await fetch(`/api/test/${service}`);
+                const response = await fetch(`/api/test/${service}`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(body)
+                });
                 const result = await response.json();
 
                 if (result.success) {
@@ -783,10 +799,18 @@ def create_setup_app() -> Any:
         state.set_context("openai_api_key", key)
         return jsonify({"success": True, "message": "OpenAI API key saved"})
 
-    @app.route("/api/test/anthropic")
+    @app.route("/api/test/anthropic", methods=["GET", "POST"])
     def test_anthropic():
         """Test Anthropic API connection."""
-        key = os.environ.get(ANTHROPIC_API_KEY_ENV) or state.get_context("anthropic_api_key")
+        # Accept key from POST body, query param, or use stored value
+        if request.method == "POST":
+            data = request.get_json() or {}
+            key = data.get("key")
+        else:
+            key = request.args.get("key")
+
+        if not key:
+            key = os.environ.get(ANTHROPIC_API_KEY_ENV) or state.get_context("anthropic_api_key")
 
         if not key:
             return jsonify({"success": False, "error": "API key not configured"})
@@ -794,7 +818,7 @@ def create_setup_app() -> Any:
         try:
             import anthropic
             client = anthropic.Anthropic(api_key=key)
-            # Simple test - list models or make minimal request
+            # Simple test - make minimal request
             response = client.messages.create(
                 model="claude-3-haiku-20240307",
                 max_tokens=10,
@@ -804,10 +828,17 @@ def create_setup_app() -> Any:
         except Exception as e:
             return jsonify({"success": False, "error": str(e)})
 
-    @app.route("/api/test/telegram")
+    @app.route("/api/test/telegram", methods=["GET", "POST"])
     def test_telegram():
         """Test Telegram bot connection."""
-        token = os.environ.get(TELEGRAM_BOT_TOKEN_ENV) or state.get_context("telegram_bot_token")
+        if request.method == "POST":
+            data = request.get_json() or {}
+            token = data.get("token")
+        else:
+            token = request.args.get("token")
+
+        if not token:
+            token = os.environ.get(TELEGRAM_BOT_TOKEN_ENV) or state.get_context("telegram_bot_token")
 
         if not token:
             return jsonify({"success": False, "error": "Bot token not configured"})
@@ -834,10 +865,17 @@ def create_setup_app() -> Any:
         except Exception as e:
             return jsonify({"success": False, "error": str(e)})
 
-    @app.route("/api/test/discord")
+    @app.route("/api/test/discord", methods=["GET", "POST"])
     def test_discord():
         """Test Discord bot connection."""
-        token = os.environ.get(DISCORD_BOT_TOKEN_ENV) or state.get_context("discord_bot_token")
+        if request.method == "POST":
+            data = request.get_json() or {}
+            token = data.get("token")
+        else:
+            token = request.args.get("token")
+
+        if not token:
+            token = os.environ.get(DISCORD_BOT_TOKEN_ENV) or state.get_context("discord_bot_token")
 
         if not token:
             return jsonify({"success": False, "error": "Bot token not configured"})
@@ -865,10 +903,17 @@ def create_setup_app() -> Any:
         except Exception as e:
             return jsonify({"success": False, "error": str(e)})
 
-    @app.route("/api/test/openai")
+    @app.route("/api/test/openai", methods=["GET", "POST"])
     def test_openai():
         """Test OpenAI API connection."""
-        key = os.environ.get(OPENAI_API_KEY_ENV) or state.get_context("openai_api_key")
+        if request.method == "POST":
+            data = request.get_json() or {}
+            key = data.get("key")
+        else:
+            key = request.args.get("key")
+
+        if not key:
+            key = os.environ.get(OPENAI_API_KEY_ENV) or state.get_context("openai_api_key")
 
         if not key:
             return jsonify({"success": False, "error": "API key not configured"})
