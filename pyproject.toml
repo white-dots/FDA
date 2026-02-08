@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fda-system"
+version = "0.1.0"
+description = "FDA Multi-Agent System for Project Coordination"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "anthropic>=0.7.0",
+    "pandas>=1.5.0",
+    "openpyxl>=3.9.0",
+    "msal>=1.20.0",
+    "requests>=2.28.0",
+]
+
+[project.scripts]
+fda = "fda.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "black>=23.0",
+    "ruff>=0.0.250",
+]
+telegram = [
+    "python-telegram-bot>=22.0",
+]
+discord = [
+    "discord.py[voice]>=2.0",
+    "pynacl>=1.5.0",
+    "openai>=1.0",
+]
+comms = [
+    "python-telegram-bot>=22.0",
+    "discord.py[voice]>=2.0",
+    "pynacl>=1.5.0",
+    "openai>=1.0",
+]
+web = [
+    "flask>=2.3.0",
+]
+all = [
+    "python-telegram-bot>=22.0",
+    "discord.py[voice]>=2.0",
+    "pynacl>=1.5.0",
+    "openai>=1.0",
+    "flask>=2.3.0",
+]
