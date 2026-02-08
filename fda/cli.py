@@ -104,24 +104,22 @@ def handle_start(args: argparse.Namespace) -> int:
 
 def handle_ask(args: argparse.Namespace) -> int:
     """Ask the FDA agent a question."""
+    from fda.fda_agent import FDAAgent
+
     print(f"Question: {args.question}")
     print()
-    print("Note: FDA agent Claude API integration pending (Week 3).")
-    print("The agent will use context from:")
 
-    # Show available context
-    state = ProjectState()
-    tasks = state.get_tasks()
-    print(f"  - {len(tasks)} tasks in project state")
-
-    retriever = JournalRetriever()
-    entries = retriever.retrieve(query_text=args.question, top_n=3)
-    print(f"  - {len(entries)} relevant journal entries found")
-
-    for entry in entries:
-        print(f"    - {entry.get('summary', 'Untitled')} (score: {entry.get('combined_score', 0):.2f})")
-
-    return 0
+    try:
+        agent = FDAAgent()
+        response = agent.ask(args.question)
+        print("FDA Response:")
+        print("-" * 50)
+        print(response)
+        print("-" * 50)
+        return 0
+    except Exception as e:
+        print(f"Error: {e}")
+        return 1
 
 
 def handle_status(args: argparse.Namespace) -> int:

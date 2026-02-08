@@ -13,11 +13,13 @@ from datetime import datetime
 
 from anthropic import Anthropic
 
+import os
+
 from fda.state.project_state import ProjectState
 from fda.comms.message_bus import MessageBus
 from fda.journal.writer import JournalWriter
 from fda.journal.retriever import JournalRetriever
-from fda.config import STATE_DB_PATH, MESSAGE_BUS_PATH, JOURNAL_DIR
+from fda.config import STATE_DB_PATH, MESSAGE_BUS_PATH, JOURNAL_DIR, ANTHROPIC_API_KEY_ENV
 
 logger = logging.getLogger(__name__)
 
@@ -50,11 +52,17 @@ class BaseAgent(ABC):
         self.model = model
         self.system_prompt = system_prompt
 
-        # Initialize Anthropic client
-        self.client = Anthropic()
-
-        # Initialize shared components
+        # Initialize shared components first (needed to get API key from DB)
         self.state = ProjectState(project_state_path or STATE_DB_PATH)
+
+        # Initialize Anthropic client with API key from env or database
+        api_key = os.environ.get(ANTHROPIC_API_KEY_ENV) or self.state.get_context("anthropic_api_key")
+        if not api_key:
+            raise ValueError(
+                "Anthropic API key not found. Set ANTHROPIC_API_KEY environment variable "
+                "or configure via 'fda setup' web interface."
+            )
+        self.client = Anthropic(api_key=api_key)
         self.message_bus = MessageBus(MESSAGE_BUS_PATH)
         self.journal_writer = JournalWriter(JOURNAL_DIR)
         self.journal_retriever = JournalRetriever(JOURNAL_DIR)
