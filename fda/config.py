@@ -51,6 +51,9 @@ DISCORD_CLIENT_ID_ENV: Final[str] = "DISCORD_CLIENT_ID"
 # OpenAI configuration (for Whisper STT and TTS)
 OPENAI_API_KEY_ENV: Final[str] = "OPENAI_API_KEY"
 
+# Anthropic configuration
+ANTHROPIC_API_KEY_ENV: Final[str] = "ANTHROPIC_API_KEY"
+
 # Logging
 LOG_DIR: Final[Path] = PROJECT_ROOT / "logs"
 LOG_LEVEL: Final[str] = "INFO"
