@@ -17,26 +17,89 @@ Plus integrations for:
 
 ## Quick Start
 
-### Installation
+### One-Line Installation
+
+**macOS / Linux:**
+```bash
+curl -sSL https://raw.githubusercontent.com/white-dots/FDA/main/install.sh | bash
+```
+
+**Windows (PowerShell):**
+```powershell
+irm https://raw.githubusercontent.com/white-dots/FDA/main/install.ps1 | iex
+```
+
+### Manual Installation
+
+<details>
+<summary><b>macOS</b></summary>
 
 ```bash
-# Clone the repository
+# Install Python 3.12 (if not installed)
+brew install python@3.12
+
+# Clone and install
 git clone https://github.com/white-dots/FDA.git
 cd FDA
+python3.12 -m venv venv
+source venv/bin/activate
+pip install -e ".[all]"
 
-# Create virtual environment (recommended)
+# Start setup
+fda setup
+```
+</details>
+
+<details>
+<summary><b>Windows</b></summary>
+
+1. Install Python 3.12 from [python.org](https://www.python.org/downloads/)
+   - **Important:** Check "Add Python to PATH" during installation
+
+2. Install Git from [git-scm.com](https://git-scm.com/download/win)
+
+3. Open PowerShell and run:
+```powershell
+git clone https://github.com/white-dots/FDA.git
+cd FDA
 python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+.\venv\Scripts\Activate.ps1
+pip install -e ".[all]"
 
-# Install the package
-pip install -e .
+# Start setup
+fda setup
+```
+</details>
 
-# Install optional dependencies for communication features
-pip install -e ".[all]"  # Everything
-# Or individually:
-pip install -e ".[telegram]"  # Telegram bot
-pip install -e ".[discord]"   # Discord voice bot
-pip install -e ".[web]"       # Web setup UI
+<details>
+<summary><b>Linux (Ubuntu/Debian)</b></summary>
+
+```bash
+# Install Python 3.12
+sudo apt update
+sudo apt install software-properties-common
+sudo add-apt-repository ppa:deadsnakes/ppa
+sudo apt install python3.12 python3.12-venv python3.12-dev
+
+# Clone and install
+git clone https://github.com/white-dots/FDA.git
+cd FDA
+python3.12 -m venv venv
+source venv/bin/activate
+pip install -e ".[all]"
+
+# Start setup
+fda setup
+```
+</details>
+
+### Install Optional Features
+
+```bash
+pip install -e ".[all]"       # Everything
+pip install -e ".[telegram]"  # Telegram bot only
+pip install -e ".[discord]"   # Discord voice bot only
+pip install -e ".[web]"       # Web setup UI only
 ```
 
 ### Web-Based Setup (Recommended)
