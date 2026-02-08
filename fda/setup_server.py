@@ -708,6 +708,30 @@ def create_setup_app() -> Any:
     # Initialize state
     state = ProjectState()
 
+    # Global error handler to ensure JSON responses for API routes
+    @app.errorhandler(Exception)
+    def handle_exception(e):
+        """Return JSON for API errors."""
+        if request.path.startswith("/api/"):
+            logger.exception(f"API error: {e}")
+            return jsonify({"success": False, "error": str(e)}), 500
+        # For non-API routes, re-raise the exception
+        raise e
+
+    @app.errorhandler(404)
+    def handle_404(e):
+        """Return JSON for API 404 errors."""
+        if request.path.startswith("/api/"):
+            return jsonify({"success": False, "error": "Not found"}), 404
+        return "Not found", 404
+
+    @app.errorhandler(500)
+    def handle_500(e):
+        """Return JSON for API 500 errors."""
+        if request.path.startswith("/api/"):
+            return jsonify({"success": False, "error": "Internal server error"}), 500
+        return "Internal server error", 500
+
     @app.route("/")
     def index():
         """Serve the setup page."""
@@ -802,21 +826,25 @@ def create_setup_app() -> Any:
     @app.route("/api/test/anthropic", methods=["GET", "POST"])
     def test_anthropic():
         """Test Anthropic API connection."""
-        # Accept key from POST body, query param, or use stored value
-        if request.method == "POST":
-            data = request.get_json() or {}
-            key = data.get("key")
-        else:
-            key = request.args.get("key")
-
-        if not key:
-            key = os.environ.get(ANTHROPIC_API_KEY_ENV) or state.get_context("anthropic_api_key")
-
-        if not key:
-            return jsonify({"success": False, "error": "API key not configured"})
-
         try:
-            import anthropic
+            # Accept key from POST body, query param, or use stored value
+            if request.method == "POST":
+                data = request.get_json() or {}
+                key = data.get("key", "").strip() if data.get("key") else ""
+            else:
+                key = request.args.get("key", "").strip()
+
+            if not key:
+                key = os.environ.get(ANTHROPIC_API_KEY_ENV) or state.get_context("anthropic_api_key")
+
+            if not key:
+                return jsonify({"success": False, "error": "API key not configured"})
+
+            try:
+                import anthropic
+            except ImportError:
+                return jsonify({"success": False, "error": "anthropic package not installed. Run: pip install anthropic"})
+
             client = anthropic.Anthropic(api_key=key)
             # Simple test - make minimal request
             response = client.messages.create(
@@ -831,28 +859,28 @@ def create_setup_app() -> Any:
     @app.route("/api/test/telegram", methods=["GET", "POST"])
     def test_telegram():
         """Test Telegram bot connection."""
-        if request.method == "POST":
-            data = request.get_json() or {}
-            token = data.get("token")
-        else:
-            token = request.args.get("token")
-
-        if not token:
-            token = os.environ.get(TELEGRAM_BOT_TOKEN_ENV) or state.get_context("telegram_bot_token")
-
-        if not token:
-            return jsonify({"success": False, "error": "Bot token not configured"})
-
         try:
-            import requests
-            response = requests.get(
+            if request.method == "POST":
+                data = request.get_json() or {}
+                token = data.get("token", "").strip() if data.get("token") else ""
+            else:
+                token = request.args.get("token", "").strip()
+
+            if not token:
+                token = os.environ.get(TELEGRAM_BOT_TOKEN_ENV) or state.get_context("telegram_bot_token")
+
+            if not token:
+                return jsonify({"success": False, "error": "Bot token not configured"})
+
+            import requests as req
+            response = req.get(
                 f"https://api.telegram.org/bot{token}/getMe",
                 timeout=10
             )
-            data = response.json()
+            resp_data = response.json()
 
-            if data.get("ok"):
-                bot_name = data.get("result", {}).get("username", "Unknown")
+            if resp_data.get("ok"):
+                bot_name = resp_data.get("result", {}).get("username", "Unknown")
                 return jsonify({
                     "success": True,
                     "message": f"Connected as @{bot_name}"
@@ -860,7 +888,7 @@ def create_setup_app() -> Any:
             else:
                 return jsonify({
                     "success": False,
-                    "error": data.get("description", "Unknown error")
+                    "error": resp_data.get("description", "Unknown error")
                 })
         except Exception as e:
             return jsonify({"success": False, "error": str(e)})
@@ -868,29 +896,29 @@ def create_setup_app() -> Any:
     @app.route("/api/test/discord", methods=["GET", "POST"])
     def test_discord():
         """Test Discord bot connection."""
-        if request.method == "POST":
-            data = request.get_json() or {}
-            token = data.get("token")
-        else:
-            token = request.args.get("token")
-
-        if not token:
-            token = os.environ.get(DISCORD_BOT_TOKEN_ENV) or state.get_context("discord_bot_token")
-
-        if not token:
-            return jsonify({"success": False, "error": "Bot token not configured"})
-
         try:
-            import requests
-            response = requests.get(
+            if request.method == "POST":
+                data = request.get_json() or {}
+                token = data.get("token", "").strip() if data.get("token") else ""
+            else:
+                token = request.args.get("token", "").strip()
+
+            if not token:
+                token = os.environ.get(DISCORD_BOT_TOKEN_ENV) or state.get_context("discord_bot_token")
+
+            if not token:
+                return jsonify({"success": False, "error": "Bot token not configured"})
+
+            import requests as req
+            response = req.get(
                 "https://discord.com/api/v10/users/@me",
                 headers={"Authorization": f"Bot {token}"},
                 timeout=10
             )
 
             if response.status_code == 200:
-                data = response.json()
-                bot_name = data.get("username", "Unknown")
+                resp_data = response.json()
+                bot_name = resp_data.get("username", "Unknown")
                 return jsonify({
                     "success": True,
                     "message": f"Connected as {bot_name}"
@@ -906,20 +934,24 @@ def create_setup_app() -> Any:
     @app.route("/api/test/openai", methods=["GET", "POST"])
     def test_openai():
         """Test OpenAI API connection."""
-        if request.method == "POST":
-            data = request.get_json() or {}
-            key = data.get("key")
-        else:
-            key = request.args.get("key")
-
-        if not key:
-            key = os.environ.get(OPENAI_API_KEY_ENV) or state.get_context("openai_api_key")
-
-        if not key:
-            return jsonify({"success": False, "error": "API key not configured"})
-
         try:
-            from openai import OpenAI
+            if request.method == "POST":
+                data = request.get_json() or {}
+                key = data.get("key", "").strip() if data.get("key") else ""
+            else:
+                key = request.args.get("key", "").strip()
+
+            if not key:
+                key = os.environ.get(OPENAI_API_KEY_ENV) or state.get_context("openai_api_key")
+
+            if not key:
+                return jsonify({"success": False, "error": "API key not configured"})
+
+            try:
+                from openai import OpenAI
+            except ImportError:
+                return jsonify({"success": False, "error": "openai package not installed. Run: pip install openai"})
+
             client = OpenAI(api_key=key)
             # List models as a simple test
             models = client.models.list()
