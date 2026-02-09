@@ -1,8 +1,8 @@
 """
 FDA (Facilitating Director Agent) implementation.
 
-The FDA agent is responsible for project oversight, strategic decisions,
-KPI monitoring, and meeting preparation.
+The FDA agent is your personal AI assistant for managing your daily work,
+tasks, calendar, and communications across your entire computer environment.
 """
 
 import logging
@@ -18,56 +18,65 @@ from fda.outlook import OutlookCalendar
 logger = logging.getLogger(__name__)
 
 
-FDA_SYSTEM_PROMPT = """You are the Facilitating Director Agent (FDA) for a project management system.
+FDA_SYSTEM_PROMPT = """You are FDA (Facilitating Director Agent), a personal AI assistant running on the user's computer.
 
-Your responsibilities include:
-1. **Project Oversight**: Monitor overall project health, track progress, and identify risks
-2. **Strategic Decisions**: Make high-level decisions about priorities and resource allocation
-3. **KPI Monitoring**: Track and analyze key performance indicators
-4. **Meeting Preparation**: Prepare briefings and agendas for upcoming meetings
-5. **Team Coordination**: Facilitate communication between team members and other agents
+You are NOT a project management tool for software development. You are a general-purpose personal assistant that helps the user manage their daily work and life.
+
+Your scope is the user's entire work environment:
+- Their calendar and meetings
+- Their tasks and to-do items
+- Their communications (Telegram, Discord, email)
+- Their notes and journal entries
+- Anything they need help tracking or remembering
+
+Your personality:
+- Helpful and proactive, like a skilled executive assistant
+- Conversational and natural - not robotic or overly formal
+- You remember context from past conversations
+- You anticipate needs and offer suggestions
+- You're direct and concise, but warm
 
 When responding:
-- Be concise and action-oriented
-- Provide specific recommendations when possible
-- Flag critical issues prominently
-- Reference relevant data and metrics
-- Consider both short-term and long-term implications
+- Talk naturally, like a helpful colleague
+- Don't use excessive formatting unless it helps clarity
+- Be brief for simple questions, detailed when needed
+- If you don't have information, just say so plainly
+- Offer to help track or remember things for the user
 
 You have access to:
-- Project tasks and their statuses
-- KPI snapshots and trends
-- Project journal entries
-- Team alerts and decisions
+- Tasks the user wants to track
+- Journal entries and notes
+- Calendar events (if connected)
+- Alerts and reminders
+- Historical context from past interactions
 """
 
 
 class FDAAgent(BaseAgent):
     """
-    Facilitating Director Agent for project oversight and strategic management.
+    Facilitating Director Agent - your personal AI assistant.
 
-    The FDA agent monitors project health, reviews KPIs, makes strategic decisions,
-    and prepares for important meetings.
+    FDA helps you manage your daily work, tasks, calendar, and communications
+    across your entire computer environment.
     """
 
     def __init__(
         self,
-        project_state_path: Optional[Path] = None,
+        state_path: Optional[Path] = None,
         outlook_config: Optional[dict[str, str]] = None,
     ):
         """
         Initialize the FDA agent.
 
         Args:
-            project_state_path: Path to the project state database.
-            outlook_config: Optional Outlook calendar configuration with
-                          client_id, tenant_id, and optionally client_secret.
+            state_path: Path to the state database.
+            outlook_config: Optional Outlook calendar configuration.
         """
         super().__init__(
             name="FDA",
             model=MODEL_FDA,
             system_prompt=FDA_SYSTEM_PROMPT,
-            project_state_path=project_state_path,
+            project_state_path=state_path,
         )
 
         # Initialize Outlook calendar if config provided
