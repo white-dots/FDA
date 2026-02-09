@@ -266,6 +266,67 @@ class FDAAgent(BaseAgent):
         self.state.set_context("onboarded", True)
         self.state.set_context("onboarded_at", datetime.now().isoformat())
 
+        # Build the full interview transcript for the journal
+        interview_transcript = f"""# First Meeting with {responses['name']}
+
+**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M')}
+
+---
+
+## About {responses['name']}
+
+**What should I call you?**
+> {responses['name']}
+
+**What do you do?**
+> {responses['role']}
+
+**Tell me about your current work or situation:**
+> {responses['context']}
+
+---
+
+## Goals & Priorities
+
+**What are you trying to accomplish right now?**
+> {responses['goals']}
+
+**What's challenging or frustrating about your current workflow?**
+> {responses['challenges']}
+
+---
+
+## Tools & Data Sources
+
+- **Outlook/Office 365 calendar:** {'Yes' if responses['uses_outlook'] else 'No'}
+- **Important folders:** {responses['important_folders'] if responses['important_folders'] and responses['important_folders'].lower() != 'skip' else 'None specified'}
+- **Telegram notifications:** {'Yes' if responses['uses_telegram'] else 'No'}
+- **Discord integration:** {'Yes' if responses['uses_discord'] else 'No'}
+
+---
+
+## Preferences
+
+- **Daily check-in time:** {responses['check_in_time'] if responses['check_in_time'] and responses['check_in_time'].lower() != 'skip' else 'Not set'}
+- **Communication style:** {responses['communication_style']}
+
+---
+
+## Key Takeaways
+
+- {responses['name']} is a {responses['role']}
+- Main focus: {responses['goals'][:200] if len(responses['goals']) > 200 else responses['goals']}
+- Key challenge: {responses['challenges'][:200] if len(responses['challenges']) > 200 else responses['challenges']}
+"""
+
+        # Save the full interview as the first journal entry
+        self.log_to_journal(
+            summary=f"First meeting with {responses['name']} - Onboarding interview",
+            content=interview_transcript,
+            tags=["onboarding", "first-meeting", "user-profile"],
+            relevance_decay="slow",
+        )
+
         # Ask Claude to synthesize and create a personalized welcome
         synthesis_prompt = f"""Based on this onboarding information, create a brief personalized summary and suggest 2-3 immediate ways I can help.
 
@@ -283,14 +344,6 @@ User Info:
 Keep it warm and conversational. Don't use excessive formatting. End by asking what they'd like to tackle first."""
 
         welcome_response = self.chat(synthesis_prompt, include_history=False)
-
-        # Log the onboarding
-        self.log_to_journal(
-            summary=f"Onboarding completed for {responses['name']}",
-            content=f"## Onboarding Session\n\n**User:** {responses['name']} ({responses['role']})\n\n**Context:** {responses['context']}\n\n**Goals:** {responses['goals']}\n\n**Challenges:** {responses['challenges']}",
-            tags=["onboarding", "setup"],
-            relevance_decay="slow",
-        )
 
         print(welcome_response)
 
