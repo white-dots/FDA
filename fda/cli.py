@@ -102,20 +102,57 @@ def handle_start(args: argparse.Namespace) -> int:
     return 0
 
 
+def handle_onboard(args: argparse.Namespace) -> int:
+    """Run interactive onboarding."""
+    from fda.fda_agent import FDAAgent
+
+    try:
+        agent = FDAAgent()
+
+        # Check if already onboarded
+        if agent.is_onboarded() and not args.force:
+            print("You've already completed onboarding.")
+            user_name = agent.state.get_context("user_name") or "there"
+            print(f"Welcome back, {user_name}!")
+            print("\nTo redo onboarding, run: fda onboard --force")
+            print("To chat with me, run: fda ask \"<your question>\"")
+            return 0
+
+        agent.onboard_interactive()
+        return 0
+    except KeyboardInterrupt:
+        print("\n\nOnboarding cancelled. Run 'fda onboard' when you're ready.")
+        return 1
+    except Exception as e:
+        print(f"Error: {e}")
+        return 1
+
+
 def handle_ask(args: argparse.Namespace) -> int:
     """Ask the FDA agent a question."""
     from fda.fda_agent import FDAAgent
 
-    print(f"Question: {args.question}")
-    print()
-
     try:
         agent = FDAAgent()
+
+        # Check if onboarded, suggest it if not
+        if not agent.is_onboarded():
+            print("Hi! I notice we haven't been introduced yet.")
+            print("Run 'fda onboard' first so I can learn about you and how to help.")
+            print()
+            proceed = input("Or would you like to skip that and just ask your question? (y/n) > ").strip().lower()
+            if proceed not in ("y", "yes"):
+                return 0
+            print()
+
+        # Get user name for personalization
+        user_name = agent.state.get_context("user_name")
+
+        print(f"Question: {args.question}")
+        print()
+
         response = agent.ask(args.question)
-        print("FDA Response:")
-        print("-" * 50)
         print(response)
-        print("-" * 50)
         return 0
     except Exception as e:
         print(f"Error: {e}")
@@ -871,6 +908,18 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="Run in daemon mode",
     )
     start_parser.set_defaults(func=handle_start)
+
+    # onboard command - interactive setup
+    onboard_parser = subparsers.add_parser(
+        "onboard",
+        help="Interactive setup - FDA learns about you and your goals",
+    )
+    onboard_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Redo onboarding even if already completed",
+    )
+    onboard_parser.set_defaults(func=handle_onboard)
 
     # ask command
     ask_parser = subparsers.add_parser("ask", help="Ask the FDA agent a question")

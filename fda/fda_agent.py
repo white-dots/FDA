@@ -181,48 +181,147 @@ class FDAAgent(BaseAgent):
         except Exception as e:
             logger.error(f"[FDA] Error checking meetings: {e}")
 
-    def onboard(self) -> dict[str, Any]:
+    def onboard_interactive(self) -> dict[str, Any]:
         """
-        Onboard a new project with the FDA agent.
+        Interactive onboarding that asks the user questions to set up FDA.
 
-        Gathers project context, goals, and initial team information.
+        Asks about:
+        - Who the user is and what they do
+        - Their goals and priorities
+        - Where their data lives (calendars, task systems, files)
+        - Communication preferences
 
         Returns:
-            Dictionary containing onboarding results and project context.
+            Dictionary containing onboarding results.
         """
-        # Get any existing context
-        existing_context = self.state.get_context("project_info")
+        import os
+        from pathlib import Path
 
-        prompt = """Please help me onboard this project. I need to gather the following information:
+        print("\n" + "=" * 60)
+        print("Welcome to FDA - Your Personal AI Assistant")
+        print("=" * 60)
+        print("\nI'd like to get to know you and understand how I can help.")
+        print("Let's go through a few questions to set things up.\n")
 
-1. Project name and brief description
-2. Key objectives and success criteria
-3. Main stakeholders and their roles
-4. Current status and any existing work
-5. Key risks or concerns
+        # Gather information through questions
+        responses = {}
 
-Based on the information provided, create a structured project context that I can use for ongoing management.
+        # Question 1: About the user
+        print("-" * 40)
+        print("1. ABOUT YOU")
+        print("-" * 40)
+        responses["name"] = input("What should I call you? > ").strip()
+        responses["role"] = input("What do you do? (e.g., 'software engineer', 'product manager', 'entrepreneur') > ").strip()
+        responses["context"] = input("Tell me briefly about your current work or situation: > ").strip()
 
-If there's existing context, summarize what we know and identify any gaps."""
+        # Question 2: Goals
+        print("\n" + "-" * 40)
+        print("2. YOUR GOALS")
+        print("-" * 40)
+        responses["goals"] = input("What are you trying to accomplish right now? What are your priorities? > ").strip()
+        responses["challenges"] = input("What's challenging or frustrating about your current workflow? > ").strip()
 
-        if existing_context:
-            prompt += f"\n\nExisting project context:\n{existing_context}"
+        # Question 3: Data sources
+        print("\n" + "-" * 40)
+        print("3. YOUR DATA & TOOLS")
+        print("-" * 40)
+        print("Where do you keep your important information?")
+        print("(I can connect to calendars, read files, track tasks, etc.)")
+        print()
 
-        response = self.chat(prompt, include_history=True)
+        # Calendar
+        cal_response = input("Do you use Outlook/Office 365 calendar? (y/n) > ").strip().lower()
+        responses["uses_outlook"] = cal_response in ("y", "yes")
 
-        # Log the onboarding to journal
+        # Files/Documents
+        responses["important_folders"] = input("Any folders I should know about? (paths, comma-separated, or 'skip') > ").strip()
+
+        # Communication
+        print("\nFor notifications and quick questions:")
+        tg_response = input("Do you want to set up Telegram notifications? (y/n) > ").strip().lower()
+        responses["uses_telegram"] = tg_response in ("y", "yes")
+
+        discord_response = input("Do you want to set up Discord integration? (y/n) > ").strip().lower()
+        responses["uses_discord"] = discord_response in ("y", "yes")
+
+        # Question 4: Preferences
+        print("\n" + "-" * 40)
+        print("4. PREFERENCES")
+        print("-" * 40)
+        responses["check_in_time"] = input("What time should I do daily check-ins? (e.g., '9:00 AM' or 'skip') > ").strip()
+        responses["communication_style"] = input("How should I communicate? (brief/detailed/adaptive) > ").strip() or "adaptive"
+
+        # Now process with Claude to create a personalized setup
+        print("\n" + "=" * 60)
+        print("Setting up your personalized FDA assistant...")
+        print("=" * 60 + "\n")
+
+        # Store raw responses
+        self.state.set_context("user_name", responses["name"])
+        self.state.set_context("user_role", responses["role"])
+        self.state.set_context("user_context", responses["context"])
+        self.state.set_context("user_goals", responses["goals"])
+        self.state.set_context("user_challenges", responses["challenges"])
+        self.state.set_context("communication_style", responses["communication_style"])
+        self.state.set_context("onboarded", True)
+        self.state.set_context("onboarded_at", datetime.now().isoformat())
+
+        # Ask Claude to synthesize and create a personalized welcome
+        synthesis_prompt = f"""Based on this onboarding information, create a brief personalized summary and suggest 2-3 immediate ways I can help.
+
+User Info:
+- Name: {responses['name']}
+- Role: {responses['role']}
+- Context: {responses['context']}
+- Goals: {responses['goals']}
+- Challenges: {responses['challenges']}
+- Communication style preference: {responses['communication_style']}
+- Uses Outlook calendar: {responses['uses_outlook']}
+- Uses Telegram: {responses['uses_telegram']}
+- Uses Discord: {responses['uses_discord']}
+
+Keep it warm and conversational. Don't use excessive formatting. End by asking what they'd like to tackle first."""
+
+        welcome_response = self.chat(synthesis_prompt, include_history=False)
+
+        # Log the onboarding
         self.log_to_journal(
-            summary="Project onboarding completed",
-            content=f"## Onboarding Session\n\n{response}",
-            tags=["onboarding", "project-setup"],
+            summary=f"Onboarding completed for {responses['name']}",
+            content=f"## Onboarding Session\n\n**User:** {responses['name']} ({responses['role']})\n\n**Context:** {responses['context']}\n\n**Goals:** {responses['goals']}\n\n**Challenges:** {responses['challenges']}",
+            tags=["onboarding", "setup"],
             relevance_decay="slow",
         )
 
+        print(welcome_response)
+
+        # Provide next steps based on their choices
+        print("\n" + "-" * 40)
+        print("NEXT STEPS")
+        print("-" * 40)
+
+        if responses["uses_outlook"]:
+            print("- Run 'fda calendar login' to connect your Outlook calendar")
+
+        if responses["uses_telegram"]:
+            print("- Run 'fda telegram setup' to configure Telegram notifications")
+
+        if responses["uses_discord"]:
+            print("- Run 'fda discord setup' to configure Discord integration")
+
+        print("- Run 'fda ask \"<your question>\"' to chat with me anytime")
+        print("- Run 'fda task add \"<task>\"' to track something")
+        print()
+
         return {
             "status": "completed",
-            "response": response,
+            "responses": responses,
+            "welcome": welcome_response,
             "timestamp": datetime.now().isoformat(),
         }
+
+    def is_onboarded(self) -> bool:
+        """Check if the user has completed onboarding."""
+        return bool(self.state.get_context("onboarded"))
 
     def daily_checkin(self) -> dict[str, Any]:
         """
@@ -287,7 +386,7 @@ Be specific and actionable in your recommendations."""
 
     def ask(self, question: str) -> str:
         """
-        Ask the FDA agent a question about the project.
+        Ask the FDA agent a question.
 
         Args:
             question: The question to ask.
@@ -295,13 +394,27 @@ Be specific and actionable in your recommendations."""
         Returns:
             The FDA agent's response.
         """
-        # Get relevant context
-        context = self.get_project_context()
+        # Build context with user info if available
+        context = {}
+
+        # Add user context from onboarding
+        user_name = self.state.get_context("user_name")
+        if user_name:
+            context["user"] = {
+                "name": user_name,
+                "role": self.state.get_context("user_role"),
+                "goals": self.state.get_context("user_goals"),
+                "challenges": self.state.get_context("user_challenges"),
+            }
+
+        # Add task context
+        project_context = self.get_project_context()
+        context.update(project_context)
 
         # Search journal for relevant entries
         relevant_entries = self.search_journal(question, top_n=3)
         if relevant_entries:
-            context["relevant_journal_entries"] = [
+            context["relevant_notes"] = [
                 {
                     "summary": e.get("summary"),
                     "content": self.journal_retriever._read_entry_content(
