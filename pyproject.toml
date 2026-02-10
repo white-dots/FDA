@@ -14,10 +14,15 @@ dependencies = [
     "openpyxl>=3.0.0",
     "msal>=1.20.0",
     "requests>=2.28.0",
+    "pyyaml>=6.0",
 ]
 
 [project.scripts]
 fda = "fda.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["fda*"]
+exclude = ["journal*", "tests*"]
 
 [project.optional-dependencies]
 dev = [

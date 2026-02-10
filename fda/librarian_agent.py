@@ -1,60 +1,109 @@
 """
 Librarian Agent implementation.
 
-The Librarian agent manages knowledge artifacts, generates reports,
+The Librarian agent is a PEER agent that manages knowledge and discovery.
+It explores the file system, indexes documents, generates reports,
 and maintains the project journal.
+
+As a peer to FDA and Executor, it collaborates via the message bus
+without hierarchy - responding to requests and sharing discoveries.
 """
 
 import logging
 import time
+import subprocess
+import os
+import re
+import json
+import ast
 from pathlib import Path
 from typing import Any, Optional
 from datetime import datetime, timedelta
 
 from fda.base_agent import BaseAgent
-from fda.config import MODEL_LIBRARIAN, DEFAULT_CHECK_INTERVAL_MINUTES
+from fda.config import MODEL_LIBRARIAN, DEFAULT_CHECK_INTERVAL_MINUTES, PROJECT_ROOT
+from fda.comms.message_bus import MessageTypes, Agents
 
 logger = logging.getLogger(__name__)
 
 
-LIBRARIAN_SYSTEM_PROMPT = """You are the Librarian Agent for a project management system.
+LIBRARIAN_SYSTEM_PROMPT = """You are the Librarian Agent - a PEER in a multi-agent system.
 
-Your responsibilities include:
-1. **Knowledge Management**: Maintain and organize project documentation
-2. **Report Generation**: Create daily, weekly, and monthly reports
-3. **Meeting Briefs**: Prepare briefing materials for meetings
-4. **Journal Maintenance**: Keep the project journal organized and searchable
-5. **Information Retrieval**: Help find relevant historical information
+You work alongside FDA (user interface) and Executor (actions) as equals.
+No one bosses anyone - you collaborate through requests and shared knowledge.
 
-When generating content:
-- Be clear and well-organized
-- Use appropriate formatting (headers, lists, etc.)
-- Include relevant data and metrics
-- Highlight key insights and recommendations
-- Make content actionable where appropriate
+Your domain is KNOWLEDGE & DISCOVERY:
+1. **File System Exploration**: Use grep, find, ls to explore the computer
+2. **Indexing**: Track interesting files (docs, configs, code) in the file index
+3. **Knowledge Management**: Maintain and organize project documentation
+4. **Information Retrieval**: Help find files, patterns, and historical information
+5. **Report Generation**: Create reports when requested
 
-When responding:
-- Structure information logically
-- Prioritize the most important information first
-- Include supporting data when available
-- Cross-reference related entries when helpful
+You have access to the user's file system and can run shell commands to explore.
+When you discover something interesting, share it with your peers.
+
+When responding to search/knowledge requests:
+- Be thorough but concise
+- Include file paths and line numbers where relevant
+- Organize results logically
+- Suggest related searches if appropriate
+
+Remember: You're a helpful peer, not a subordinate. You can suggest actions
+and share discoveries proactively with FDA.
 """
 
 
 class LibrarianAgent(BaseAgent):
     """
-    Librarian Agent for knowledge management and report generation.
+    Librarian Agent for knowledge management and file exploration.
 
-    The Librarian agent maintains the project journal, generates reports,
-    creates meeting briefs, and manages the knowledge index.
+    As a PEER agent, the Librarian:
+    - Explores the file system using grep, find, ls
+    - Indexes documents, configs, and code files
+    - Manages the project journal
+    - Responds to knowledge requests from peers
+    - Shares discoveries proactively
     """
 
-    def __init__(self, project_state_path: Optional[Path] = None):
+    # File extensions of interest for indexing
+    INTERESTING_EXTENSIONS = [
+        "py", "js", "ts", "go", "rs", "java", "c", "cpp", "h",  # Code
+        "md", "txt", "rst", "adoc",                              # Docs
+        "json", "yaml", "yml", "toml", "ini", "cfg",            # Config
+        "sql", "sh", "bash", "zsh",                              # Scripts/DB
+        "html", "css", "scss",                                   # Web
+    ]
+
+    # Directories to skip during exploration
+    SKIP_DIRS = [
+        ".git", "node_modules", "__pycache__", ".venv", "venv",
+        ".idea", ".vscode", "dist", "build", ".cache", ".pytest_cache",
+        ".eggs", "*.egg-info", "site-packages", ".tox", ".mypy_cache",
+    ]
+
+    # Default exploration depth (deep enough to index most projects)
+    DEFAULT_EXPLORATION_DEPTH = 6
+
+    # Max files to index per extension (increase for thorough indexing)
+    MAX_FILES_PER_EXTENSION = 500
+
+    # Default folders to explore (relative to home directory)
+    DEFAULT_EXPLORATION_FOLDERS = ["Desktop", "Downloads", "Documents"]
+
+    def __init__(
+        self,
+        project_state_path: Optional[Path] = None,
+        exploration_roots: Optional[list[str]] = None,
+        exploration_depth: int = DEFAULT_EXPLORATION_DEPTH,
+    ):
         """
         Initialize the Librarian agent.
 
         Args:
             project_state_path: Path to the project state database.
+            exploration_roots: List of root paths for file system exploration.
+                              Defaults to ~/Desktop, ~/Downloads, ~/Documents.
+            exploration_depth: How deep to explore directories (default 6).
         """
         super().__init__(
             name="Librarian",
@@ -62,28 +111,100 @@ class LibrarianAgent(BaseAgent):
             system_prompt=LIBRARIAN_SYSTEM_PROMPT,
             project_state_path=project_state_path,
         )
+        # Use default folders if not specified
+        if exploration_roots:
+            self.exploration_roots = exploration_roots
+        else:
+            home = Path.home()
+            self.exploration_roots = [
+                str(home / folder)
+                for folder in self.DEFAULT_EXPLORATION_FOLDERS
+                if (home / folder).exists()
+            ]
+        self.exploration_depth = exploration_depth
+        self._exploration_complete = False
+        self._routing_complete = False
 
     def run_event_loop(self) -> None:
         """
         Run the main event loop for the Librarian.
 
-        Continuously processes requests for reports and journal updates.
+        As a peer agent:
+        1. On startup, explore the file system and index interesting files
+        2. Build a routing system (index functions, classes, endpoints)
+        3. Continuously process requests from peer agents
+        4. Share discoveries proactively
         """
         logger.info("[Librarian] Starting event loop...")
+        logger.info(f"[Librarian] Exploration roots: {self.exploration_roots}")
+        logger.info(f"[Librarian] Exploration depth: {self.exploration_depth}")
 
-        check_interval = DEFAULT_CHECK_INTERVAL_MINUTES * 60
+        # Update agent status
+        self.state.update_agent_status(self.name.lower(), "running", "Starting up")
+
+        # Run initial exploration if not done
+        if not self._exploration_complete:
+            self.state.update_agent_status(self.name.lower(), "exploring", "Initial file exploration")
+            try:
+                print(f"[Librarian] Starting file exploration...")
+                print(f"[Librarian] Folders to explore: {', '.join(self.exploration_roots)}")
+                print(f"[Librarian] This may take a while for depth {self.exploration_depth}...")
+
+                # Explore each root folder
+                total_stats = {"files_found": 0, "files_indexed": 0, "errors": 0}
+                for root in self.exploration_roots:
+                    if os.path.exists(root):
+                        print(f"[Librarian] Exploring: {root}")
+                        stats = self.explore_filesystem(root, max_depth=self.exploration_depth)
+                        total_stats["files_found"] += stats.get("files_found", 0)
+                        total_stats["files_indexed"] += stats.get("files_indexed", 0)
+                        total_stats["errors"] += stats.get("errors", 0)
+                    else:
+                        print(f"[Librarian] Skipping (not found): {root}")
+
+                self._exploration_complete = True
+                print(f"[Librarian] File exploration complete! Total: {total_stats['files_indexed']} files indexed")
+            except Exception as e:
+                logger.error(f"[Librarian] Exploration error: {e}")
+                print(f"[Librarian] Exploration error: {e}")
+
+        # Build routing system after file exploration
+        if not self._routing_complete and self._exploration_complete:
+            self.state.update_agent_status(self.name.lower(), "routing", "Building code routing system")
+            try:
+                print("[Librarian] Building code routing system...")
+                self.build_routing_system()
+                self._routing_complete = True
+                print("[Librarian] Routing system complete!")
+            except Exception as e:
+                logger.error(f"[Librarian] Routing system error: {e}")
+                print(f"[Librarian] Routing system error: {e}")
+
+        # Check for messages frequently (every 1 second) for responsive inter-agent comms
+        # Maintenance tasks run less frequently
+        message_check_interval = 1  # Check messages every 1 second
+        maintenance_interval = 300  # Run maintenance every 5 minutes
+        last_maintenance = time.time()
+
+        print("[Librarian] Ready and listening for requests...")
 
         while self._running:
             try:
-                # Process pending messages
+                # Heartbeat
+                self.state.agent_heartbeat(self.name.lower())
+                self.state.update_agent_status(self.name.lower(), "running")
+
+                # Process pending messages from peers (check frequently!)
                 messages = self.get_pending_messages()
                 for message in messages:
                     self._handle_message(message)
 
-                # Periodic maintenance tasks
-                self._run_maintenance()
+                # Periodic maintenance tasks (run less frequently)
+                if time.time() - last_maintenance > maintenance_interval:
+                    self._run_maintenance()
+                    last_maintenance = time.time()
 
-                time.sleep(check_interval)
+                time.sleep(message_check_interval)
 
             except KeyboardInterrupt:
                 logger.info("[Librarian] Received shutdown signal")
@@ -92,51 +213,249 @@ class LibrarianAgent(BaseAgent):
                 logger.error(f"[Librarian] Error in event loop: {e}")
                 time.sleep(60)
 
+        self.state.update_agent_status(self.name.lower(), "stopped")
         logger.info("[Librarian] Event loop stopped")
 
     def _handle_message(self, message: dict[str, Any]) -> None:
-        """Handle an incoming message."""
+        """Handle an incoming message from a peer agent."""
         msg_type = message.get("type", "")
         subject = message.get("subject", "")
         body = message.get("body", "")
         from_agent = message.get("from", "")
+        msg_id = message.get("id", "")
 
-        logger.info(f"[Librarian] Received message from {from_agent}: {subject}")
+        logger.info(f"[Librarian] Received {msg_type} from {from_agent}: {subject}")
+        self.message_bus.mark_read(msg_id)
 
-        self.message_bus.mark_read(message["id"])
+        # Update status while processing
+        self.state.update_agent_status(self.name.lower(), "busy", f"Processing {msg_type}")
 
-        if msg_type == "report_request":
-            # Generate requested report
-            report_type = body or "daily"
-            report = self.generate_report(report_type)
-            self.send_message(
-                to_agent=from_agent,
-                msg_type="report",
-                subject=f"{report_type.title()} Report",
-                body=report,
+        try:
+            if msg_type == MessageTypes.SEARCH_REQUEST:
+                self._handle_search_request(message)
+
+            elif msg_type == MessageTypes.INDEX_REQUEST:
+                self._handle_index_request(message)
+
+            elif msg_type == MessageTypes.KNOWLEDGE_REQUEST:
+                self._handle_knowledge_request(message)
+
+            elif msg_type == MessageTypes.STATUS_REQUEST:
+                self._handle_status_request(message)
+
+            # Legacy message types for backward compatibility
+            elif msg_type == "report_request":
+                report_type = body or "daily"
+                report = self.generate_report(report_type)
+                self.send_message(
+                    to_agent=from_agent,
+                    msg_type="report",
+                    subject=f"{report_type.title()} Report",
+                    body=report,
+                )
+
+            elif msg_type == "meeting_brief_request":
+                event = {"id": body, "subject": subject}
+                brief = self.generate_meeting_brief(event)
+                self.send_message(
+                    to_agent=from_agent,
+                    msg_type="meeting_brief",
+                    subject=f"Brief: {subject}",
+                    body=brief,
+                )
+
+            elif msg_type == "search_request":
+                # Legacy search (journal only)
+                results = self.search_journal(body, top_n=5)
+                response = self._format_search_results(results)
+                self.send_message(
+                    to_agent=from_agent,
+                    msg_type="search_results",
+                    subject=f"Search: {body}",
+                    body=response,
+                )
+
+        except Exception as e:
+            logger.error(f"[Librarian] Error handling message: {e}")
+            # Send error response
+            self.message_bus.send_result(
+                from_agent=self.name.lower(),
+                to_agent=from_agent.lower(),
+                msg_type=MessageTypes.SEARCH_RESULT,
+                result=None,
+                success=False,
+                error=str(e),
+                reply_to=msg_id,
             )
 
-        elif msg_type == "meeting_brief_request":
-            # Generate meeting brief
-            event = {"id": body, "subject": subject}
-            brief = self.generate_meeting_brief(event)
-            self.send_message(
-                to_agent=from_agent,
-                msg_type="meeting_brief",
-                subject=f"Brief: {subject}",
-                body=brief,
-            )
+        # Reset status
+        self.state.update_agent_status(self.name.lower(), "running")
 
-        elif msg_type == "search_request":
-            # Search the journal
-            results = self.search_journal(body, top_n=5)
-            response = self._format_search_results(results)
-            self.send_message(
-                to_agent=from_agent,
-                msg_type="search_results",
-                subject=f"Search: {body}",
-                body=response,
-            )
+    def _handle_search_request(self, message: dict[str, Any]) -> None:
+        """Handle a search request from a peer."""
+        from_agent = message.get("from", "")
+        msg_id = message.get("id", "")
+        body = message.get("body", "")
+
+        # Parse the request
+        try:
+            request = json.loads(body)
+            query = request.get("query", "")
+            # Use first exploration root as default search path
+            path = request.get("path", self.exploration_roots[0] if self.exploration_roots else str(Path.home()))
+            search_type = request.get("search_type", "smart")  # smart, routes, files, journal
+        except (json.JSONDecodeError, TypeError):
+            # Body is just the query string
+            query = body
+            path = self.exploration_roots[0] if self.exploration_roots else str(Path.home())
+            search_type = "smart"
+
+        logger.info(f"[Librarian] Searching for: {query} (type: {search_type})")
+
+        # Execute appropriate search
+        if search_type == "routes":
+            # Search code routes only
+            route_results = self.search_routes(query)
+            results = {
+                "query": query,
+                "routes": route_results,
+                "summary": f"Found {len(route_results)} code routes matching '{query}'",
+            }
+        elif search_type == "files":
+            # Search file index only
+            file_results = self.state.search_file_index(query=query, limit=20)
+            results = {
+                "query": query,
+                "files": file_results,
+                "summary": f"Found {len(file_results)} files matching '{query}'",
+            }
+        elif search_type == "journal":
+            # Search journal only
+            journal_results = self.search_journal(query, top_n=10)
+            results = {
+                "query": query,
+                "journal": journal_results,
+                "summary": f"Found {len(journal_results)} journal entries matching '{query}'",
+            }
+        else:
+            # Smart search: search everything
+            results = self._smart_search(query, path)
+
+            # Also search code routes
+            route_results = self.search_routes(query)
+            if route_results:
+                results["routes"] = route_results
+                results["summary"] += f" + {len(route_results)} code routes"
+
+        # Send results back
+        self.message_bus.send_result(
+            from_agent=self.name.lower(),
+            to_agent=from_agent.lower(),
+            msg_type=MessageTypes.SEARCH_RESULT,
+            result=results,
+            success=True,
+            reply_to=msg_id,
+        )
+
+    def _handle_index_request(self, message: dict[str, Any]) -> None:
+        """Handle an index request from a peer."""
+        from_agent = message.get("from", "")
+        msg_id = message.get("id", "")
+        body = message.get("body", "")
+
+        try:
+            request = json.loads(body)
+            file_path = request.get("path", "")
+        except (json.JSONDecodeError, TypeError):
+            file_path = body
+
+        if file_path and os.path.exists(file_path):
+            self.index_file(file_path)
+            result = f"Indexed: {file_path}"
+            success = True
+        else:
+            result = f"File not found: {file_path}"
+            success = False
+
+        self.message_bus.send_result(
+            from_agent=self.name.lower(),
+            to_agent=from_agent.lower(),
+            msg_type=MessageTypes.INDEX_COMPLETE,
+            result=result,
+            success=success,
+            reply_to=msg_id,
+        )
+
+    def _handle_knowledge_request(self, message: dict[str, Any]) -> None:
+        """Handle a knowledge/question request from a peer."""
+        from_agent = message.get("from", "")
+        msg_id = message.get("id", "")
+        body = message.get("body", "")
+
+        try:
+            request = json.loads(body)
+            question = request.get("question", "")
+            context = request.get("context", {})
+        except (json.JSONDecodeError, TypeError):
+            question = body
+            context = {}
+
+        # Search journal and file index for relevant info
+        journal_results = self.search_journal(question, top_n=5)
+        file_results = self.state.search_file_index(path_pattern=f"%{question.split()[0] if question else ''}%", limit=5)
+
+        # Use AI to formulate an answer
+        answer_context = {
+            "question": question,
+            "journal_entries": journal_results[:3],
+            "relevant_files": file_results[:5],
+            "additional_context": context,
+        }
+
+        prompt = f"""Based on the knowledge available, answer this question:
+
+Question: {question}
+
+Use the journal entries and file information provided in the context.
+If you don't have enough information, say so clearly.
+Be concise but helpful."""
+
+        answer = self.chat_with_context(prompt, answer_context)
+
+        self.message_bus.send_result(
+            from_agent=self.name.lower(),
+            to_agent=from_agent.lower(),
+            msg_type=MessageTypes.KNOWLEDGE_RESULT,
+            result={"answer": answer, "sources": journal_results[:3]},
+            success=True,
+            reply_to=msg_id,
+        )
+
+    def _handle_status_request(self, message: dict[str, Any]) -> None:
+        """Handle a status request from a peer."""
+        from_agent = message.get("from", "")
+        msg_id = message.get("id", "")
+
+        stats = self.state.get_file_index_stats()
+        discoveries = self.state.get_discoveries(agent=self.name.lower(), limit=5)
+
+        status = {
+            "agent": self.name,
+            "status": "running",
+            "exploration_complete": self._exploration_complete,
+            "file_index": stats,
+            "recent_discoveries": len(discoveries),
+            "exploration_roots": self.exploration_roots,
+        }
+
+        self.message_bus.send_result(
+            from_agent=self.name.lower(),
+            to_agent=from_agent.lower(),
+            msg_type=MessageTypes.STATUS_RESPONSE,
+            result=status,
+            success=True,
+            reply_to=msg_id,
+        )
 
     def _run_maintenance(self) -> None:
         """Run periodic maintenance tasks."""
@@ -145,6 +464,304 @@ class LibrarianAgent(BaseAgent):
             self.update_index()
         except Exception as e:
             logger.error(f"[Librarian] Error updating index: {e}")
+
+    # ========== File Exploration Methods ==========
+
+    def explore_filesystem(self, root_path: str, max_depth: int = DEFAULT_EXPLORATION_DEPTH) -> dict[str, Any]:
+        """
+        Explore the file system and index interesting files.
+
+        Args:
+            root_path: Root directory to start exploration.
+            max_depth: Maximum depth to traverse (default 6 for thorough exploration).
+
+        Returns:
+            Summary of exploration results.
+        """
+        logger.info(f"[Librarian] Starting exploration from: {root_path} (depth: {max_depth})")
+        print(f"[Librarian] Exploring with depth {max_depth}, max {self.MAX_FILES_PER_EXTENSION} files per extension")
+
+        stats = {
+            "files_found": 0,
+            "files_indexed": 0,
+            "errors": 0,
+            "by_extension": {},
+        }
+
+        for ext in self.INTERESTING_EXTENSIONS:
+            try:
+                files = self.find_files_by_extension(root_path, [ext], max_depth)
+                ext_count = len(files)
+                stats["files_found"] += ext_count
+                stats["by_extension"][ext] = {"found": ext_count, "indexed": 0}
+
+                if ext_count > 0:
+                    print(f"[Librarian] Found {ext_count} .{ext} files")
+
+                for file_path in files[:self.MAX_FILES_PER_EXTENSION]:
+                    try:
+                        self.index_file(file_path)
+                        stats["files_indexed"] += 1
+                        stats["by_extension"][ext]["indexed"] = stats["by_extension"][ext].get("indexed", 0) + 1
+                    except Exception as e:
+                        logger.debug(f"Failed to index {file_path}: {e}")
+                        stats["errors"] += 1
+
+            except Exception as e:
+                logger.error(f"[Librarian] Error finding .{ext} files: {e}")
+                stats["errors"] += 1
+
+        # Log the exploration results
+        discovery_msg = f"Explored {root_path} (depth {max_depth}): found {stats['files_found']} files, indexed {stats['files_indexed']}"
+        self.state.add_discovery(
+            agent=self.name.lower(),
+            discovery_type="exploration",
+            description=discovery_msg,
+            details=stats,
+        )
+
+        # Share discovery with FDA
+        self.message_bus.share_discovery(
+            from_agent=self.name.lower(),
+            discovery_type="exploration_complete",
+            description=discovery_msg,
+            details=stats,
+        )
+
+        logger.info(f"[Librarian] Exploration complete: {stats}")
+        print(f"[Librarian] Exploration complete: {stats['files_indexed']} files indexed")
+        return stats
+
+    def find_files_by_extension(
+        self,
+        path: str,
+        extensions: list[str],
+        max_depth: int = 5,
+    ) -> list[str]:
+        """
+        Find files with specific extensions using the find command.
+
+        Args:
+            path: Directory to search.
+            extensions: List of file extensions (without dot).
+            max_depth: Maximum directory depth.
+
+        Returns:
+            List of file paths.
+        """
+        if not os.path.exists(path):
+            return []
+
+        # Build exclude patterns
+        excludes = []
+        for skip_dir in self.SKIP_DIRS:
+            excludes.extend(["-not", "-path", f"*/{skip_dir}/*"])
+
+        # Build name patterns
+        name_patterns = []
+        for ext in extensions:
+            if name_patterns:
+                name_patterns.append("-o")
+            name_patterns.extend(["-name", f"*.{ext}"])
+
+        cmd = [
+            "find", path,
+            "-maxdepth", str(max_depth),
+            "-type", "f",
+            *excludes,
+            "(", *name_patterns, ")",
+        ]
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=300,  # 5 minutes per extension search
+            )
+            files = [f for f in result.stdout.strip().split("\n") if f]
+            return files
+        except subprocess.TimeoutExpired:
+            logger.warning(f"[Librarian] find command timed out for {path} (5 min limit)")
+            return []
+        except Exception as e:
+            logger.error(f"[Librarian] find error: {e}")
+            return []
+
+    def grep_for_pattern(
+        self,
+        pattern: str,
+        path: str,
+        file_pattern: Optional[str] = None,
+        max_results: int = 100,
+    ) -> list[dict[str, Any]]:
+        """
+        Search for a pattern in files using grep.
+
+        Args:
+            pattern: Regex pattern to search for.
+            path: Directory or file to search.
+            file_pattern: Optional glob pattern to filter files (e.g., "*.py").
+            max_results: Maximum number of results to return.
+
+        Returns:
+            List of match dictionaries with file, line_number, and content.
+        """
+        if not os.path.exists(path):
+            return []
+
+        cmd = ["grep", "-r", "-n", "-I"]  # -I skips binary files
+
+        # Add file pattern if specified
+        if file_pattern:
+            cmd.extend(["--include", file_pattern])
+
+        # Exclude directories
+        for skip_dir in self.SKIP_DIRS:
+            cmd.extend(["--exclude-dir", skip_dir])
+
+        cmd.extend([pattern, path])
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+            matches = []
+            for line in result.stdout.strip().split("\n")[:max_results]:
+                if ":" in line:
+                    parts = line.split(":", 2)
+                    if len(parts) >= 3:
+                        matches.append({
+                            "file": parts[0],
+                            "line_number": int(parts[1]) if parts[1].isdigit() else 0,
+                            "content": parts[2].strip()[:200],  # Truncate long lines
+                        })
+
+            return matches
+
+        except subprocess.TimeoutExpired:
+            logger.warning(f"[Librarian] grep timed out for pattern: {pattern}")
+            return []
+        except Exception as e:
+            logger.error(f"[Librarian] grep error: {e}")
+            return []
+
+    def _smart_search(self, query: str, path: str) -> dict[str, Any]:
+        """
+        Perform a smart search based on the query.
+
+        Determines the best search strategy based on the query:
+        - File extension search: "*.py files" or "python files"
+        - Pattern search: "TODO", "FIXME", function names
+        - Content search: general text search
+
+        Args:
+            query: The search query.
+            path: Path to search in.
+
+        Returns:
+            Search results dictionary.
+        """
+        results = {
+            "query": query,
+            "path": path,
+            "files": [],
+            "matches": [],
+            "summary": "",
+        }
+
+        query_lower = query.lower()
+
+        # Check for file type searches
+        if "python" in query_lower or ".py" in query_lower:
+            results["files"] = self.find_files_by_extension(path, ["py"])
+            results["summary"] = f"Found {len(results['files'])} Python files"
+
+        elif "javascript" in query_lower or ".js" in query_lower:
+            results["files"] = self.find_files_by_extension(path, ["js", "ts"])
+            results["summary"] = f"Found {len(results['files'])} JavaScript/TypeScript files"
+
+        elif "config" in query_lower:
+            results["files"] = self.find_files_by_extension(
+                path, ["json", "yaml", "yml", "toml", "ini", "cfg"]
+            )
+            results["summary"] = f"Found {len(results['files'])} config files"
+
+        elif "markdown" in query_lower or ".md" in query_lower or "docs" in query_lower:
+            results["files"] = self.find_files_by_extension(path, ["md", "txt", "rst"])
+            results["summary"] = f"Found {len(results['files'])} documentation files"
+
+        # Pattern/content search
+        else:
+            results["matches"] = self.grep_for_pattern(query, path)
+            results["summary"] = f"Found {len(results['matches'])} matches for '{query}'"
+
+        # Also search the journal
+        journal_results = self.search_journal(query, top_n=3)
+        if journal_results:
+            results["journal_matches"] = journal_results
+            results["summary"] += f" + {len(journal_results)} journal entries"
+
+        return results
+
+    def index_file(self, file_path: str) -> Optional[str]:
+        """
+        Index a single file into the database.
+
+        Args:
+            file_path: Path to the file to index.
+
+        Returns:
+            File ID if indexed successfully, None otherwise.
+        """
+        try:
+            path = Path(file_path)
+            if not path.exists() or not path.is_file():
+                return None
+
+            stat = path.stat()
+
+            # Generate a simple summary (first few lines for code files)
+            summary = None
+            if path.suffix in [".py", ".js", ".ts", ".go", ".rs"]:
+                try:
+                    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                        lines = f.readlines()[:10]
+                        # Look for docstrings or comments
+                        for line in lines:
+                            line = line.strip()
+                            if line.startswith('"""') or line.startswith("'''"):
+                                summary = line.strip('"\' ')
+                                break
+                            elif line.startswith("//") or line.startswith("#"):
+                                summary = line.lstrip("/#").strip()
+                                break
+                except Exception:
+                    pass
+
+            # Determine tags based on path and extension
+            tags = [path.suffix.lstrip(".")] if path.suffix else []
+            if "test" in str(path).lower():
+                tags.append("test")
+            if "config" in str(path).lower():
+                tags.append("config")
+
+            return self.state.add_file_to_index(
+                path=str(path.absolute()),
+                extension=path.suffix.lstrip("."),
+                size=stat.st_size,
+                modified_at=datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                summary=summary,
+                tags=tags,
+            )
+
+        except Exception as e:
+            logger.debug(f"[Librarian] Failed to index {file_path}: {e}")
+            return None
 
     def generate_report(self, report_type: str) -> str:
         """
@@ -573,3 +1190,355 @@ Focus on information that remains relevant over time."""
         )
 
         return digest
+
+    # ========== Code Routing System ==========
+
+    def build_routing_system(self) -> dict[str, Any]:
+        """
+        Build a routing system by analyzing indexed code files.
+
+        Extracts functions, classes, methods, and API endpoints from code files
+        to create a searchable routing index.
+
+        Returns:
+            Statistics about the routing system.
+        """
+        logger.info("[Librarian] Building code routing system...")
+
+        stats = {
+            "files_analyzed": 0,
+            "routes_added": 0,
+            "errors": 0,
+            "by_type": {},
+        }
+
+        # Get all indexed code files
+        file_stats = self.state.get_file_index_stats()
+        code_extensions = ["py", "js", "ts", "go", "java"]
+
+        for ext in code_extensions:
+            if ext not in file_stats.get("by_extension", {}):
+                continue
+
+            # Get files of this extension
+            files = self.state.search_file_index(extension=ext, limit=500)
+
+            for file_entry in files:
+                file_path = file_entry.get("path")
+                if not file_path:
+                    continue
+
+                try:
+                    routes = self._analyze_code_file(file_path, ext)
+                    stats["files_analyzed"] += 1
+
+                    for route in routes:
+                        self.state.add_code_route(
+                            file_path=file_path,
+                            route_type=route["type"],
+                            name=route["name"],
+                            line_number=route.get("line"),
+                            signature=route.get("signature"),
+                            docstring=route.get("docstring"),
+                            keywords=route.get("keywords"),
+                        )
+                        stats["routes_added"] += 1
+
+                        # Track by type
+                        route_type = route["type"]
+                        stats["by_type"][route_type] = stats["by_type"].get(route_type, 0) + 1
+
+                except Exception as e:
+                    logger.debug(f"[Librarian] Error analyzing {file_path}: {e}")
+                    stats["errors"] += 1
+
+        # Share discovery with FDA
+        discovery_msg = f"Built routing system: {stats['routes_added']} routes from {stats['files_analyzed']} files"
+        self.message_bus.share_discovery(
+            from_agent=self.name.lower(),
+            discovery_type="routing_complete",
+            description=discovery_msg,
+            details=stats,
+        )
+
+        logger.info(f"[Librarian] Routing system complete: {stats}")
+        print(f"[Librarian] Routing complete: {stats['routes_added']} routes indexed")
+        return stats
+
+    def _analyze_code_file(self, file_path: str, extension: str) -> list[dict[str, Any]]:
+        """
+        Analyze a code file and extract routes (functions, classes, endpoints).
+
+        Args:
+            file_path: Path to the code file.
+            extension: File extension (py, js, ts, etc.).
+
+        Returns:
+            List of route dictionaries.
+        """
+        routes = []
+
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+                lines = content.split("\n")
+        except Exception:
+            return routes
+
+        if extension == "py":
+            routes.extend(self._analyze_python_file(file_path, content, lines))
+        elif extension in ["js", "ts"]:
+            routes.extend(self._analyze_javascript_file(file_path, content, lines))
+        elif extension == "go":
+            routes.extend(self._analyze_go_file(file_path, content, lines))
+
+        return routes
+
+    def _analyze_python_file(self, file_path: str, content: str, lines: list[str]) -> list[dict[str, Any]]:
+        """Analyze a Python file for functions, classes, and endpoints."""
+        routes = []
+
+        try:
+            tree = ast.parse(content)
+        except SyntaxError:
+            # Fall back to regex-based parsing
+            return self._analyze_python_regex(file_path, lines)
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) or isinstance(node, ast.AsyncFunctionDef):
+                # Get function signature
+                args = []
+                for arg in node.args.args:
+                    args.append(arg.arg)
+                signature = f"{node.name}({', '.join(args)})"
+
+                # Get docstring
+                docstring = ast.get_docstring(node)
+
+                # Determine route type
+                route_type = "function"
+                keywords = [node.name.lower()]
+
+                # Check for decorators that indicate endpoints/handlers
+                for decorator in node.decorator_list:
+                    dec_name = ""
+                    if isinstance(decorator, ast.Name):
+                        dec_name = decorator.id
+                    elif isinstance(decorator, ast.Attribute):
+                        dec_name = decorator.attr
+                    elif isinstance(decorator, ast.Call):
+                        if isinstance(decorator.func, ast.Attribute):
+                            dec_name = decorator.func.attr
+                        elif isinstance(decorator.func, ast.Name):
+                            dec_name = decorator.func.id
+
+                    dec_lower = dec_name.lower()
+                    if dec_lower in ["route", "get", "post", "put", "delete", "patch"]:
+                        route_type = "endpoint"
+                        keywords.append("api")
+                        keywords.append(dec_lower)
+                    elif dec_lower in ["command", "event", "handler"]:
+                        route_type = "handler"
+                        keywords.append(dec_lower)
+                    elif dec_lower == "property":
+                        route_type = "property"
+
+                # Add keywords from function name
+                name_parts = re.findall(r'[A-Z][a-z]*|[a-z]+', node.name)
+                keywords.extend([p.lower() for p in name_parts])
+
+                routes.append({
+                    "type": route_type,
+                    "name": node.name,
+                    "line": node.lineno,
+                    "signature": signature,
+                    "docstring": docstring,
+                    "keywords": list(set(keywords)),
+                })
+
+            elif isinstance(node, ast.ClassDef):
+                docstring = ast.get_docstring(node)
+                keywords = [node.name.lower()]
+
+                # Add keywords from class name
+                name_parts = re.findall(r'[A-Z][a-z]*|[a-z]+', node.name)
+                keywords.extend([p.lower() for p in name_parts])
+
+                # Check for base classes
+                for base in node.bases:
+                    if isinstance(base, ast.Name):
+                        keywords.append(base.id.lower())
+
+                routes.append({
+                    "type": "class",
+                    "name": node.name,
+                    "line": node.lineno,
+                    "signature": f"class {node.name}",
+                    "docstring": docstring,
+                    "keywords": list(set(keywords)),
+                })
+
+        return routes
+
+    def _analyze_python_regex(self, file_path: str, lines: list[str]) -> list[dict[str, Any]]:
+        """Fallback regex-based Python analysis."""
+        routes = []
+
+        func_pattern = re.compile(r'^(?:async\s+)?def\s+(\w+)\s*\(([^)]*)\)')
+        class_pattern = re.compile(r'^class\s+(\w+)')
+
+        for i, line in enumerate(lines, 1):
+            # Functions
+            match = func_pattern.match(line.strip())
+            if match:
+                name = match.group(1)
+                args = match.group(2)
+                routes.append({
+                    "type": "function",
+                    "name": name,
+                    "line": i,
+                    "signature": f"{name}({args})",
+                    "keywords": [name.lower()],
+                })
+
+            # Classes
+            match = class_pattern.match(line.strip())
+            if match:
+                name = match.group(1)
+                routes.append({
+                    "type": "class",
+                    "name": name,
+                    "line": i,
+                    "signature": f"class {name}",
+                    "keywords": [name.lower()],
+                })
+
+        return routes
+
+    def _analyze_javascript_file(self, file_path: str, content: str, lines: list[str]) -> list[dict[str, Any]]:
+        """Analyze a JavaScript/TypeScript file for functions, classes, and exports."""
+        routes = []
+
+        # Function patterns
+        func_patterns = [
+            re.compile(r'(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*\(([^)]*)\)'),
+            re.compile(r'(?:export\s+)?const\s+(\w+)\s*=\s*(?:async\s+)?\([^)]*\)\s*=>'),
+            re.compile(r'(?:export\s+)?const\s+(\w+)\s*=\s*function'),
+        ]
+
+        class_pattern = re.compile(r'(?:export\s+)?class\s+(\w+)')
+
+        for i, line in enumerate(lines, 1):
+            # Functions
+            for pattern in func_patterns:
+                match = pattern.search(line)
+                if match:
+                    name = match.group(1)
+                    keywords = [name.lower()]
+                    name_parts = re.findall(r'[A-Z][a-z]*|[a-z]+', name)
+                    keywords.extend([p.lower() for p in name_parts])
+
+                    routes.append({
+                        "type": "function",
+                        "name": name,
+                        "line": i,
+                        "signature": name,
+                        "keywords": list(set(keywords)),
+                    })
+                    break
+
+            # Classes
+            match = class_pattern.search(line)
+            if match:
+                name = match.group(1)
+                keywords = [name.lower()]
+                name_parts = re.findall(r'[A-Z][a-z]*|[a-z]+', name)
+                keywords.extend([p.lower() for p in name_parts])
+
+                routes.append({
+                    "type": "class",
+                    "name": name,
+                    "line": i,
+                    "signature": f"class {name}",
+                    "keywords": list(set(keywords)),
+                })
+
+        return routes
+
+    def _analyze_go_file(self, file_path: str, content: str, lines: list[str]) -> list[dict[str, Any]]:
+        """Analyze a Go file for functions and types."""
+        routes = []
+
+        func_pattern = re.compile(r'^func\s+(?:\(\w+\s+\*?\w+\)\s+)?(\w+)\s*\(([^)]*)\)')
+        type_pattern = re.compile(r'^type\s+(\w+)\s+(struct|interface)')
+
+        for i, line in enumerate(lines, 1):
+            # Functions
+            match = func_pattern.match(line)
+            if match:
+                name = match.group(1)
+                args = match.group(2)
+                keywords = [name.lower()]
+
+                # Check for handler patterns
+                route_type = "function"
+                if "Handler" in name or "handler" in line.lower():
+                    route_type = "handler"
+                    keywords.append("handler")
+
+                routes.append({
+                    "type": route_type,
+                    "name": name,
+                    "line": i,
+                    "signature": f"func {name}({args})",
+                    "keywords": keywords,
+                })
+
+            # Types (struct/interface)
+            match = type_pattern.match(line)
+            if match:
+                name = match.group(1)
+                kind = match.group(2)
+                routes.append({
+                    "type": kind,
+                    "name": name,
+                    "line": i,
+                    "signature": f"type {name} {kind}",
+                    "keywords": [name.lower(), kind],
+                })
+
+        return routes
+
+    def search_routes(self, query: str, route_type: Optional[str] = None) -> list[dict[str, Any]]:
+        """
+        Search the code routing system.
+
+        Args:
+            query: Search query (searches name, keywords, docstring).
+            route_type: Optional filter by route type (function, class, endpoint, handler).
+
+        Returns:
+            List of matching routes with file info.
+        """
+        return self.state.search_code_routes(query, route_type=route_type, limit=20)
+
+    def get_file_routes(self, file_path: str) -> list[dict[str, Any]]:
+        """
+        Get all routes in a specific file.
+
+        Args:
+            file_path: Path to the file.
+
+        Returns:
+            List of routes in the file, ordered by line number.
+        """
+        return self.state.get_routes_for_file(file_path)
+
+    def get_routing_stats(self) -> dict[str, Any]:
+        """
+        Get statistics about the routing system.
+
+        Returns:
+            Dictionary with total routes and breakdown by type.
+        """
+        return self.state.get_code_routes_stats()

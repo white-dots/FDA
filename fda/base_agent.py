@@ -129,6 +129,7 @@ class BaseAgent(ABC):
         message: str,
         context: dict[str, Any],
         max_tokens: int = 4096,
+        model_override: Optional[str] = None,
     ) -> str:
         """
         Send a message with additional context to Claude.
@@ -137,6 +138,7 @@ class BaseAgent(ABC):
             message: The user message.
             context: Dictionary of context to include.
             max_tokens: Maximum tokens in response.
+            model_override: Optional model to use instead of the agent's default.
 
         Returns:
             Claude's response text.
@@ -145,7 +147,41 @@ class BaseAgent(ABC):
         context_str = self._format_context(context)
         full_message = f"{context_str}\n\n{message}"
 
+        if model_override:
+            return self._chat_with_model(full_message, model_override, max_tokens)
         return self.chat(full_message, include_history=False, max_tokens=max_tokens)
+
+    def _chat_with_model(
+        self,
+        message: str,
+        model: str,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+    ) -> str:
+        """
+        Send a message using a specific model (doesn't update history).
+
+        Args:
+            message: The user message.
+            model: Model to use for this request.
+            max_tokens: Maximum tokens in response.
+            temperature: Sampling temperature.
+
+        Returns:
+            Claude's response text.
+        """
+        try:
+            response = self.client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                system=self.system_prompt,
+                messages=[{"role": "user", "content": message}],
+                temperature=temperature,
+            )
+            return response.content[0].text
+        except Exception as e:
+            logger.error(f"Error calling Claude API with model {model}: {e}")
+            raise
 
     def _format_context(self, context: dict[str, Any]) -> str:
         """Format context dictionary into a string for the prompt."""

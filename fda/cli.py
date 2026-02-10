@@ -30,39 +30,42 @@ from fda.journal.writer import JournalWriter
 from fda.journal.retriever import JournalRetriever
 
 
-def handle_init(args: argparse.Namespace) -> int:
-    """Initialize a new FDA project."""
-    project_path = Path(args.path).resolve()
-    print(f"Initializing FDA project at {project_path}")
+def ensure_fda_initialized() -> ProjectState:
+    """
+    Ensure FDA system is initialized, creating dirs/db if needed.
 
-    # Create directory structure
-    project_path.mkdir(parents=True, exist_ok=True)
-    (project_path / "journal").mkdir(exist_ok=True)
-    (project_path / "logs").mkdir(exist_ok=True)
+    Returns:
+        ProjectState instance ready for use.
+    """
+    from datetime import datetime
 
-    # Initialize project state
-    db_path = project_path / "state.db"
-    state = ProjectState(db_path)
+    # Create directory structure if needed
+    PROJECT_ROOT.mkdir(parents=True, exist_ok=True)
+    JOURNAL_DIR.mkdir(parents=True, exist_ok=True)
+    (PROJECT_ROOT / "logs").mkdir(exist_ok=True)
 
-    # Set initial context
-    state.set_context("project_path", str(project_path))
-    state.set_context("initialized_at", __import__("datetime").datetime.now().isoformat())
-    state.set_context("version", "0.1.0")
+    # Initialize project state (creates DB if needed)
+    state = ProjectState(STATE_DB_PATH)
 
-    # Initialize message bus
-    bus_path = project_path / "message_bus.json"
-    MessageBus(bus_path)
+    # Initialize message bus (creates file if needed)
+    MessageBus(MESSAGE_BUS_PATH)
 
-    print(f"  Created state database: {db_path}")
-    print(f"  Created message bus: {bus_path}")
-    print(f"  Created journal directory: {project_path / 'journal'}")
-    print("Project initialized successfully!")
+    # Set initial context if not already set
+    if not state.get_context("initialized_at"):
+        state.set_context("initialized_at", datetime.now().isoformat())
+        state.set_context("version", "0.1.0")
+        state.set_context("project_path", str(PROJECT_ROOT))
 
-    return 0
+    return state
 
 
 def handle_start(args: argparse.Namespace) -> int:
     """Start the FDA system."""
+
+    # Check if starting all peer agents
+    if getattr(args, 'all_agents', False):
+        return handle_start_all_agents(args)
+
     print("Starting FDA system...")
 
     # Initialize components
@@ -102,8 +105,141 @@ def handle_start(args: argparse.Namespace) -> int:
     return 0
 
 
+def handle_start_all_agents(args: argparse.Namespace) -> int:
+    """Start all peer agents (FDA, Librarian, Executor)."""
+    import threading
+    import signal
+    import sys
+
+    print("=" * 60)
+    print("FDA PEER-BASED MULTI-AGENT SYSTEM")
+    print("=" * 60)
+    print()
+    print("Starting peer agents:")
+    print("  - FDA (User Interface)")
+    print("  - Librarian (Knowledge & Discovery)")
+    print("  - Executor (Actions)")
+    print()
+
+    from fda.fda_agent import FDAAgent
+    from fda.librarian_agent import LibrarianAgent
+    from fda.executor_agent import ExecutorAgent
+
+    # Track threads and stop event
+    threads = []
+    stop_event = threading.Event()
+
+    def signal_handler(sig, frame):
+        print("\n\nShutting down all agents...")
+        stop_event.set()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, signal_handler)
+
+    try:
+        # Start Librarian in background thread
+        # Default folders: Desktop, Downloads, Documents
+        # Plus any additional folders configured by the user
+        home = Path.home()
+        default_folders = ["Desktop", "Downloads", "Documents"]
+        exploration_roots = [
+            str(home / folder)
+            for folder in default_folders
+            if (home / folder).exists()
+        ]
+
+        # Check for user-configured additional folders
+        state = ProjectState()
+        additional_folders = state.get_context("exploration_folders")
+        if additional_folders:
+            try:
+                extra_folders = json.loads(additional_folders) if isinstance(additional_folders, str) else additional_folders
+                for folder in extra_folders:
+                    folder_path = Path(folder).expanduser()
+                    if folder_path.exists() and str(folder_path) not in exploration_roots:
+                        exploration_roots.append(str(folder_path))
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        print("[1/3] Starting Librarian agent...")
+        print(f"      Exploration folders: {', '.join(exploration_roots)}")
+        librarian = LibrarianAgent(exploration_roots=exploration_roots)
+
+        def run_librarian():
+            try:
+                librarian.start()
+            except Exception as e:
+                print(f"Librarian error: {e}")
+
+        librarian_thread = threading.Thread(target=run_librarian, daemon=True)
+        librarian_thread.start()
+        threads.append(("Librarian", librarian_thread, librarian))
+        print("      ✓ Librarian started")
+
+        # Start Executor in background thread
+        print("[2/3] Starting Executor agent...")
+        executor = ExecutorAgent()
+
+        def run_executor():
+            try:
+                executor.start()
+            except Exception as e:
+                print(f"Executor error: {e}")
+
+        executor_thread = threading.Thread(target=run_executor, daemon=True)
+        executor_thread.start()
+        threads.append(("Executor", executor_thread, executor))
+        print("      ✓ Executor started")
+
+        # Start FDA in main thread (or background if specified)
+        print("[3/3] Starting FDA agent...")
+        fda = FDAAgent()
+
+        def run_fda():
+            try:
+                fda.start()
+            except Exception as e:
+                print(f"FDA error: {e}")
+
+        fda_thread = threading.Thread(target=run_fda, daemon=True)
+        fda_thread.start()
+        threads.append(("FDA", fda_thread, fda))
+        print("      ✓ FDA started")
+
+        print()
+        print("=" * 60)
+        print("All agents running! Press Ctrl+C to stop.")
+        print()
+        print("To interact:")
+        print("  - Discord: fda discord start (PRIMARY)")
+        print("  - Telegram: fda telegram start")
+        print("  - CLI: fda ask \"<question>\"")
+        print("=" * 60)
+        print()
+
+        # Keep main thread alive
+        while not stop_event.is_set():
+            stop_event.wait(1)
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        print("\nStopping agents...")
+        for name, thread, agent in threads:
+            try:
+                agent.stop()
+                print(f"  ✓ {name} stopped")
+            except Exception as e:
+                print(f"  ✗ {name} error: {e}")
+
+    return 0
+
+
 def handle_onboard(args: argparse.Namespace) -> int:
     """Run interactive onboarding."""
+    # Ensure system is initialized first
+    ensure_fda_initialized()
+
     from fda.fda_agent import FDAAgent
 
     try:
@@ -119,6 +255,32 @@ def handle_onboard(args: argparse.Namespace) -> int:
             return 0
 
         agent.onboard_interactive()
+
+        # After successful onboarding, offer to start all agents
+        print("\n" + "=" * 60)
+        print("READY TO START")
+        print("=" * 60)
+        print("\nOnboarding complete! Would you like to start all FDA agents now?")
+        print("This will start:")
+        print("  - FDA (your personal assistant)")
+        print("  - Librarian (file search & knowledge)")
+        print("  - Executor (command execution)")
+        print()
+
+        start_now = input("Start all agents now? (y/n) > ").strip().lower()
+
+        if start_now in ("y", "yes"):
+            print()
+            # Create a namespace object to pass to handle_start_all_agents
+            start_args = argparse.Namespace(all_agents=True, daemon=False)
+            return handle_start_all_agents(start_args)
+        else:
+            print("\nNo problem! When you're ready, run:")
+            print("  fda start --all    - Start all agents")
+            print("  fda discord start  - Start Discord bot")
+            print("  fda telegram start - Start Telegram bot")
+            print("  fda ask \"...\"      - Ask a question via CLI")
+
         return 0
     except KeyboardInterrupt:
         print("\n\nOnboarding cancelled. Run 'fda onboard' when you're ready.")
@@ -164,8 +326,8 @@ def handle_status(args: argparse.Namespace) -> int:
     print("FDA System Status")
     print("=" * 50)
 
-    # Project state
-    state = ProjectState()
+    # Auto-initialize if needed
+    state = ensure_fda_initialized()
 
     # Tasks summary
     all_tasks = state.get_tasks()
@@ -368,6 +530,73 @@ def handle_journal_write(args: argparse.Namespace) -> int:
     return 0
 
 
+def handle_write_journal(args: argparse.Namespace) -> int:
+    """Generate an AI-written journal entry about today."""
+    from fda.fda_agent import FDAAgent
+    from fda.utils.timezone import get_user_timezone, get_local_today, get_current_time_for_user
+
+    # Ensure system is initialized
+    ensure_fda_initialized()
+
+    try:
+        agent = FDAAgent()
+
+        # Check if onboarded
+        if not agent.is_onboarded():
+            print("Please run 'fda onboard' first to set up your profile.")
+            return 1
+
+        # Get user's timezone
+        user_tz = get_user_timezone(agent.state)
+        if not user_tz:
+            print("Note: No timezone set. Using system time.")
+            print("Run 'fda onboard --force' to set your timezone.\n")
+
+        # Get today's date range in user's timezone
+        start_of_day, end_of_day = get_local_today(user_tz)
+        current_time = get_current_time_for_user(user_tz)
+
+        print(f"Generating journal entry for {current_time.strftime('%A, %B %d, %Y')}...")
+        print("Gathering today's activities...\n")
+
+        # Gather context for the day
+        context = agent.gather_daily_context(start_of_day, end_of_day)
+
+        # Show what we found
+        tasks_completed = context.get("tasks_completed_today", [])
+        calendar_events = context.get("calendar_events", [])
+
+        if tasks_completed:
+            print(f"  Found {len(tasks_completed)} task(s) completed today")
+        if calendar_events:
+            print(f"  Found {len(calendar_events)} calendar event(s)")
+
+        print("\nWriting journal entry...\n")
+
+        # Generate journal entry using Claude
+        entry_content = agent.generate_daily_journal(context, current_time)
+
+        # Write to journal
+        date_str = current_time.strftime('%Y-%m-%d')
+        filepath = agent.log_to_journal(
+            summary=f"Daily reflection - {date_str}",
+            content=entry_content,
+            tags=["daily-journal", "reflection", "auto-generated"],
+            relevance_decay="medium",
+        )
+
+        print("=" * 60)
+        print(entry_content)
+        print("=" * 60)
+        print(f"\nJournal entry saved: {filepath}")
+
+        return 0
+
+    except Exception as e:
+        print(f"Error: {e}")
+        return 1
+
+
 def handle_config(args: argparse.Namespace) -> int:
     """Show or update configuration."""
     print("FDA System Configuration")
@@ -388,18 +617,138 @@ def handle_config(args: argparse.Namespace) -> int:
     print(f"  Daily Checkin: {DEFAULT_DAILY_CHECKIN_TIME}")
     print(f"  Calendar Check Interval: {DEFAULT_CALENDAR_CHECK_INTERVAL_MINUTES} min")
 
-    # Show project context if available
+    # Show exploration folders
+    home = Path.home()
+    default_folders = ["Desktop", "Downloads", "Documents"]
+    exploration_folders = [str(home / f) for f in default_folders if (home / f).exists()]
+
     try:
         state = ProjectState()
         project_path = state.get_context("project_path")
         initialized_at = state.get_context("initialized_at")
 
+        # Get additional configured folders
+        additional = state.get_context("exploration_folders")
+        if additional:
+            try:
+                extra = json.loads(additional) if isinstance(additional, str) else additional
+                exploration_folders.extend(extra)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        print("\nExploration Folders (Librarian):")
+        for folder in exploration_folders:
+            exists = "✓" if Path(folder).exists() else "✗"
+            print(f"  {exists} {folder}")
+
         if project_path:
             print("\nProject Context:")
             print(f"  Project Path: {project_path}")
             print(f"  Initialized: {initialized_at}")
+
+        print("\nTo add more folders: fda config folders add <path>")
     except Exception:
         print("\nProject Context: Not initialized")
+
+    return 0
+
+
+def handle_config_folders_list(args: argparse.Namespace) -> int:
+    """List configured exploration folders."""
+    state = ProjectState()
+
+    home = Path.home()
+    default_folders = ["Desktop", "Downloads", "Documents"]
+
+    print("Exploration Folders")
+    print("=" * 50)
+
+    print("\nDefault folders:")
+    for folder in default_folders:
+        folder_path = home / folder
+        exists = "✓" if folder_path.exists() else "✗"
+        print(f"  {exists} {folder_path}")
+
+    # Get additional configured folders
+    additional = state.get_context("exploration_folders")
+    if additional:
+        try:
+            extra = json.loads(additional) if isinstance(additional, str) else additional
+            if extra:
+                print("\nAdditional folders:")
+                for folder in extra:
+                    folder_path = Path(folder).expanduser()
+                    exists = "✓" if folder_path.exists() else "✗"
+                    print(f"  {exists} {folder_path}")
+        except (json.JSONDecodeError, TypeError):
+            pass
+    else:
+        print("\nNo additional folders configured.")
+
+    print("\nCommands:")
+    print("  fda config folders add <path>    - Add a folder")
+    print("  fda config folders remove <path> - Remove a folder")
+
+    return 0
+
+
+def handle_config_folders_add(args: argparse.Namespace) -> int:
+    """Add an exploration folder."""
+    state = ProjectState()
+
+    folder_path = Path(args.path).expanduser().resolve()
+
+    if not folder_path.exists():
+        print(f"Error: Folder does not exist: {folder_path}")
+        return 1
+
+    if not folder_path.is_dir():
+        print(f"Error: Not a directory: {folder_path}")
+        return 1
+
+    # Get current additional folders
+    additional = state.get_context("exploration_folders")
+    try:
+        extra = json.loads(additional) if additional and isinstance(additional, str) else (additional or [])
+    except (json.JSONDecodeError, TypeError):
+        extra = []
+
+    folder_str = str(folder_path)
+    if folder_str in extra:
+        print(f"Folder already configured: {folder_path}")
+        return 0
+
+    extra.append(folder_str)
+    state.set_context("exploration_folders", json.dumps(extra))
+
+    print(f"Added exploration folder: {folder_path}")
+    print("\nNote: Restart 'fda start --all' to re-index with the new folder.")
+
+    return 0
+
+
+def handle_config_folders_remove(args: argparse.Namespace) -> int:
+    """Remove an exploration folder."""
+    state = ProjectState()
+
+    folder_path = Path(args.path).expanduser().resolve()
+    folder_str = str(folder_path)
+
+    # Get current additional folders
+    additional = state.get_context("exploration_folders")
+    try:
+        extra = json.loads(additional) if additional and isinstance(additional, str) else (additional or [])
+    except (json.JSONDecodeError, TypeError):
+        extra = []
+
+    if folder_str not in extra:
+        print(f"Folder not in configuration: {folder_path}")
+        return 1
+
+    extra.remove(folder_str)
+    state.set_context("exploration_folders", json.dumps(extra))
+
+    print(f"Removed exploration folder: {folder_path}")
 
     return 0
 
@@ -481,39 +830,31 @@ def handle_task_update(args: argparse.Namespace) -> int:
 
 
 def handle_discord_setup(args: argparse.Namespace) -> int:
-    """Set up Discord bot token and client ID."""
-    from fda.discord_bot import setup_bot_token, setup_client_id, get_bot_token
+    """Set up Discord bot - redirect to web UI."""
+    from fda.discord_bot import get_bot_token
 
     existing = get_bot_token()
     if existing and not args.force:
         print("Discord bot already configured.")
-        print("Use --force to reconfigure.")
+        print("Use --force to view setup instructions.")
         return 0
 
     print("Discord Bot Setup")
     print("=" * 40)
-    print("\nTo create a Discord bot:")
-    print("1. Go to https://discord.com/developers/applications")
-    print("2. Click 'New Application' and name it")
-    print("3. Go to 'Bot' tab and click 'Add Bot'")
-    print("4. Copy the bot token")
-    print("5. Go to 'OAuth2' > 'General' and copy the Client ID\n")
-
-    token = input("Enter your bot token: ").strip()
-    if not token:
-        print("No token provided. Aborting.")
-        return 1
-
-    client_id = input("Enter your client ID: ").strip()
-    if not client_id:
-        print("No client ID provided. Aborting.")
-        return 1
-
-    setup_bot_token(token)
-    setup_client_id(client_id)
-
-    print("\n✓ Discord bot configured!")
-    print("Run 'fda discord invite' to get the invite link.")
+    print("\nDiscord bot configuration is done via the web interface.")
+    print("\nTo configure:")
+    print("  1. Run: fda setup")
+    print("  2. Open http://localhost:9999 in your browser")
+    print("  3. Enter your Discord bot token and client ID")
+    print()
+    print("To create a Discord bot:")
+    print("  1. Go to https://discord.com/developers/applications")
+    print("  2. Click 'New Application' and name it")
+    print("  3. Go to 'Bot' tab and click 'Add Bot'")
+    print("  4. Copy the bot token")
+    print("  5. Go to 'OAuth2' > 'General' and copy the Client ID")
+    print()
+    print("Run 'fda setup' to open the configuration page.")
     return 0
 
 
@@ -590,37 +931,30 @@ def handle_discord_invite(args: argparse.Namespace) -> int:
 
 
 def handle_telegram_setup(args: argparse.Namespace) -> int:
-    """Set up Telegram bot token."""
-    from fda.telegram_bot import setup_bot_token, get_bot_token
+    """Set up Telegram bot - redirect to web UI."""
+    from fda.telegram_bot import get_bot_token
 
     # Check if already configured
     existing = get_bot_token()
     if existing and not args.force:
         print("Telegram bot already configured.")
-        print("Use --force to reconfigure.")
+        print("Use --force to view setup instructions.")
         return 0
 
     print("Telegram Bot Setup")
     print("=" * 40)
-    print("\nTo create a Telegram bot:")
-    print("1. Open Telegram and search for @BotFather")
-    print("2. Send /newbot and follow the prompts")
-    print("3. Copy the bot token provided\n")
-
-    token = input("Enter your bot token: ").strip()
-
-    if not token:
-        print("No token provided. Aborting.")
-        return 1
-
-    # Validate token format (basic check)
-    if ":" not in token or len(token) < 30:
-        print("Invalid token format. Please check and try again.")
-        return 1
-
-    setup_bot_token(token)
-    print("\n✓ Telegram bot token saved!")
-    print("Run 'fda telegram start' to start the bot.")
+    print("\nTelegram bot configuration is done via the web interface.")
+    print("\nTo configure:")
+    print("  1. Run: fda setup")
+    print("  2. Open http://localhost:9999 in your browser")
+    print("  3. Enter your Telegram bot token")
+    print()
+    print("To create a Telegram bot:")
+    print("  1. Open Telegram and search for @BotFather")
+    print("  2. Send /newbot and follow the prompts")
+    print("  3. Copy the bot token provided")
+    print()
+    print("Run 'fda setup' to open the configuration page.")
     return 0
 
 
@@ -655,6 +989,7 @@ def handle_telegram_status(args: argparse.Namespace) -> int:
 
 def handle_telegram_start(args: argparse.Namespace) -> int:
     """Start the Telegram bot."""
+    import sys
     from fda.telegram_bot import TelegramBotAgent, get_bot_token
 
     token = get_bot_token()
@@ -662,11 +997,14 @@ def handle_telegram_start(args: argparse.Namespace) -> int:
         print("Telegram bot not configured. Run: fda telegram setup")
         return 1
 
-    print("Starting Telegram bot...")
-    print("Press Ctrl+C to stop.\n")
+    print("Starting Telegram bot...", flush=True)
+    print("Press Ctrl+C to stop.\n", flush=True)
 
     try:
+        print("[DEBUG] Creating TelegramBotAgent...", flush=True)
         bot = TelegramBotAgent(bot_token=token)
+        print("[DEBUG] TelegramBotAgent created successfully", flush=True)
+        print("[DEBUG] Calling bot.start()...", flush=True)
         bot.start()
     except KeyboardInterrupt:
         print("\nStopping bot...")
@@ -864,6 +1202,156 @@ def handle_setup_server(args: argparse.Namespace) -> int:
     return 0
 
 
+def handle_setup_deps(args: argparse.Namespace) -> int:
+    """Install FDA dependencies based on platform and requested features."""
+    import subprocess
+    import sys as sys_module
+    import platform
+
+    print("FDA Dependency Setup")
+    print("=" * 50)
+
+    is_linux = sys_module.platform.startswith("linux")
+    is_macos = sys_module.platform == "darwin"
+
+    # Determine which feature sets to install
+    features = []
+    if args.all:
+        features = ["telegram", "discord", "web"]
+    else:
+        if args.telegram:
+            features.append("telegram")
+        if args.discord:
+            features.append("discord")
+        if args.web:
+            features.append("web")
+
+    # Check for system dependencies on Linux
+    if is_linux and ("discord" in features or args.all):
+        print("\n[1/3] Checking Linux system dependencies for Discord voice...")
+        print("      Discord voice requires: libffi-dev, libnacl-dev, python3-dev, ffmpeg")
+
+        # Detect package manager
+        pkg_manager = None
+        if Path("/usr/bin/apt").exists():
+            pkg_manager = "apt"
+        elif Path("/usr/bin/dnf").exists():
+            pkg_manager = "dnf"
+        elif Path("/usr/bin/pacman").exists():
+            pkg_manager = "pacman"
+
+        if pkg_manager:
+            print(f"\n      Detected package manager: {pkg_manager}")
+
+            if pkg_manager == "apt":
+                cmd = "sudo apt update && sudo apt install -y libffi-dev libnacl-dev python3-dev ffmpeg"
+            elif pkg_manager == "dnf":
+                cmd = "sudo dnf install -y libffi-devel libsodium-devel python3-devel ffmpeg"
+            elif pkg_manager == "pacman":
+                cmd = "sudo pacman -S --noconfirm libffi libsodium python ffmpeg"
+
+            if args.yes:
+                print(f"      Running: {cmd}")
+                result = subprocess.run(cmd, shell=True)
+                if result.returncode != 0:
+                    print("      Warning: System dependency installation failed.")
+                    print("      You may need to install them manually.")
+            else:
+                print(f"\n      To install system dependencies, run:")
+                print(f"      {cmd}")
+                print("\n      Or re-run with --yes to auto-install.")
+        else:
+            print("      Could not detect package manager. Please install manually:")
+            print("      - libffi development files")
+            print("      - libsodium/nacl development files")
+            print("      - Python development files")
+            print("      - ffmpeg")
+    else:
+        print("\n[1/3] System dependencies: OK (not needed or not on Linux)")
+
+    # Install Python dependencies
+    print("\n[2/3] Installing Python dependencies...")
+
+    pip_cmd = [sys_module.executable, "-m", "pip", "install", "-e", "."]
+
+    if features:
+        # Install with optional dependencies
+        extras = ",".join(features)
+        pip_cmd = [sys_module.executable, "-m", "pip", "install", "-e", f".[{extras}]"]
+        print(f"      Features: {', '.join(features)}")
+    else:
+        print("      Installing core dependencies only.")
+        print("      Use --telegram, --discord, --web, or --all for optional features.")
+
+    try:
+        # Get the project root
+        from fda.config import PROJECT_ROOT
+        # We need to install from the source directory, not PROJECT_ROOT
+        import fda
+        fda_source = Path(fda.__file__).parent.parent
+
+        print(f"      Installing from: {fda_source}")
+        result = subprocess.run(
+            pip_cmd,
+            cwd=fda_source,
+            capture_output=not args.verbose,
+        )
+
+        if result.returncode != 0:
+            print("      Error installing Python dependencies.")
+            if not args.verbose:
+                print("      Run with --verbose to see details.")
+            return 1
+
+        print("      Python dependencies installed successfully.")
+
+    except Exception as e:
+        print(f"      Error: {e}")
+        return 1
+
+    # Check for Claude Code CLI
+    print("\n[3/3] Checking for Claude Code CLI...")
+
+    try:
+        result = subprocess.run(
+            ["claude", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            version = result.stdout.strip() or result.stderr.strip()
+            print(f"      Claude Code CLI: {version}")
+        else:
+            raise FileNotFoundError()
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        print("      Claude Code CLI not found.")
+        print("\n      To install Claude Code CLI:")
+        print("      npm install -g @anthropic-ai/claude-code")
+        print("\n      Or install Node.js first:")
+        if is_linux:
+            print("      curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -")
+            print("      sudo apt install -y nodejs")
+        elif is_macos:
+            print("      brew install node")
+        print("\n      Note: Claude Code is optional but enables Max subscription features.")
+
+    # Summary
+    print("\n" + "=" * 50)
+    print("Setup complete!")
+    print("\nNext steps:")
+    print("  fda onboard       - Set up your profile")
+    print("  fda setup         - Configure integrations (web UI)")
+    print("  fda start --all   - Start all agents")
+
+    if is_linux:
+        print("\nLinux notes:")
+        print(f"  - Data directory: ~/.fda")
+        print(f"  - Override with: export FDA_ROOT=/your/path")
+
+    return 0
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     """
     Main entry point for the FDA CLI.
@@ -891,21 +1379,18 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     subparsers = parser.add_subparsers(dest="command", help="Command to execute")
 
-    # init command
-    init_parser = subparsers.add_parser("init", help="Initialize a new FDA project")
-    init_parser.add_argument(
-        "path",
-        type=Path,
-        help="Path to initialize the project at",
-    )
-    init_parser.set_defaults(func=handle_init)
-
     # start command
     start_parser = subparsers.add_parser("start", help="Start the FDA system")
     start_parser.add_argument(
         "--daemon",
         action="store_true",
         help="Run in daemon mode",
+    )
+    start_parser.add_argument(
+        "--all", "-a",
+        dest="all_agents",
+        action="store_true",
+        help="Start all peer agents (FDA, Librarian, Executor)",
     )
     start_parser.set_defaults(func=handle_start)
 
@@ -980,6 +1465,20 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     write_parser.set_defaults(func=handle_journal_write)
 
+    # journal auto (AI-generated daily journal)
+    auto_parser = journal_subparsers.add_parser(
+        "auto",
+        help="Generate an AI-written journal entry about today"
+    )
+    auto_parser.set_defaults(func=handle_write_journal)
+
+    # write_journal command (top-level alias for convenience)
+    write_journal_parser = subparsers.add_parser(
+        "write_journal",
+        help="Generate an AI-written journal entry about today"
+    )
+    write_journal_parser.set_defaults(func=handle_write_journal)
+
     # task command
     task_parser = subparsers.add_parser("task", help="Task management")
     task_subparsers = task_parser.add_subparsers(dest="task_command")
@@ -1026,6 +1525,28 @@ def main(argv: Optional[list[str]] = None) -> int:
     # config command
     config_parser = subparsers.add_parser("config", help="Show or update configuration")
     config_parser.set_defaults(func=handle_config)
+    config_subparsers = config_parser.add_subparsers(dest="config_command")
+
+    # config folders
+    folders_parser = config_subparsers.add_parser("folders", help="Manage exploration folders")
+    folders_subparsers = folders_parser.add_subparsers(dest="folders_command")
+
+    # config folders list
+    folders_list_parser = folders_subparsers.add_parser("list", help="List exploration folders")
+    folders_list_parser.set_defaults(func=handle_config_folders_list)
+
+    # config folders add
+    folders_add_parser = folders_subparsers.add_parser("add", help="Add an exploration folder")
+    folders_add_parser.add_argument("path", help="Path to folder to add")
+    folders_add_parser.set_defaults(func=handle_config_folders_add)
+
+    # config folders remove
+    folders_remove_parser = folders_subparsers.add_parser("remove", help="Remove an exploration folder")
+    folders_remove_parser.add_argument("path", help="Path to folder to remove")
+    folders_remove_parser.set_defaults(func=handle_config_folders_remove)
+
+    # Set default action for 'fda config folders' (no subcommand)
+    folders_parser.set_defaults(func=handle_config_folders_list)
 
     # discord command
     discord_parser = subparsers.add_parser("discord", help="Discord voice bot operations")
@@ -1135,14 +1656,58 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     setup_parser.set_defaults(func=handle_setup_server)
 
+    # setup-deps command - install dependencies
+    setup_deps_parser = subparsers.add_parser(
+        "setup-deps",
+        help="Install FDA dependencies (handles Linux system deps)",
+    )
+    setup_deps_parser.add_argument(
+        "--all", "-a",
+        action="store_true",
+        help="Install all optional dependencies (telegram, discord, web)",
+    )
+    setup_deps_parser.add_argument(
+        "--telegram",
+        action="store_true",
+        help="Install Telegram bot dependencies",
+    )
+    setup_deps_parser.add_argument(
+        "--discord",
+        action="store_true",
+        help="Install Discord bot dependencies (voice support)",
+    )
+    setup_deps_parser.add_argument(
+        "--web",
+        action="store_true",
+        help="Install web setup server dependencies",
+    )
+    setup_deps_parser.add_argument(
+        "--yes", "-y",
+        action="store_true",
+        help="Auto-install system dependencies without prompting (Linux)",
+    )
+    setup_deps_parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Show detailed pip output",
+    )
+    setup_deps_parser.set_defaults(func=handle_setup_deps)
+
     args = parser.parse_args(argv)
 
     if args.verbose:
         logging.basicConfig(level=logging.DEBUG)
 
     if not hasattr(args, "func"):
-        parser.print_help()
-        return 1
+        print("FDA - Your Personal AI Assistant")
+        print("=" * 40)
+        print("\nGetting started:")
+        print("  fda onboard       - Set up your profile")
+        print("  fda setup         - Configure integrations (web UI)")
+        print("  fda ask \"...\"     - Ask a question")
+        print("  fda write_journal - Write today's journal entry")
+        print("\nRun 'fda --help' for all commands.")
+        return 0
 
     try:
         return args.func(args)

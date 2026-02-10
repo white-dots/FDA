@@ -2,18 +2,46 @@
 Configuration and constants for the FDA system.
 
 Defines model names, file paths, and system defaults.
+
+Cross-platform support:
+- Set FDA_ROOT environment variable to override the default project root
+- On macOS: defaults to ~/Documents/agenthub/fda-system
+- On Linux: defaults to ~/.fda
+- On Windows: defaults to ~/.fda
 """
 
+import os
+import sys
 from pathlib import Path
 from typing import Final
 
+
+def _get_default_project_root() -> Path:
+    """Get the default project root based on platform."""
+    # Allow override via environment variable
+    if env_root := os.environ.get("FDA_ROOT"):
+        return Path(env_root).expanduser()
+
+    # Platform-specific defaults
+    if sys.platform == "darwin":
+        # macOS: use Documents folder (traditional location)
+        return Path.home() / "Documents" / "agenthub" / "fda-system"
+    else:
+        # Linux/Windows: use hidden directory in home
+        return Path.home() / ".fda"
+
+
 # Model names for Claude API
-MODEL_FDA: Final[str] = "claude-opus-4-5-20251101"  # Full power for FDA agent
-MODEL_EXECUTOR: Final[str] = "claude-3-5-sonnet-20241022"  # Balanced for executor
-MODEL_LIBRARIAN: Final[str] = "claude-3-5-sonnet-20241022"  # Balanced for librarian
+# Using Haiku for all agents - complex tasks are delegated to Claude Code (Max subscription)
+MODEL_FDA: Final[str] = "claude-3-5-haiku-20241022"  # Fast and cheap for routing/simple tasks
+MODEL_EXECUTOR: Final[str] = "claude-3-5-haiku-20241022"  # Fast for command execution
+MODEL_LIBRARIAN: Final[str] = "claude-3-5-haiku-20241022"  # Fast for file indexing/search
+
+# Use Sonnet for quality-critical tasks (meeting summaries, daily journals)
+MODEL_MEETING_SUMMARY: Final[str] = "claude-sonnet-4-20250514"  # Better for long transcripts
 
 # Project root and directory structure
-PROJECT_ROOT: Final[Path] = Path.home() / "Documents" / "agenthub" / "fda-system"
+PROJECT_ROOT: Final[Path] = _get_default_project_root()
 JOURNAL_DIR: Final[Path] = PROJECT_ROOT / "journal"
 STATE_DB_PATH: Final[Path] = PROJECT_ROOT / "state.db"
 MESSAGE_BUS_PATH: Final[Path] = PROJECT_ROOT / "message_bus.json"
@@ -39,7 +67,8 @@ DECAY_RATES: Final[dict[str, float]] = {
 OUTLOOK_API_ENDPOINT: Final[str] = "https://graph.microsoft.com/v1.0"
 
 # Data directory (for token caches, etc.)
-DATA_DIR: Final[Path] = Path.home() / ".fda" / "data"
+# Always under PROJECT_ROOT for consistency
+DATA_DIR: Final[Path] = PROJECT_ROOT / "data"
 
 # Telegram configuration
 TELEGRAM_BOT_TOKEN_ENV: Final[str] = "TELEGRAM_BOT_TOKEN"

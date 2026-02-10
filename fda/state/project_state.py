@@ -142,6 +142,58 @@ class ProjectState:
             )
         """)
 
+        # File index table - Librarian's file tracking
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS file_index (
+                id TEXT PRIMARY KEY,
+                path TEXT UNIQUE NOT NULL,
+                extension TEXT,
+                size INTEGER,
+                modified_at TEXT,
+                indexed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                summary TEXT,
+                tags TEXT
+            )
+        """)
+
+        # Discoveries table - agent exploration findings
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS discoveries (
+                id TEXT PRIMARY KEY,
+                agent TEXT NOT NULL,
+                discovery_type TEXT NOT NULL,
+                description TEXT NOT NULL,
+                details TEXT,
+                discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Agent status table - peer agent health tracking
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS agent_status (
+                agent_name TEXT PRIMARY KEY,
+                status TEXT NOT NULL DEFAULT 'stopped',
+                last_heartbeat TIMESTAMP,
+                current_task TEXT
+            )
+        """)
+
+        # Code routes table - Librarian's routing system for code structure
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS code_routes (
+                id TEXT PRIMARY KEY,
+                file_path TEXT NOT NULL,
+                route_type TEXT NOT NULL,
+                name TEXT NOT NULL,
+                line_number INTEGER,
+                signature TEXT,
+                docstring TEXT,
+                keywords TEXT,
+                indexed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (file_path) REFERENCES file_index(path)
+            )
+        """)
+
         # Create indexes for common queries
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_tasks_owner ON tasks(owner)")
@@ -150,6 +202,12 @@ class ProjectState:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_meeting_prep_event ON meeting_prep(event_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_telegram_active ON telegram_users(is_active)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_discord_status ON discord_sessions(status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_file_index_ext ON file_index(extension)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_discoveries_agent ON discoveries(agent)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_discoveries_type ON discoveries(discovery_type)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_code_routes_type ON code_routes(route_type)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_code_routes_name ON code_routes(name)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_code_routes_file ON code_routes(file_path)")
 
         conn.commit()
 
@@ -712,6 +770,474 @@ class ProjectState:
         )
         rows = cursor.fetchall()
         return [dict(row) for row in rows]
+
+    # File index methods (for Librarian)
+
+    def add_file_to_index(
+        self,
+        path: str,
+        extension: Optional[str] = None,
+        size: Optional[int] = None,
+        modified_at: Optional[str] = None,
+        summary: Optional[str] = None,
+        tags: Optional[list[str]] = None,
+    ) -> str:
+        """
+        Add or update a file in the index.
+
+        Args:
+            path: Absolute file path.
+            extension: File extension (e.g., 'py', 'md').
+            size: File size in bytes.
+            modified_at: File modification timestamp.
+            summary: AI-generated file summary.
+            tags: List of tags for categorization.
+
+        Returns:
+            Generated file index ID.
+        """
+        file_id = f"file_{uuid.uuid4().hex[:8]}"
+        now = datetime.now().isoformat()
+        tags_json = json.dumps(tags) if tags else None
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO file_index (id, path, extension, size, modified_at, indexed_at, summary, tags)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(path) DO UPDATE SET
+                extension = excluded.extension,
+                size = excluded.size,
+                modified_at = excluded.modified_at,
+                indexed_at = excluded.indexed_at,
+                summary = excluded.summary,
+                tags = excluded.tags
+            """,
+            (file_id, path, extension, size, modified_at, now, summary, tags_json),
+        )
+        conn.commit()
+        return file_id
+
+    def get_file_from_index(self, path: str) -> Optional[dict[str, Any]]:
+        """
+        Get a file from the index by path.
+
+        Args:
+            path: File path to look up.
+
+        Returns:
+            File index entry or None if not found.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM file_index WHERE path = ?", (path,))
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        if result.get("tags"):
+            result["tags"] = json.loads(result["tags"])
+        return result
+
+    def search_file_index(
+        self,
+        extension: Optional[str] = None,
+        tags: Optional[list[str]] = None,
+        path_pattern: Optional[str] = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """
+        Search the file index.
+
+        Args:
+            extension: Filter by file extension.
+            tags: Filter by tags (any match).
+            path_pattern: Filter by path pattern (SQL LIKE).
+            limit: Maximum results to return.
+
+        Returns:
+            List of matching file index entries.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        query = "SELECT * FROM file_index WHERE 1=1"
+        params: list[Any] = []
+
+        if extension:
+            query += " AND extension = ?"
+            params.append(extension)
+        if path_pattern:
+            query += " AND path LIKE ?"
+            params.append(path_pattern)
+
+        query += " ORDER BY indexed_at DESC LIMIT ?"
+        params.append(limit)
+
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+
+        results = []
+        for row in rows:
+            entry = dict(row)
+            if entry.get("tags"):
+                entry["tags"] = json.loads(entry["tags"])
+            # Filter by tags if specified (needs to be done in Python for JSON)
+            if tags:
+                entry_tags = entry.get("tags") or []
+                if not any(t in entry_tags for t in tags):
+                    continue
+            results.append(entry)
+
+        return results
+
+    def remove_file_from_index(self, path: str) -> None:
+        """
+        Remove a file from the index.
+
+        Args:
+            path: File path to remove.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM file_index WHERE path = ?", (path,))
+        conn.commit()
+
+    def get_file_index_stats(self) -> dict[str, Any]:
+        """
+        Get statistics about the file index.
+
+        Returns:
+            Dictionary with counts by extension and total files.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        # Total count
+        cursor.execute("SELECT COUNT(*) as total FROM file_index")
+        total = cursor.fetchone()["total"]
+
+        # Count by extension
+        cursor.execute(
+            "SELECT extension, COUNT(*) as count FROM file_index GROUP BY extension ORDER BY count DESC"
+        )
+        by_extension = {row["extension"] or "none": row["count"] for row in cursor.fetchall()}
+
+        return {"total": total, "by_extension": by_extension}
+
+    # Code routes methods (for routing system)
+
+    def add_code_route(
+        self,
+        file_path: str,
+        route_type: str,
+        name: str,
+        line_number: Optional[int] = None,
+        signature: Optional[str] = None,
+        docstring: Optional[str] = None,
+        keywords: Optional[list[str]] = None,
+    ) -> str:
+        """
+        Add a code route (function, class, endpoint, etc.) to the routing index.
+
+        Args:
+            file_path: Path to the file containing the route.
+            route_type: Type of route (function, class, method, endpoint, handler).
+            name: Name of the function/class/endpoint.
+            line_number: Line number in the file.
+            signature: Function/method signature.
+            docstring: Documentation string.
+            keywords: Keywords for search indexing.
+
+        Returns:
+            Generated route ID.
+        """
+        route_id = f"route_{uuid.uuid4().hex[:8]}"
+        keywords_json = json.dumps(keywords) if keywords else None
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT OR REPLACE INTO code_routes
+            (id, file_path, route_type, name, line_number, signature, docstring, keywords, indexed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (route_id, file_path, route_type, name, line_number, signature,
+             docstring[:500] if docstring else None, keywords_json, datetime.now().isoformat()),
+        )
+        conn.commit()
+        return route_id
+
+    def search_code_routes(
+        self,
+        query: str,
+        route_type: Optional[str] = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """
+        Search code routes by name, keywords, or docstring.
+
+        Args:
+            query: Search query (searches name, keywords, docstring).
+            route_type: Filter by route type.
+            limit: Maximum results.
+
+        Returns:
+            List of matching code routes.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        sql = """
+            SELECT * FROM code_routes
+            WHERE (name LIKE ? OR keywords LIKE ? OR docstring LIKE ?)
+        """
+        params: list[Any] = [f"%{query}%", f"%{query}%", f"%{query}%"]
+
+        if route_type:
+            sql += " AND route_type = ?"
+            params.append(route_type)
+
+        sql += " ORDER BY name LIMIT ?"
+        params.append(limit)
+
+        cursor.execute(sql, params)
+        rows = cursor.fetchall()
+
+        results = []
+        for row in rows:
+            entry = dict(row)
+            if entry.get("keywords"):
+                entry["keywords"] = json.loads(entry["keywords"])
+            results.append(entry)
+
+        return results
+
+    def get_routes_for_file(self, file_path: str) -> list[dict[str, Any]]:
+        """
+        Get all code routes in a specific file.
+
+        Args:
+            file_path: Path to the file.
+
+        Returns:
+            List of code routes in the file.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM code_routes WHERE file_path = ? ORDER BY line_number",
+            (file_path,)
+        )
+        rows = cursor.fetchall()
+
+        results = []
+        for row in rows:
+            entry = dict(row)
+            if entry.get("keywords"):
+                entry["keywords"] = json.loads(entry["keywords"])
+            results.append(entry)
+
+        return results
+
+    def get_code_routes_stats(self) -> dict[str, Any]:
+        """
+        Get statistics about the code routes index.
+
+        Returns:
+            Dictionary with counts by type and total routes.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT COUNT(*) as total FROM code_routes")
+        total = cursor.fetchone()["total"]
+
+        cursor.execute(
+            "SELECT route_type, COUNT(*) as count FROM code_routes GROUP BY route_type ORDER BY count DESC"
+        )
+        by_type = {row["route_type"]: row["count"] for row in cursor.fetchall()}
+
+        return {"total": total, "by_type": by_type}
+
+    def clear_routes_for_file(self, file_path: str) -> int:
+        """
+        Clear all routes for a file (used before re-indexing).
+
+        Args:
+            file_path: Path to the file.
+
+        Returns:
+            Number of routes deleted.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM code_routes WHERE file_path = ?", (file_path,))
+        deleted = cursor.rowcount
+        conn.commit()
+        return deleted
+
+    # Discovery methods (for agent exploration findings)
+
+    def add_discovery(
+        self,
+        agent: str,
+        discovery_type: str,
+        description: str,
+        details: Optional[dict[str, Any]] = None,
+    ) -> str:
+        """
+        Record a discovery made by an agent.
+
+        Args:
+            agent: Agent name that made the discovery.
+            discovery_type: Type of discovery (file, pattern, tool, capability).
+            description: Human-readable description.
+            details: Additional details as dictionary.
+
+        Returns:
+            Generated discovery ID.
+        """
+        discovery_id = f"disc_{uuid.uuid4().hex[:8]}"
+        now = datetime.now().isoformat()
+        details_json = json.dumps(details) if details else None
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO discoveries (id, agent, discovery_type, description, details, discovered_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (discovery_id, agent, discovery_type, description, details_json, now),
+        )
+        conn.commit()
+        return discovery_id
+
+    def get_discoveries(
+        self,
+        agent: Optional[str] = None,
+        discovery_type: Optional[str] = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """
+        Get discoveries, optionally filtered.
+
+        Args:
+            agent: Filter by agent name.
+            discovery_type: Filter by discovery type.
+            limit: Maximum results to return.
+
+        Returns:
+            List of discovery entries.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        query = "SELECT * FROM discoveries WHERE 1=1"
+        params: list[Any] = []
+
+        if agent:
+            query += " AND agent = ?"
+            params.append(agent)
+        if discovery_type:
+            query += " AND discovery_type = ?"
+            params.append(discovery_type)
+
+        query += " ORDER BY discovered_at DESC LIMIT ?"
+        params.append(limit)
+
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+
+        results = []
+        for row in rows:
+            entry = dict(row)
+            if entry.get("details"):
+                entry["details"] = json.loads(entry["details"])
+            results.append(entry)
+
+        return results
+
+    # Agent status methods (for peer coordination)
+
+    def update_agent_status(
+        self,
+        agent_name: str,
+        status: str,
+        current_task: Optional[str] = None,
+    ) -> None:
+        """
+        Update an agent's status.
+
+        Args:
+            agent_name: Name of the agent.
+            status: Current status (running, stopped, exploring, busy).
+            current_task: Optional description of current task.
+        """
+        now = datetime.now().isoformat()
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO agent_status (agent_name, status, last_heartbeat, current_task)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(agent_name) DO UPDATE SET
+                status = excluded.status,
+                last_heartbeat = excluded.last_heartbeat,
+                current_task = excluded.current_task
+            """,
+            (agent_name, status, now, current_task),
+        )
+        conn.commit()
+
+    def get_agent_status(self, agent_name: str) -> Optional[dict[str, Any]]:
+        """
+        Get an agent's current status.
+
+        Args:
+            agent_name: Name of the agent.
+
+        Returns:
+            Agent status dictionary or None if not found.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM agent_status WHERE agent_name = ?", (agent_name,))
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        return dict(row)
+
+    def get_all_agent_statuses(self) -> list[dict[str, Any]]:
+        """
+        Get status of all agents.
+
+        Returns:
+            List of agent status dictionaries.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM agent_status ORDER BY agent_name")
+        rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    def agent_heartbeat(self, agent_name: str) -> None:
+        """
+        Update an agent's heartbeat timestamp.
+
+        Args:
+            agent_name: Name of the agent.
+        """
+        now = datetime.now().isoformat()
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE agent_status SET last_heartbeat = ? WHERE agent_name = ?
+            """,
+            (now, agent_name),
+        )
+        conn.commit()
 
     def close(self) -> None:
         """Close the database connection."""

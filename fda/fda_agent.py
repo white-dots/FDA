@@ -1,12 +1,16 @@
 """
 FDA (Facilitating Director Agent) implementation.
 
-The FDA agent is your personal AI assistant for managing your daily work,
-tasks, calendar, and communications across your entire computer environment.
+FDA is a PEER agent - the user-facing interface of the multi-agent system.
+It communicates with users via Discord voice (primary) and Telegram (secondary),
+and collaborates with Librarian and Executor agents to fulfill requests.
+
+FDA does NOT boss the other agents - they are equals collaborating via message bus.
 """
 
 import logging
 import time
+import json
 from pathlib import Path
 from typing import Any, Optional
 from datetime import datetime
@@ -14,20 +18,28 @@ from datetime import datetime
 from fda.base_agent import BaseAgent
 from fda.config import MODEL_FDA, DEFAULT_CHECK_INTERVAL_MINUTES
 from fda.outlook import OutlookCalendar
+from fda.comms.message_bus import MessageTypes, Agents
 
 logger = logging.getLogger(__name__)
 
 
-FDA_SYSTEM_PROMPT = """You are FDA (Facilitating Director Agent), a personal AI assistant running on the user's computer.
+FDA_SYSTEM_PROMPT = """You are FDA (Facilitating Director Agent), a personal AI assistant - a PERSONA living on the user's computer.
 
-You are NOT a project management tool for software development. You are a general-purpose personal assistant that helps the user manage their daily work and life.
+You are the user-facing interface of a multi-agent system. You work with two peer agents:
+- **Librarian**: Knows about files, documents, and knowledge on the computer
+- **Executor**: Can run commands, create files, and take actions
+
+You collaborate with these peers - you don't boss them around. When the user asks for something:
+- If it's about finding files or information → Ask Librarian
+- If it's about running commands or making changes → Ask Executor
+- If you can answer directly from your knowledge → Do so
 
 Your scope is the user's entire work environment:
 - Their calendar and meetings
 - Their tasks and to-do items
-- Their communications (Telegram, Discord, email)
-- Their notes and journal entries
-- Anything they need help tracking or remembering
+- Their communications (Telegram, Discord voice)
+- Their files and documents (via Librarian)
+- Commands and actions (via Executor)
 
 Your personality:
 - Helpful and proactive, like a skilled executive assistant
@@ -40,24 +52,18 @@ When responding:
 - Talk naturally, like a helpful colleague
 - Don't use excessive formatting unless it helps clarity
 - Be brief for simple questions, detailed when needed
-- If you don't have information, just say so plainly
-- Offer to help track or remember things for the user
+- When you need to search or run something, tell the user you're asking your peers
 
-You have access to:
-- Tasks the user wants to track
-- Journal entries and notes
-- Calendar events (if connected)
-- Alerts and reminders
-- Historical context from past interactions
+You are the voice and face of the system. The user talks to YOU via Discord voice or Telegram.
 """
 
 
 class FDAAgent(BaseAgent):
     """
-    Facilitating Director Agent - your personal AI assistant.
+    Facilitating Director Agent - the user-facing peer agent.
 
-    FDA helps you manage your daily work, tasks, calendar, and communications
-    across your entire computer environment.
+    FDA is the primary interface for users via Discord voice and Telegram.
+    It collaborates with Librarian and Executor agents to fulfill requests.
     """
 
     def __init__(
@@ -88,20 +94,32 @@ class FDAAgent(BaseAgent):
                 client_secret=outlook_config.get("client_secret"),
             )
 
+        # Track pending requests to peer agents
+        self.pending_requests: dict[str, dict[str, Any]] = {}
+
     def run_event_loop(self) -> None:
         """
         Run the main event loop for the FDA agent.
 
-        Periodically checks for messages, monitors project health,
-        and prepares for upcoming meetings.
+        As a peer agent:
+        1. Process messages from peer agents (Librarian, Executor)
+        2. Handle user requests from Discord/Telegram
+        3. Monitor project health and upcoming meetings
         """
         logger.info("[FDA] Starting event loop...")
 
-        check_interval = DEFAULT_CHECK_INTERVAL_MINUTES * 60  # Convert to seconds
+        # Update agent status
+        self.state.update_agent_status(self.name.lower(), "running", "Starting up")
+
+        check_interval = min(DEFAULT_CHECK_INTERVAL_MINUTES * 60, 30)  # Check frequently
 
         while self._running:
             try:
-                # Process pending messages
+                # Heartbeat
+                self.state.agent_heartbeat(self.name.lower())
+                self.state.update_agent_status(self.name.lower(), "running")
+
+                # Process pending messages from peers
                 messages = self.get_pending_messages()
                 for message in messages:
                     self._handle_message(message)
@@ -110,9 +128,6 @@ class FDAAgent(BaseAgent):
                 if self.calendar:
                     self._check_upcoming_meetings()
 
-                # Periodic health check (less frequent)
-                # This could be expanded to run at specific intervals
-
                 time.sleep(check_interval)
 
             except KeyboardInterrupt:
@@ -120,24 +135,48 @@ class FDAAgent(BaseAgent):
                 break
             except Exception as e:
                 logger.error(f"[FDA] Error in event loop: {e}")
-                time.sleep(60)  # Wait before retrying
+                time.sleep(60)
 
+        self.state.update_agent_status(self.name.lower(), "stopped")
         logger.info("[FDA] Event loop stopped")
 
     def _handle_message(self, message: dict[str, Any]) -> None:
-        """Handle an incoming message."""
+        """Handle an incoming message from a peer agent."""
         msg_type = message.get("type", "")
         subject = message.get("subject", "")
         body = message.get("body", "")
         from_agent = message.get("from", "")
+        msg_id = message.get("id", "")
+        reply_to = message.get("reply_to")
 
-        logger.info(f"[FDA] Processing message from {from_agent}: {subject}")
+        logger.info(f"[FDA] Received {msg_type} from {from_agent}: {subject}")
+        self.message_bus.mark_read(msg_id)
 
-        self.message_bus.mark_read(message["id"])
+        # Handle responses from peer agents
+        if msg_type in [
+            MessageTypes.SEARCH_RESULT,
+            MessageTypes.EXECUTE_RESULT,
+            MessageTypes.FILE_COMPLETE,
+            MessageTypes.KNOWLEDGE_RESULT,
+            MessageTypes.INDEX_COMPLETE,
+        ]:
+            self._handle_peer_response(message)
 
-        if msg_type == "review_request":
-            # Handle review request from Executor
-            task_id = body  # Assuming body contains task_id
+        elif msg_type == MessageTypes.DISCOVERY:
+            # Peer agent shared a discovery
+            self._handle_discovery(message)
+
+        elif msg_type == MessageTypes.BLOCKER:
+            # Peer agent reports being blocked
+            self.add_alert("warning", f"Blocker from {from_agent}: {subject} - {body}")
+
+        elif msg_type == MessageTypes.STATUS_RESPONSE:
+            # Peer agent status update
+            logger.info(f"[FDA] Status from {from_agent}: {body}")
+
+        # Legacy message types
+        elif msg_type == "review_request":
+            task_id = body
             result = self.review_task(task_id)
             self.send_message(
                 to_agent=from_agent,
@@ -147,13 +186,59 @@ class FDAAgent(BaseAgent):
             )
 
         elif msg_type == "blocker":
-            # Handle blocker report
             self.add_alert("warning", f"Blocker reported: {subject} - {body}")
 
         elif msg_type == "alert":
-            # Handle alert from other agents
             level = "critical" if "critical" in subject.lower() else "warning"
             self.add_alert(level, body)
+
+    def _handle_peer_response(self, message: dict[str, Any]) -> None:
+        """Handle a response from a peer agent (Librarian or Executor)."""
+        msg_type = message.get("type", "")
+        body = message.get("body", "")
+        from_agent = message.get("from", "")
+        reply_to = message.get("reply_to")
+
+        try:
+            result_data = json.loads(body)
+        except (json.JSONDecodeError, TypeError):
+            result_data = {"result": body}
+
+        success = result_data.get("success", True)
+        result = result_data.get("result")
+        error = result_data.get("error")
+
+        # Store the response for retrieval
+        if reply_to and reply_to in self.pending_requests:
+            self.pending_requests[reply_to]["response"] = result_data
+            self.pending_requests[reply_to]["completed"] = True
+            logger.info(f"[FDA] Received response for request {reply_to}")
+
+        if error:
+            logger.warning(f"[FDA] Peer {from_agent} reported error: {error}")
+
+    def _handle_discovery(self, message: dict[str, Any]) -> None:
+        """Handle a discovery shared by a peer agent."""
+        body = message.get("body", "")
+        from_agent = message.get("from", "")
+
+        try:
+            discovery_data = json.loads(body)
+            discovery_type = discovery_data.get("discovery_type", "unknown")
+            description = discovery_data.get("description", "")
+
+            logger.info(f"[FDA] Discovery from {from_agent}: {discovery_type} - {description}")
+
+            # Store in state for future reference
+            self.state.add_discovery(
+                agent=from_agent,
+                discovery_type=discovery_type,
+                description=description,
+                details=discovery_data.get("details"),
+            )
+
+        except (json.JSONDecodeError, TypeError):
+            logger.info(f"[FDA] Discovery from {from_agent}: {body}")
 
     def _check_upcoming_meetings(self) -> None:
         """Check for upcoming meetings and prepare if needed."""
@@ -180,6 +265,215 @@ class FDAAgent(BaseAgent):
 
         except Exception as e:
             logger.error(f"[FDA] Error checking meetings: {e}")
+
+    # ========== Peer Request Methods ==========
+
+    def request_file_search(
+        self,
+        query: str,
+        path: Optional[str] = None,
+        wait_for_response: bool = True,
+        timeout: float = 30.0,
+    ) -> Optional[dict[str, Any]]:
+        """
+        Request a file search from the Librarian peer.
+
+        Args:
+            query: Search query.
+            path: Optional path to search within.
+            wait_for_response: Whether to wait for the response.
+            timeout: How long to wait for response.
+
+        Returns:
+            Search results if wait_for_response=True, else the request ID.
+        """
+        msg_id = self.message_bus.request_search(
+            from_agent=self.name.lower(),
+            query=query,
+            path=path,
+        )
+
+        self.pending_requests[msg_id] = {
+            "type": "search",
+            "query": query,
+            "sent_at": datetime.now().isoformat(),
+            "completed": False,
+            "response": None,
+        }
+
+        if wait_for_response:
+            response = self.message_bus.wait_for_response(
+                agent_name=self.name.lower(),
+                request_id=msg_id,
+                timeout_seconds=timeout,
+            )
+            if response:
+                self._handle_peer_response(response)
+                return self.pending_requests[msg_id].get("response")
+
+        return {"request_id": msg_id}
+
+    def request_command_execution(
+        self,
+        command: str,
+        cwd: Optional[str] = None,
+        wait_for_response: bool = True,
+        timeout: float = 60.0,
+    ) -> Optional[dict[str, Any]]:
+        """
+        Request command execution from the Executor peer.
+
+        Args:
+            command: Command to execute.
+            cwd: Working directory.
+            wait_for_response: Whether to wait for the response.
+            timeout: How long to wait for response.
+
+        Returns:
+            Execution results if wait_for_response=True, else the request ID.
+        """
+        msg_id = self.message_bus.request_execute(
+            from_agent=self.name.lower(),
+            command=command,
+            cwd=cwd,
+        )
+
+        self.pending_requests[msg_id] = {
+            "type": "execute",
+            "command": command,
+            "sent_at": datetime.now().isoformat(),
+            "completed": False,
+            "response": None,
+        }
+
+        if wait_for_response:
+            response = self.message_bus.wait_for_response(
+                agent_name=self.name.lower(),
+                request_id=msg_id,
+                timeout_seconds=timeout,
+            )
+            if response:
+                self._handle_peer_response(response)
+                return self.pending_requests[msg_id].get("response")
+
+        return {"request_id": msg_id}
+
+    def request_file_operation(
+        self,
+        operation: str,
+        path: str,
+        content: Optional[str] = None,
+        destination: Optional[str] = None,
+        wait_for_response: bool = True,
+        timeout: float = 30.0,
+    ) -> Optional[dict[str, Any]]:
+        """
+        Request a file operation from the Executor peer.
+
+        Args:
+            operation: Operation type ('create', 'edit', 'delete', 'read', 'copy', 'move').
+            path: File path.
+            content: Content for create/edit.
+            destination: Destination for copy/move.
+            wait_for_response: Whether to wait for the response.
+            timeout: How long to wait for response.
+
+        Returns:
+            Operation results if wait_for_response=True, else the request ID.
+        """
+        msg_id = self.message_bus.request_file_operation(
+            from_agent=self.name.lower(),
+            operation=operation,
+            path=path,
+            content=content,
+        )
+
+        self.pending_requests[msg_id] = {
+            "type": "file_operation",
+            "operation": operation,
+            "path": path,
+            "sent_at": datetime.now().isoformat(),
+            "completed": False,
+            "response": None,
+        }
+
+        if wait_for_response:
+            response = self.message_bus.wait_for_response(
+                agent_name=self.name.lower(),
+                request_id=msg_id,
+                timeout_seconds=timeout,
+            )
+            if response:
+                self._handle_peer_response(response)
+                return self.pending_requests[msg_id].get("response")
+
+        return {"request_id": msg_id}
+
+    def request_knowledge(
+        self,
+        question: str,
+        context: Optional[dict[str, Any]] = None,
+        wait_for_response: bool = True,
+        timeout: float = 30.0,
+    ) -> Optional[dict[str, Any]]:
+        """
+        Request knowledge/information from the Librarian peer.
+
+        Args:
+            question: Question to ask.
+            context: Additional context.
+            wait_for_response: Whether to wait for the response.
+            timeout: How long to wait for response.
+
+        Returns:
+            Knowledge results if wait_for_response=True, else the request ID.
+        """
+        msg_id = self.message_bus.request_knowledge(
+            from_agent=self.name.lower(),
+            question=question,
+            context=context,
+        )
+
+        self.pending_requests[msg_id] = {
+            "type": "knowledge",
+            "question": question,
+            "sent_at": datetime.now().isoformat(),
+            "completed": False,
+            "response": None,
+        }
+
+        if wait_for_response:
+            response = self.message_bus.wait_for_response(
+                agent_name=self.name.lower(),
+                request_id=msg_id,
+                timeout_seconds=timeout,
+            )
+            if response:
+                self._handle_peer_response(response)
+                return self.pending_requests[msg_id].get("response")
+
+        return {"request_id": msg_id}
+
+    def get_peer_status(self, agent_name: str) -> Optional[dict[str, Any]]:
+        """
+        Get the status of a peer agent.
+
+        Args:
+            agent_name: Name of the peer agent.
+
+        Returns:
+            Agent status dictionary.
+        """
+        return self.state.get_agent_status(agent_name.lower())
+
+    def get_all_peer_statuses(self) -> list[dict[str, Any]]:
+        """
+        Get status of all peer agents.
+
+        Returns:
+            List of agent status dictionaries.
+        """
+        return self.state.get_all_agent_statuses()
 
     def onboard_interactive(self) -> dict[str, Any]:
         """
@@ -251,6 +545,32 @@ class FDAAgent(BaseAgent):
         responses["check_in_time"] = input("What time should I do daily check-ins? (e.g., '9:00 AM' or 'skip') > ").strip()
         responses["communication_style"] = input("How should I communicate? (brief/detailed/adaptive) > ").strip() or "adaptive"
 
+        # Question 5: Timezone
+        print("\n" + "-" * 40)
+        print("5. TIMEZONE")
+        print("-" * 40)
+        print("What's your timezone? Examples: America/New_York, Europe/London, Asia/Tokyo")
+        print("(Enter 'auto' to detect from system, or just press Enter to skip)")
+        tz_response = input("Timezone > ").strip()
+
+        if tz_response.lower() == "auto" or not tz_response:
+            # Try to detect system timezone
+            responses["timezone"] = self._detect_system_timezone()
+            if responses["timezone"]:
+                print(f"  Detected timezone: {responses['timezone']}")
+            else:
+                print("  Could not detect timezone, will use system default")
+        else:
+            # Validate the provided timezone
+            from fda.utils.timezone import validate_timezone
+            validated_tz = validate_timezone(tz_response)
+            if validated_tz:
+                responses["timezone"] = validated_tz
+                print(f"  Using timezone: {validated_tz}")
+            else:
+                print(f"  Warning: '{tz_response}' doesn't look like a valid timezone. Using system default.")
+                responses["timezone"] = None
+
         # Now process with Claude to create a personalized setup
         print("\n" + "=" * 60)
         print("Setting up your personalized FDA assistant...")
@@ -263,6 +583,7 @@ class FDAAgent(BaseAgent):
         self.state.set_context("user_goals", responses["goals"])
         self.state.set_context("user_challenges", responses["challenges"])
         self.state.set_context("communication_style", responses["communication_style"])
+        self.state.set_context("user_timezone", responses.get("timezone"))
         self.state.set_context("onboarded", True)
         self.state.set_context("onboarded_at", datetime.now().isoformat())
 
@@ -309,6 +630,7 @@ class FDAAgent(BaseAgent):
 
 - **Daily check-in time:** {responses['check_in_time'] if responses['check_in_time'] and responses['check_in_time'].lower() != 'skip' else 'Not set'}
 - **Communication style:** {responses['communication_style']}
+- **Timezone:** {responses.get('timezone') or 'System default'}
 
 ---
 
@@ -376,6 +698,158 @@ Keep it warm and conversational. Don't use excessive formatting. End by asking w
         """Check if the user has completed onboarding."""
         return bool(self.state.get_context("onboarded"))
 
+    def _detect_system_timezone(self) -> Optional[str]:
+        """
+        Try to detect the system's timezone.
+
+        Returns:
+            IANA timezone name or None if detection fails.
+        """
+        from fda.utils.timezone import detect_system_timezone
+        return detect_system_timezone()
+
+    def gather_daily_context(self, start_of_day: datetime, end_of_day: datetime) -> dict[str, Any]:
+        """
+        Gather context from today for journal generation.
+
+        Args:
+            start_of_day: Start of day in user's timezone.
+            end_of_day: End of day in user's timezone.
+
+        Returns:
+            Dictionary containing today's context.
+        """
+        today_str = start_of_day.strftime("%Y-%m-%d")
+
+        context = {
+            "date": start_of_day.strftime("%A, %B %d, %Y"),
+            "date_iso": today_str,
+            "user_name": self.state.get_context("user_name"),
+            "user_role": self.state.get_context("user_role"),
+            "user_goals": self.state.get_context("user_goals"),
+        }
+
+        # Get all tasks and filter for today
+        all_tasks = self.state.get_tasks()
+        today_tasks = []
+        completed_today = []
+        in_progress = []
+
+        for t in all_tasks:
+            updated_at = t.get("updated_at", "")
+            if isinstance(updated_at, str) and updated_at.startswith(today_str):
+                today_tasks.append(t)
+                if t.get("status") == "completed":
+                    completed_today.append(t)
+            if t.get("status") == "in_progress":
+                in_progress.append(t)
+
+        context["tasks_completed_today"] = [t.get("title") for t in completed_today]
+        context["tasks_in_progress"] = [t.get("title") for t in in_progress[:5]]
+        context["tasks_updated_today"] = len(today_tasks)
+
+        # Get calendar events for today (if calendar connected)
+        context["calendar_events"] = []
+        if self.calendar:
+            try:
+                events = self.calendar.get_events_today()
+                context["calendar_events"] = [
+                    {"subject": e.get("subject"), "start": e.get("start")}
+                    for e in events
+                ]
+            except Exception as e:
+                logger.debug(f"Could not fetch calendar events: {e}")
+
+        # Get journal entries from today
+        recent_entries = self.search_journal("", top_n=10)
+        today_entries = [
+            e for e in recent_entries
+            if e.get("created_at", "").startswith(today_str)
+        ]
+        context["journal_entries_today"] = [e.get("summary") for e in today_entries]
+
+        # Get any alerts from today
+        alerts = self.state.get_alerts()
+        today_alerts = [
+            a for a in alerts
+            if a.get("created_at", "").startswith(today_str)
+        ]
+        context["alerts_today"] = [a.get("message") for a in today_alerts[:5]]
+
+        # Get any decisions made today
+        decisions = self.state.get_decisions(limit=10)
+        today_decisions = [
+            d for d in decisions
+            if d.get("created_at", "").startswith(today_str)
+        ]
+        context["decisions_today"] = [d.get("title") for d in today_decisions]
+
+        return context
+
+    def generate_daily_journal(self, context: dict[str, Any], current_time: datetime) -> str:
+        """
+        Generate a reflective journal entry using Claude.
+
+        Args:
+            context: Daily context gathered by gather_daily_context.
+            current_time: Current time in user's timezone.
+
+        Returns:
+            Generated journal entry content as markdown.
+        """
+        user_name = context.get("user_name", "the user")
+        user_role = context.get("user_role", "professional")
+
+        # Build a summary of activities
+        tasks_completed = context.get("tasks_completed_today", [])
+        tasks_in_progress = context.get("tasks_in_progress", [])
+        calendar_events = context.get("calendar_events", [])
+        journal_entries = context.get("journal_entries_today", [])
+        alerts = context.get("alerts_today", [])
+        decisions = context.get("decisions_today", [])
+
+        prompt = f"""Based on today's activities, write a personal daily journal entry for {user_name}.
+
+Today's Date: {context.get('date')}
+Current Time: {current_time.strftime('%I:%M %p')}
+Role: {user_role}
+
+## Today's Activities
+
+### Tasks Completed
+{chr(10).join(f'- {t}' for t in tasks_completed) if tasks_completed else '- No tasks marked as completed today'}
+
+### Tasks In Progress
+{chr(10).join(f'- {t}' for t in tasks_in_progress) if tasks_in_progress else '- No tasks currently in progress'}
+
+### Calendar Events
+{chr(10).join(f'- {e.get("subject")} at {e.get("start", "")[:16]}' for e in calendar_events) if calendar_events else '- No calendar events (or calendar not connected)'}
+
+### Notes Made Today
+{chr(10).join(f'- {e}' for e in journal_entries) if journal_entries else '- No journal entries made today'}
+
+### Alerts/Reminders
+{chr(10).join(f'- {a}' for a in alerts) if alerts else '- No alerts today'}
+
+### Decisions Made
+{chr(10).join(f'- {d}' for d in decisions) if decisions else '- No major decisions recorded'}
+
+---
+
+Write a reflective journal entry that:
+1. Summarizes what was accomplished today
+2. Notes any important events, meetings, or interactions
+3. Reflects on progress toward goals (their goals: {context.get('user_goals', 'not specified')})
+4. Mentions any challenges, blockers, or lessons learned
+5. Suggests focus areas or intentions for tomorrow
+
+Write in first person, conversational tone as if {user_name} is writing their own journal.
+Keep it meaningful but concise (200-400 words).
+Format as markdown with appropriate headers.
+Don't be overly positive if nothing was accomplished - be honest and reflective."""
+
+        return self.chat(prompt, include_history=False)
+
     def daily_checkin(self) -> dict[str, Any]:
         """
         Perform daily health check of the project.
@@ -437,16 +911,45 @@ Be specific and actionable in your recommendations."""
             "timestamp": datetime.now().isoformat(),
         }
 
-    def ask(self, question: str) -> str:
+    def ask(self, question: str, use_claude_code: bool = True) -> str:
         """
         Ask the FDA agent a question.
 
+        By default, delegates to Claude Code (uses Max subscription).
+        Falls back to direct API if Claude Code unavailable.
+
         Args:
             question: The question to ask.
+            use_claude_code: If True (default), try to use Claude Code via Max subscription.
 
         Returns:
             The FDA agent's response.
         """
+        question_lower = question.lower()
+
+        # Check if this should be delegated to a peer agent
+        peer_result = None
+
+        # File search requests → Librarian
+        if any(phrase in question_lower for phrase in [
+            "find file", "search for", "where is", "list file", "python file",
+            "what files", "show file", "config file", "look for"
+        ]):
+            peer_result = self._delegate_to_librarian(question)
+
+        # Simple status/info queries - answer directly without Claude Code
+        is_simple_query = any(phrase in question_lower for phrase in [
+            "what time", "hello", "hi ", "hey ", "thanks", "thank you",
+            "how are you", "good morning", "good evening", "good night",
+        ])
+
+        # Try Claude Code for complex questions (uses Max subscription credits)
+        if use_claude_code and not is_simple_query and not peer_result:
+            claude_code_result = self._try_claude_code(question)
+            if claude_code_result:
+                return claude_code_result
+
+        # Fall back to direct API call if Claude Code not available
         # Build context with user info if available
         context = {}
 
@@ -464,6 +967,10 @@ Be specific and actionable in your recommendations."""
         project_context = self.get_project_context()
         context.update(project_context)
 
+        # Add peer agent results if we delegated
+        if peer_result:
+            context["peer_agent_result"] = peer_result
+
         # Search journal for relevant entries
         relevant_entries = self.search_journal(question, top_n=3)
         if relevant_entries:
@@ -477,9 +984,207 @@ Be specific and actionable in your recommendations."""
                 for e in relevant_entries
             ]
 
-        response = self.chat_with_context(question, context)
+        # If we got a peer result, include it in the prompt
+        if peer_result:
+            enhanced_question = f"""{question}
+
+[I asked my peer agents to help with this. Here's what they found:]
+{json.dumps(peer_result, indent=2)[:2000]}
+
+Please summarize and present this information naturally to the user."""
+        else:
+            enhanced_question = question
+
+        response = self.chat_with_context(enhanced_question, context)
 
         return response
+
+    def _try_claude_code(self, question: str) -> Optional[str]:
+        """
+        Try to answer a question using Claude Code (Max subscription).
+
+        Args:
+            question: The question to ask.
+
+        Returns:
+            Response from Claude Code, or None if unavailable.
+        """
+        # Check if Executor is running
+        executor_status = self.get_peer_status(Agents.EXECUTOR)
+        if not executor_status or executor_status.get("status") != "running":
+            logger.debug("[FDA] Executor not running, falling back to direct API")
+            return None
+
+        # Build context for Claude Code
+        user_name = self.state.get_context("user_name") or "user"
+        user_role = self.state.get_context("user_role") or ""
+        user_goals = self.state.get_context("user_goals") or ""
+
+        # Prepare the prompt with context
+        prompt = f"""You are FDA, a personal AI assistant for {user_name}.
+{f"They are a {user_role}." if user_role else ""}
+{f"Their goals: {user_goals}" if user_goals else ""}
+
+User's question: {question}
+
+Answer helpfully and conversationally. Be concise but thorough."""
+
+        logger.info(f"[FDA] Delegating to Claude Code: {question[:50]}...")
+
+        result = self._delegate_to_claude_code(
+            prompt=prompt,
+            timeout=120,  # 2 minute timeout for questions
+        )
+
+        if result is None:
+            logger.debug("[FDA] Claude Code did not respond, falling back to direct API")
+            return None
+
+        if result.get("success"):
+            output = result.get("output", "").strip()
+            if output:
+                logger.info("[FDA] Got response from Claude Code")
+                return output
+
+        # Claude Code failed - log and fall back
+        error = result.get("error", "")
+        if error:
+            logger.warning(f"[FDA] Claude Code error: {error}")
+
+        return None
+
+    def _delegate_to_librarian(self, question: str) -> Optional[dict[str, Any]]:
+        """Delegate a search/knowledge request to Librarian."""
+        logger.info(f"[FDA] Delegating to Librarian: {question}")
+
+        # Check if Librarian is running
+        librarian_status = self.get_peer_status(Agents.LIBRARIAN)
+        if not librarian_status or librarian_status.get("status") != "running":
+            logger.warning("[FDA] Librarian is not running, cannot delegate")
+            return None
+
+        # Send request and wait for response
+        result = self.request_file_search(question, wait_for_response=True, timeout=15.0)
+        return result
+
+    def _delegate_to_executor(self, question: str) -> Optional[dict[str, Any]]:
+        """Delegate an execution request to Executor."""
+        logger.info(f"[FDA] Delegating to Executor: {question}")
+
+        # Check if Executor is running
+        executor_status = self.get_peer_status(Agents.EXECUTOR)
+        if not executor_status or executor_status.get("status") != "running":
+            logger.warning("[FDA] Executor is not running, cannot delegate")
+            return None
+
+        # Parse the question to extract command if possible
+        # For now, just send the whole question as context
+        # The Executor will interpret it
+
+        # Don't auto-execute arbitrary commands - just return info about capability
+        return {
+            "info": "I can help execute commands, but I need your explicit confirmation first.",
+            "question": question,
+            "executor_available": True,
+        }
+
+    def _delegate_to_claude_code(
+        self,
+        prompt: str,
+        cwd: Optional[str] = None,
+        allow_edits: bool = False,
+        timeout: int = 300,
+    ) -> Optional[dict[str, Any]]:
+        """
+        Delegate a coding task to Claude Code via Executor.
+
+        This uses the user's Max subscription instead of API credits.
+
+        Args:
+            prompt: The coding task/question.
+            cwd: Working directory for Claude Code.
+            allow_edits: If True, allow Claude Code to edit files.
+            timeout: Timeout in seconds (default 5 minutes).
+
+        Returns:
+            Claude Code result or None if Executor unavailable.
+        """
+        logger.info(f"[FDA] Delegating to Claude Code: {prompt[:80]}...")
+
+        # Check if Executor is running
+        executor_status = self.get_peer_status(Agents.EXECUTOR)
+        if not executor_status or executor_status.get("status") != "running":
+            logger.warning("[FDA] Executor is not running, cannot delegate to Claude Code")
+            return None
+
+        # Send request via message bus
+        msg_id = self.message_bus.request_claude_code(
+            from_agent=self.name.lower(),
+            prompt=prompt,
+            cwd=cwd,
+            allow_edits=allow_edits,
+            timeout=timeout,
+            priority="high",
+        )
+
+        # Wait for response
+        response = self.message_bus.wait_for_response(
+            agent_name=self.name.lower(),
+            request_id=msg_id,
+            timeout_seconds=float(timeout + 30),  # Extra buffer for response
+            poll_interval=1.0,
+        )
+
+        if response:
+            self.message_bus.mark_read(response["id"])
+            body = response.get("body", "{}")
+            try:
+                result = json.loads(body)
+                return result.get("result")
+            except (json.JSONDecodeError, TypeError):
+                return {"output": body}
+
+        return None
+
+    def ask_claude_code(
+        self,
+        task: str,
+        cwd: Optional[str] = None,
+        allow_edits: bool = False,
+    ) -> str:
+        """
+        Ask Claude Code to perform a coding task.
+
+        This is a convenience method that delegates to Claude Code and
+        formats the response nicely. Uses Max subscription credits.
+
+        Args:
+            task: The coding task/question.
+            cwd: Working directory for Claude Code.
+            allow_edits: If True, allow Claude Code to edit files.
+
+        Returns:
+            Formatted response from Claude Code.
+        """
+        result = self._delegate_to_claude_code(
+            prompt=task,
+            cwd=cwd,
+            allow_edits=allow_edits,
+        )
+
+        if result is None:
+            return "I couldn't reach Claude Code. Please make sure the Executor agent is running with `fda start --all`."
+
+        if result.get("success"):
+            output = result.get("output", "")
+            return f"Claude Code completed the task:\n\n{output}"
+        else:
+            error = result.get("error", "Unknown error")
+            output = result.get("output", "")
+            response = f"Claude Code encountered an issue: {error}"
+            if output:
+                response += f"\n\nPartial output:\n{output}"
+            return response
 
     def review_task(self, task_id: str) -> dict[str, Any]:
         """

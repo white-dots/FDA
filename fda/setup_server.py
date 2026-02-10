@@ -15,6 +15,8 @@ import os
 from pathlib import Path
 from typing import Any, Optional
 
+import yaml
+
 try:
     from flask import Flask, jsonify, render_template_string, request
 except ImportError:
@@ -343,14 +345,320 @@ SETUP_PAGE_HTML = """
             0% { transform: rotate(0deg); }
             100% { transform: rotate(360deg); }
         }
+
+        /* Tab Navigation */
+        .tabs {
+            display: flex;
+            border-bottom: 2px solid var(--border);
+            margin-bottom: 1.5rem;
+            gap: 0.25rem;
+        }
+
+        .tab-btn {
+            padding: 0.75rem 1.5rem;
+            background: none;
+            border: none;
+            border-bottom: 3px solid transparent;
+            color: var(--text-muted);
+            font-size: 1rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+            margin-bottom: -2px;
+        }
+
+        .tab-btn:hover {
+            color: var(--text);
+            background: var(--bg);
+        }
+
+        .tab-btn.active {
+            color: var(--primary);
+            border-bottom-color: var(--primary);
+        }
+
+        .tab-content {
+            display: none;
+        }
+
+        .tab-content.active {
+            display: block;
+        }
+
+        /* Agent Cards */
+        .agent-card {
+            background: var(--card-bg);
+            border-radius: 12px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            padding: 1.5rem;
+            margin-bottom: 1rem;
+        }
+
+        .agent-header {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            margin-bottom: 1rem;
+        }
+
+        .agent-icon {
+            font-size: 2rem;
+        }
+
+        .agent-name {
+            font-size: 1.25rem;
+            font-weight: 600;
+        }
+
+        .agent-description {
+            color: var(--text-muted);
+            font-size: 0.875rem;
+        }
+
+        .task-list {
+            list-style: none;
+            margin-top: 1rem;
+        }
+
+        .task-item {
+            display: flex;
+            align-items: flex-start;
+            gap: 0.75rem;
+            padding: 0.75rem;
+            border-radius: 8px;
+            background: var(--bg);
+            margin-bottom: 0.5rem;
+        }
+
+        .task-status {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            margin-top: 0.35rem;
+            flex-shrink: 0;
+        }
+
+        .task-status.completed { background: var(--success); }
+        .task-status.in_progress { background: var(--warning); }
+        .task-status.pending { background: var(--border); }
+        .task-status.blocked { background: var(--error); }
+
+        .task-content {
+            flex: 1;
+        }
+
+        .task-title {
+            font-weight: 500;
+        }
+
+        .task-meta {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            margin-top: 0.25rem;
+        }
+
+        .no-tasks {
+            text-align: center;
+            color: var(--text-muted);
+            padding: 2rem;
+        }
+
+        /* Chat Interface */
+        .chat-container {
+            display: flex;
+            gap: 1.5rem;
+        }
+
+        .agent-list {
+            width: 200px;
+            flex-shrink: 0;
+        }
+
+        .agent-select-btn {
+            width: 100%;
+            padding: 1rem;
+            text-align: left;
+            background: var(--card-bg);
+            border: 2px solid var(--border);
+            border-radius: 8px;
+            margin-bottom: 0.5rem;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .agent-select-btn:hover {
+            border-color: var(--primary);
+        }
+
+        .agent-select-btn.selected {
+            border-color: var(--primary);
+            background: rgba(79, 70, 229, 0.05);
+        }
+
+        .chat-panel {
+            flex: 1;
+            background: var(--card-bg);
+            border-radius: 12px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            display: flex;
+            flex-direction: column;
+            height: 500px;
+        }
+
+        .chat-header {
+            padding: 1rem 1.5rem;
+            border-bottom: 1px solid var(--border);
+            font-weight: 600;
+        }
+
+        .chat-messages {
+            flex: 1;
+            overflow-y: auto;
+            padding: 1rem 1.5rem;
+        }
+
+        .chat-message {
+            margin-bottom: 1rem;
+            padding: 0.75rem 1rem;
+            border-radius: 12px;
+            max-width: 80%;
+        }
+
+        .chat-message.user {
+            background: var(--primary);
+            color: white;
+            margin-left: auto;
+        }
+
+        .chat-message.agent {
+            background: var(--bg);
+            color: var(--text);
+        }
+
+        .chat-input-container {
+            padding: 1rem 1.5rem;
+            border-top: 1px solid var(--border);
+            display: flex;
+            gap: 0.5rem;
+        }
+
+        .chat-input {
+            flex: 1;
+            padding: 0.75rem 1rem;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            font-size: 1rem;
+            resize: none;
+        }
+
+        .chat-input:focus {
+            outline: none;
+            border-color: var(--primary);
+        }
+
+        /* Journal Entries */
+        .journal-entry {
+            background: var(--card-bg);
+            border-radius: 12px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            padding: 1.5rem;
+            margin-bottom: 1rem;
+        }
+
+        .journal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 1rem;
+        }
+
+        .journal-summary {
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: var(--text);
+        }
+
+        .journal-meta {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            text-align: right;
+        }
+
+        .journal-author {
+            display: inline-block;
+            padding: 0.25rem 0.5rem;
+            background: var(--primary);
+            color: white;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            margin-bottom: 0.25rem;
+        }
+
+        .journal-tags {
+            display: flex;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+            margin-bottom: 1rem;
+        }
+
+        .journal-tag {
+            padding: 0.25rem 0.5rem;
+            background: #e0e7ff;
+            color: #4338ca;
+            border-radius: 4px;
+            font-size: 0.75rem;
+        }
+
+        .journal-content {
+            color: var(--text);
+            line-height: 1.6;
+            white-space: pre-wrap;
+            max-height: 200px;
+            overflow-y: auto;
+            background: var(--bg);
+            padding: 1rem;
+            border-radius: 8px;
+        }
+
+        .journal-content.expanded {
+            max-height: none;
+        }
+
+        .expand-btn {
+            margin-top: 0.5rem;
+            background: none;
+            border: none;
+            color: var(--primary);
+            cursor: pointer;
+            font-size: 0.875rem;
+        }
+
+        .expand-btn:hover {
+            text-decoration: underline;
+        }
+
+        .refresh-btn {
+            margin-bottom: 1rem;
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <header>
-            <h1>FDA System Setup</h1>
-            <p class="subtitle">Configure your FDA Multi-Agent System</p>
+            <h1>FDA System</h1>
+            <p class="subtitle">Facilitating Director Agent - Multi-Agent System</p>
         </header>
+
+        <!-- Tab Navigation -->
+        <div class="tabs">
+            <button class="tab-btn active" onclick="switchTab('setup')">Setup</button>
+            <button class="tab-btn" onclick="switchTab('agents')">Agents</button>
+            <button class="tab-btn" onclick="switchTab('chat')">Chat</button>
+            <button class="tab-btn" onclick="switchTab('journal')">Journal</button>
+        </div>
+
+        <!-- Setup Tab -->
+        <div id="tab-setup" class="tab-content active">
 
         <!-- Status Overview -->
         <div class="card">
@@ -496,6 +804,98 @@ SETUP_PAGE_HTML = """
             </div>
             <div id="action-result" class="message" style="margin-top: 1rem;"></div>
         </div>
+
+        </div><!-- End Setup Tab -->
+
+        <!-- Agents Tab -->
+        <div id="tab-agents" class="tab-content">
+            <button class="btn-secondary refresh-btn" onclick="loadAgentTasks()">Refresh Tasks</button>
+
+            <!-- FDA Agent -->
+            <div class="agent-card">
+                <div class="agent-header">
+                    <span class="agent-icon">🧠</span>
+                    <div>
+                        <div class="agent-name">FDA (Facilitating Director Agent)</div>
+                        <div class="agent-description">Main orchestrator - answers questions, manages tasks, coordinates other agents</div>
+                    </div>
+                </div>
+                <ul class="task-list" id="tasks-fda">
+                    <li class="no-tasks">Loading tasks...</li>
+                </ul>
+            </div>
+
+            <!-- Executor Agent -->
+            <div class="agent-card">
+                <div class="agent-header">
+                    <span class="agent-icon">⚡</span>
+                    <div>
+                        <div class="agent-name">Executor Agent</div>
+                        <div class="agent-description">Executes tasks and actions delegated by FDA</div>
+                    </div>
+                </div>
+                <ul class="task-list" id="tasks-executor">
+                    <li class="no-tasks">Loading tasks...</li>
+                </ul>
+            </div>
+
+            <!-- Librarian Agent -->
+            <div class="agent-card">
+                <div class="agent-header">
+                    <span class="agent-icon">📚</span>
+                    <div>
+                        <div class="agent-name">Librarian Agent</div>
+                        <div class="agent-description">Manages knowledge, files, and data organization</div>
+                    </div>
+                </div>
+                <ul class="task-list" id="tasks-librarian">
+                    <li class="no-tasks">Loading tasks...</li>
+                </ul>
+            </div>
+        </div><!-- End Agents Tab -->
+
+        <!-- Chat Tab -->
+        <div id="tab-chat" class="tab-content">
+            <div class="chat-container">
+                <div class="agent-list">
+                    <button class="agent-select-btn selected" onclick="selectAgent('fda')">
+                        <div style="font-size: 1.5rem; margin-bottom: 0.25rem;">🧠</div>
+                        <div style="font-weight: 600;">FDA</div>
+                        <div style="font-size: 0.75rem; color: var(--text-muted);">Director</div>
+                    </button>
+                    <button class="agent-select-btn" onclick="selectAgent('executor')">
+                        <div style="font-size: 1.5rem; margin-bottom: 0.25rem;">⚡</div>
+                        <div style="font-weight: 600;">Executor</div>
+                        <div style="font-size: 0.75rem; color: var(--text-muted);">Task Runner</div>
+                    </button>
+                    <button class="agent-select-btn" onclick="selectAgent('librarian')">
+                        <div style="font-size: 1.5rem; margin-bottom: 0.25rem;">📚</div>
+                        <div style="font-weight: 600;">Librarian</div>
+                        <div style="font-size: 0.75rem; color: var(--text-muted);">Knowledge</div>
+                    </button>
+                </div>
+                <div class="chat-panel">
+                    <div class="chat-header" id="chat-header">Chat with FDA</div>
+                    <div class="chat-messages" id="chat-messages">
+                        <div style="text-align: center; color: var(--text-muted); padding: 2rem;">
+                            Select an agent and start chatting
+                        </div>
+                    </div>
+                    <div class="chat-input-container">
+                        <textarea class="chat-input" id="chat-input" placeholder="Type your message..." rows="1" onkeydown="handleChatKeydown(event)"></textarea>
+                        <button class="btn-primary" onclick="sendChatMessage()">Send</button>
+                    </div>
+                </div>
+            </div>
+        </div><!-- End Chat Tab -->
+
+        <!-- Journal Tab -->
+        <div id="tab-journal" class="tab-content">
+            <button class="btn-secondary refresh-btn" onclick="loadJournalEntries()">Refresh Journal</button>
+            <div id="journal-entries">
+                <div class="no-tasks">Loading journal entries...</div>
+            </div>
+        </div><!-- End Journal Tab -->
 
         <footer>
             <p>FDA Multi-Agent System v0.1.0</p>
@@ -687,6 +1087,234 @@ SETUP_PAGE_HTML = """
             div.textContent = message;
             div.style.display = 'block';
             div.style.whiteSpace = 'pre-line';
+        }
+
+        // Tab Navigation
+        function switchTab(tabName) {
+            // Update tab buttons
+            document.querySelectorAll('.tab-btn').forEach(btn => {
+                btn.classList.remove('active');
+            });
+            event.target.classList.add('active');
+
+            // Update tab content
+            document.querySelectorAll('.tab-content').forEach(content => {
+                content.classList.remove('active');
+            });
+            document.getElementById(`tab-${tabName}`).classList.add('active');
+
+            // Load data for the selected tab
+            if (tabName === 'agents') {
+                loadAgentTasks();
+            } else if (tabName === 'journal') {
+                loadJournalEntries();
+            }
+        }
+
+        // Agent Tasks
+        async function loadAgentTasks() {
+            try {
+                const response = await fetch('/api/agents/tasks');
+                const data = await response.json();
+
+                renderAgentTasks('fda', data.fda || []);
+                renderAgentTasks('executor', data.executor || []);
+                renderAgentTasks('librarian', data.librarian || []);
+            } catch (error) {
+                console.error('Failed to load agent tasks:', error);
+            }
+        }
+
+        function renderAgentTasks(agent, tasks) {
+            const container = document.getElementById(`tasks-${agent}`);
+
+            if (!tasks || tasks.length === 0) {
+                container.innerHTML = '<li class="no-tasks">No tasks assigned</li>';
+                return;
+            }
+
+            container.innerHTML = tasks.map(task => `
+                <li class="task-item">
+                    <span class="task-status ${task.status || 'pending'}"></span>
+                    <div class="task-content">
+                        <div class="task-title">${escapeHtml(task.title || task.description || 'Untitled Task')}</div>
+                        <div class="task-meta">
+                            ${task.status || 'pending'}
+                            ${task.created_at ? '• Created: ' + formatDate(task.created_at) : ''}
+                        </div>
+                    </div>
+                </li>
+            `).join('');
+        }
+
+        // Chat Functionality
+        let currentAgent = 'fda';
+        const chatHistories = { fda: [], executor: [], librarian: [] };
+
+        function selectAgent(agent) {
+            currentAgent = agent;
+
+            // Update button states
+            document.querySelectorAll('.agent-select-btn').forEach(btn => {
+                btn.classList.remove('selected');
+            });
+            event.target.closest('.agent-select-btn').classList.add('selected');
+
+            // Update chat header
+            const agentNames = { fda: 'FDA', executor: 'Executor', librarian: 'Librarian' };
+            document.getElementById('chat-header').textContent = `Chat with ${agentNames[agent]}`;
+
+            // Load chat history for this agent
+            renderChatHistory();
+        }
+
+        function renderChatHistory() {
+            const container = document.getElementById('chat-messages');
+            const history = chatHistories[currentAgent];
+
+            if (history.length === 0) {
+                container.innerHTML = `
+                    <div style="text-align: center; color: var(--text-muted); padding: 2rem;">
+                        Start a conversation with this agent
+                    </div>
+                `;
+                return;
+            }
+
+            container.innerHTML = history.map(msg => `
+                <div class="chat-message ${msg.role}">
+                    ${escapeHtml(msg.content)}
+                </div>
+            `).join('');
+
+            // Scroll to bottom
+            container.scrollTop = container.scrollHeight;
+        }
+
+        function handleChatKeydown(event) {
+            if (event.key === 'Enter' && !event.shiftKey) {
+                event.preventDefault();
+                sendChatMessage();
+            }
+        }
+
+        async function sendChatMessage() {
+            const input = document.getElementById('chat-input');
+            const message = input.value.trim();
+
+            if (!message) return;
+
+            // Add user message to history
+            chatHistories[currentAgent].push({ role: 'user', content: message });
+            renderChatHistory();
+            input.value = '';
+
+            // Show typing indicator
+            const container = document.getElementById('chat-messages');
+            const typingDiv = document.createElement('div');
+            typingDiv.className = 'chat-message agent';
+            typingDiv.innerHTML = '<span class="loading"></span> Thinking...';
+            container.appendChild(typingDiv);
+            container.scrollTop = container.scrollHeight;
+
+            try {
+                const response = await fetch('/api/agents/chat', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        agent: currentAgent,
+                        message: message
+                    })
+                });
+
+                const result = await response.json();
+
+                // Remove typing indicator
+                typingDiv.remove();
+
+                if (result.success) {
+                    chatHistories[currentAgent].push({ role: 'agent', content: result.response });
+                } else {
+                    chatHistories[currentAgent].push({ role: 'agent', content: 'Error: ' + (result.error || 'Failed to get response') });
+                }
+
+                renderChatHistory();
+            } catch (error) {
+                typingDiv.remove();
+                chatHistories[currentAgent].push({ role: 'agent', content: 'Error: ' + error.message });
+                renderChatHistory();
+            }
+        }
+
+        // Journal
+        async function loadJournalEntries() {
+            const container = document.getElementById('journal-entries');
+            container.innerHTML = '<div class="no-tasks">Loading journal entries...</div>';
+
+            try {
+                const response = await fetch('/api/journal/entries');
+                const data = await response.json();
+
+                if (!data.entries || data.entries.length === 0) {
+                    container.innerHTML = '<div class="no-tasks">No journal entries yet</div>';
+                    return;
+                }
+
+                container.innerHTML = data.entries.map((entry, index) => `
+                    <div class="journal-entry">
+                        <div class="journal-header">
+                            <div>
+                                <div class="journal-summary">${escapeHtml(entry.summary || 'Untitled Entry')}</div>
+                            </div>
+                            <div class="journal-meta">
+                                <span class="journal-author">${escapeHtml(entry.author || 'Unknown')}</span>
+                                <div>${entry.timestamp ? formatDate(entry.timestamp) : ''}</div>
+                            </div>
+                        </div>
+                        ${entry.tags && entry.tags.length > 0 ? `
+                            <div class="journal-tags">
+                                ${entry.tags.map(tag => `<span class="journal-tag">${escapeHtml(tag)}</span>`).join('')}
+                            </div>
+                        ` : ''}
+                        <div class="journal-content" id="journal-content-${index}">${escapeHtml(entry.content || '')}</div>
+                        ${(entry.content || '').length > 300 ? `
+                            <button class="expand-btn" onclick="toggleJournalContent(${index})">Show more</button>
+                        ` : ''}
+                    </div>
+                `).join('');
+            } catch (error) {
+                container.innerHTML = `<div class="no-tasks">Error loading journal: ${error.message}</div>`;
+            }
+        }
+
+        function toggleJournalContent(index) {
+            const content = document.getElementById(`journal-content-${index}`);
+            const btn = content.nextElementSibling;
+
+            if (content.classList.contains('expanded')) {
+                content.classList.remove('expanded');
+                btn.textContent = 'Show more';
+            } else {
+                content.classList.add('expanded');
+                btn.textContent = 'Show less';
+            }
+        }
+
+        // Utility functions
+        function escapeHtml(text) {
+            if (!text) return '';
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function formatDate(dateStr) {
+            try {
+                const date = new Date(dateStr);
+                return date.toLocaleDateString() + ' ' + date.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+            } catch {
+                return dateStr;
+            }
         }
     </script>
 </body>
@@ -1055,6 +1683,163 @@ def create_setup_app() -> Any:
             "success": True,
             "message": "To start the Discord bot, run:\n\nfda discord start\n\n(Run in a separate terminal)"
         })
+
+    # ============================================
+    # Agent Tasks API
+    # ============================================
+
+    @app.route("/api/agents/tasks")
+    def get_agent_tasks():
+        """Get tasks grouped by agent."""
+        try:
+            all_tasks = state.get_tasks()
+
+            # Group tasks by assigned agent
+            tasks_by_agent = {
+                "fda": [],
+                "executor": [],
+                "librarian": []
+            }
+
+            for task in all_tasks:
+                agent = (task.get("assigned_to") or "fda").lower()
+                if agent in tasks_by_agent:
+                    tasks_by_agent[agent].append(task)
+                else:
+                    # Default to FDA for unassigned tasks
+                    tasks_by_agent["fda"].append(task)
+
+            return jsonify(tasks_by_agent)
+        except Exception as e:
+            logger.exception(f"Error getting agent tasks: {e}")
+            return jsonify({"fda": [], "executor": [], "librarian": [], "error": str(e)})
+
+    # ============================================
+    # Chat API
+    # ============================================
+
+    @app.route("/api/agents/chat", methods=["POST"])
+    def agent_chat():
+        """Send a message to an agent and get a response."""
+        try:
+            data = request.get_json()
+            agent_name = data.get("agent", "fda")
+            message = data.get("message", "").strip()
+
+            if not message:
+                return jsonify({"success": False, "error": "Message is required"})
+
+            # Check if Anthropic API key is configured
+            api_key = os.environ.get(ANTHROPIC_API_KEY_ENV) or state.get_context("anthropic_api_key")
+            if not api_key:
+                return jsonify({
+                    "success": False,
+                    "error": "Anthropic API key not configured. Please set it in the Setup tab."
+                })
+
+            # Route to appropriate agent
+            if agent_name == "fda":
+                try:
+                    from fda.fda_agent import FDAAgent
+                    agent = FDAAgent()
+                    response = agent.ask(message)
+                    return jsonify({"success": True, "response": response})
+                except Exception as e:
+                    logger.exception(f"FDA Agent error: {e}")
+                    return jsonify({"success": False, "error": str(e)})
+
+            elif agent_name == "executor":
+                # Executor agent - for now, return a placeholder
+                # In full implementation, this would use ExecutorAgent
+                try:
+                    import anthropic
+                    client = anthropic.Anthropic(api_key=api_key)
+                    response = client.messages.create(
+                        model="claude-3-haiku-20240307",
+                        max_tokens=1024,
+                        system="You are the Executor Agent, responsible for running tasks and actions. You execute commands and report results. Be concise and action-oriented.",
+                        messages=[{"role": "user", "content": message}]
+                    )
+                    return jsonify({"success": True, "response": response.content[0].text})
+                except Exception as e:
+                    return jsonify({"success": False, "error": str(e)})
+
+            elif agent_name == "librarian":
+                # Librarian agent - for now, return a placeholder
+                # In full implementation, this would use LibrarianAgent
+                try:
+                    import anthropic
+                    client = anthropic.Anthropic(api_key=api_key)
+                    response = client.messages.create(
+                        model="claude-3-haiku-20240307",
+                        max_tokens=1024,
+                        system="You are the Librarian Agent, responsible for managing knowledge, files, and data organization. You help find information and organize data. Be helpful and knowledgeable.",
+                        messages=[{"role": "user", "content": message}]
+                    )
+                    return jsonify({"success": True, "response": response.content[0].text})
+                except Exception as e:
+                    return jsonify({"success": False, "error": str(e)})
+
+            else:
+                return jsonify({"success": False, "error": f"Unknown agent: {agent_name}"})
+
+        except Exception as e:
+            logger.exception(f"Chat error: {e}")
+            return jsonify({"success": False, "error": str(e)})
+
+    # ============================================
+    # Journal API
+    # ============================================
+
+    @app.route("/api/journal/entries")
+    def get_journal_entries():
+        """Get all journal entries."""
+        try:
+            from fda.config import JOURNAL_DIR
+
+            journal_path = Path(JOURNAL_DIR)
+            entries = []
+
+            if journal_path.exists():
+                # Get all markdown files in journal directory
+                for entry_file in sorted(journal_path.glob("*.md"), reverse=True):
+                    try:
+                        content = entry_file.read_text()
+
+                        # Parse YAML frontmatter if present
+                        if content.startswith("---"):
+                            parts = content.split("---", 2)
+                            if len(parts) >= 3:
+                                try:
+                                    frontmatter = yaml.safe_load(parts[1])
+                                    body = parts[2].strip()
+                                except:
+                                    frontmatter = {}
+                                    body = content
+                            else:
+                                frontmatter = {}
+                                body = content
+                        else:
+                            frontmatter = {}
+                            body = content
+
+                        entries.append({
+                            "id": entry_file.stem,
+                            "summary": frontmatter.get("summary", entry_file.stem),
+                            "author": frontmatter.get("author", "Unknown"),
+                            "tags": frontmatter.get("tags", []),
+                            "timestamp": frontmatter.get("timestamp", ""),
+                            "content": body[:2000] + ("..." if len(body) > 2000 else "")  # Limit content size
+                        })
+                    except Exception as e:
+                        logger.warning(f"Error reading journal file {entry_file}: {e}")
+                        continue
+
+            return jsonify({"entries": entries[:50]})  # Limit to 50 entries
+
+        except Exception as e:
+            logger.exception(f"Error getting journal entries: {e}")
+            return jsonify({"entries": [], "error": str(e)})
 
     return app
 

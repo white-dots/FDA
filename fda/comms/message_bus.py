@@ -2,6 +2,7 @@
 Inter-agent message bus.
 
 Manages asynchronous message passing between agents with file-based persistence.
+Supports peer-based collaboration between FDA, Librarian, and Executor agents.
 """
 
 import json
@@ -12,6 +13,52 @@ import uuid
 import fcntl
 
 from fda.config import MESSAGE_BUS_PATH
+
+
+# Peer message types for collaboration
+class MessageTypes:
+    """Standard message types for peer agent communication."""
+
+    # Request types (agent asking another agent to do something)
+    SEARCH_REQUEST = "search_request"          # Ask Librarian to search files
+    INDEX_REQUEST = "index_request"            # Ask Librarian to index a file
+    EXECUTE_REQUEST = "execute_request"        # Ask Executor to run a command
+    FILE_REQUEST = "file_request"              # Ask Executor to create/edit file
+    KNOWLEDGE_REQUEST = "knowledge_request"    # Ask Librarian for information
+    STATUS_REQUEST = "status_request"          # Ask any agent for status
+    CLAUDE_CODE_REQUEST = "claude_code_request"  # Ask Executor to run Claude Code
+
+    # Response types (agent reporting results)
+    SEARCH_RESULT = "search_result"            # Librarian returns search results
+    INDEX_COMPLETE = "index_complete"          # Librarian finished indexing
+    EXECUTE_RESULT = "execute_result"          # Executor returns command output
+    FILE_COMPLETE = "file_complete"            # Executor finished file operation
+    KNOWLEDGE_RESULT = "knowledge_result"      # Librarian returns knowledge
+    STATUS_RESPONSE = "status_response"        # Agent reports status
+    CLAUDE_CODE_RESULT = "claude_code_result"  # Executor returns Claude Code output
+
+    # Collaboration types (peer-to-peer communication)
+    DISCOVERY = "discovery"                    # Agent shares something it found
+    SUGGESTION = "suggestion"                  # Agent suggests an action
+    QUESTION = "question"                      # Agent asks for clarification
+    BLOCKER = "blocker"                        # Agent reports being blocked
+
+    # Legacy types (for backward compatibility)
+    TASK = "task"
+    ALERT = "alert"
+    REQUEST = "request"
+    REVIEW_REQUEST = "review_request"
+    REVIEW_RESPONSE = "review_response"
+
+
+# Agent names as constants
+class Agents:
+    """Standard agent names."""
+    FDA = "fda"
+    LIBRARIAN = "librarian"
+    EXECUTOR = "executor"
+    TELEGRAM = "telegram"
+    DISCORD = "discord"
 
 
 class MessageBus:
@@ -300,3 +347,318 @@ class MessageBus:
             self._release_lock(fh)
 
         return removed_count
+
+    # Peer communication helpers
+
+    def request_search(
+        self,
+        from_agent: str,
+        query: str,
+        path: Optional[str] = None,
+        priority: str = "medium",
+    ) -> str:
+        """
+        Send a search request to the Librarian.
+
+        Args:
+            from_agent: Agent making the request.
+            query: Search query (pattern, keyword, or natural language).
+            path: Optional path to search within.
+            priority: Request priority.
+
+        Returns:
+            Message ID for tracking the request.
+        """
+        body = json.dumps({"query": query, "path": path})
+        return self.send(
+            from_agent=from_agent,
+            to_agent=Agents.LIBRARIAN,
+            msg_type=MessageTypes.SEARCH_REQUEST,
+            subject=f"Search: {query[:50]}",
+            body=body,
+            priority=priority,
+        )
+
+    def request_execute(
+        self,
+        from_agent: str,
+        command: str,
+        cwd: Optional[str] = None,
+        priority: str = "medium",
+    ) -> str:
+        """
+        Send an execution request to the Executor.
+
+        Args:
+            from_agent: Agent making the request.
+            command: Command to execute.
+            cwd: Working directory for the command.
+            priority: Request priority.
+
+        Returns:
+            Message ID for tracking the request.
+        """
+        body = json.dumps({"command": command, "cwd": cwd})
+        return self.send(
+            from_agent=from_agent,
+            to_agent=Agents.EXECUTOR,
+            msg_type=MessageTypes.EXECUTE_REQUEST,
+            subject=f"Execute: {command[:50]}",
+            body=body,
+            priority=priority,
+        )
+
+    def request_file_operation(
+        self,
+        from_agent: str,
+        operation: str,
+        path: str,
+        content: Optional[str] = None,
+        priority: str = "medium",
+    ) -> str:
+        """
+        Send a file operation request to the Executor.
+
+        Args:
+            from_agent: Agent making the request.
+            operation: Operation type ('create', 'edit', 'delete', 'read').
+            path: File path.
+            content: File content (for create/edit).
+            priority: Request priority.
+
+        Returns:
+            Message ID for tracking the request.
+        """
+        body = json.dumps({"operation": operation, "path": path, "content": content})
+        return self.send(
+            from_agent=from_agent,
+            to_agent=Agents.EXECUTOR,
+            msg_type=MessageTypes.FILE_REQUEST,
+            subject=f"File {operation}: {path}",
+            body=body,
+            priority=priority,
+        )
+
+    def request_knowledge(
+        self,
+        from_agent: str,
+        question: str,
+        context: Optional[dict[str, Any]] = None,
+        priority: str = "medium",
+    ) -> str:
+        """
+        Send a knowledge request to the Librarian.
+
+        Args:
+            from_agent: Agent making the request.
+            question: Natural language question.
+            context: Optional context for the question.
+            priority: Request priority.
+
+        Returns:
+            Message ID for tracking the request.
+        """
+        body = json.dumps({"question": question, "context": context})
+        return self.send(
+            from_agent=from_agent,
+            to_agent=Agents.LIBRARIAN,
+            msg_type=MessageTypes.KNOWLEDGE_REQUEST,
+            subject=f"Knowledge: {question[:50]}",
+            body=body,
+            priority=priority,
+        )
+
+    def request_claude_code(
+        self,
+        from_agent: str,
+        prompt: str,
+        cwd: Optional[str] = None,
+        allow_edits: bool = False,
+        timeout: int = 300,
+        priority: str = "medium",
+    ) -> str:
+        """
+        Send a Claude Code request to the Executor.
+
+        This delegates coding tasks to Claude Code CLI, which uses the user's
+        Max subscription instead of API credits.
+
+        Args:
+            from_agent: Agent making the request.
+            prompt: The task/question to send to Claude Code.
+            cwd: Working directory for Claude Code.
+            allow_edits: If True, allow Claude Code to edit files.
+            timeout: Timeout in seconds (default 5 minutes).
+            priority: Request priority.
+
+        Returns:
+            Message ID for tracking the request.
+        """
+        body = json.dumps({
+            "prompt": prompt,
+            "cwd": cwd,
+            "allow_edits": allow_edits,
+            "timeout": timeout,
+        })
+        return self.send(
+            from_agent=from_agent,
+            to_agent=Agents.EXECUTOR,
+            msg_type=MessageTypes.CLAUDE_CODE_REQUEST,
+            subject=f"Claude Code: {prompt[:50]}",
+            body=body,
+            priority=priority,
+        )
+
+    def send_result(
+        self,
+        from_agent: str,
+        to_agent: str,
+        msg_type: str,
+        result: Any,
+        success: bool = True,
+        error: Optional[str] = None,
+        reply_to: Optional[str] = None,
+    ) -> str:
+        """
+        Send a result response to another agent.
+
+        Args:
+            from_agent: Agent sending the result.
+            to_agent: Agent that made the original request.
+            msg_type: Result message type.
+            result: The result data.
+            success: Whether the operation succeeded.
+            error: Error message if failed.
+            reply_to: Original request message ID.
+
+        Returns:
+            Message ID of the response.
+        """
+        body = json.dumps({
+            "success": success,
+            "result": result,
+            "error": error,
+        })
+        return self.send(
+            from_agent=from_agent,
+            to_agent=to_agent,
+            msg_type=msg_type,
+            subject=f"Result: {'Success' if success else 'Failed'}",
+            body=body,
+            priority="medium",
+            reply_to=reply_to,
+        )
+
+    def share_discovery(
+        self,
+        from_agent: str,
+        discovery_type: str,
+        description: str,
+        details: Optional[dict[str, Any]] = None,
+    ) -> str:
+        """
+        Share a discovery with all peers (broadcast).
+
+        Args:
+            from_agent: Agent that made the discovery.
+            discovery_type: Type of discovery (file, pattern, tool, etc.).
+            description: Human-readable description.
+            details: Additional details.
+
+        Returns:
+            Message ID of the discovery broadcast to FDA.
+        """
+        body = json.dumps({
+            "discovery_type": discovery_type,
+            "description": description,
+            "details": details,
+        })
+        # Send to FDA as the central coordinator for visibility
+        return self.send(
+            from_agent=from_agent,
+            to_agent=Agents.FDA,
+            msg_type=MessageTypes.DISCOVERY,
+            subject=f"Discovery: {description[:50]}",
+            body=body,
+            priority="low",
+        )
+
+    def report_blocker(
+        self,
+        from_agent: str,
+        blocker_description: str,
+        context: Optional[dict[str, Any]] = None,
+    ) -> str:
+        """
+        Report a blocker to FDA.
+
+        Args:
+            from_agent: Agent that encountered the blocker.
+            blocker_description: Description of what's blocking.
+            context: Additional context.
+
+        Returns:
+            Message ID of the blocker report.
+        """
+        body = json.dumps({
+            "description": blocker_description,
+            "context": context,
+        })
+        return self.send(
+            from_agent=from_agent,
+            to_agent=Agents.FDA,
+            msg_type=MessageTypes.BLOCKER,
+            subject=f"Blocker: {blocker_description[:50]}",
+            body=body,
+            priority="high",
+        )
+
+    def get_pending_by_type(
+        self,
+        agent_name: str,
+        msg_type: str,
+    ) -> list[dict[str, Any]]:
+        """
+        Get pending messages of a specific type for an agent.
+
+        Args:
+            agent_name: Name of the agent.
+            msg_type: Message type to filter by.
+
+        Returns:
+            List of matching pending messages.
+        """
+        pending = self.get_pending(agent_name)
+        return [msg for msg in pending if msg["type"] == msg_type]
+
+    def wait_for_response(
+        self,
+        agent_name: str,
+        request_id: str,
+        timeout_seconds: float = 30.0,
+        poll_interval: float = 0.5,
+    ) -> Optional[dict[str, Any]]:
+        """
+        Wait for a response to a specific request.
+
+        Args:
+            agent_name: Agent waiting for the response.
+            request_id: ID of the original request.
+            timeout_seconds: Maximum time to wait.
+            poll_interval: Time between checks.
+
+        Returns:
+            Response message or None if timeout.
+        """
+        import time
+
+        start_time = time.time()
+        while time.time() - start_time < timeout_seconds:
+            # Check for messages that are replies to our request
+            pending = self.get_pending(agent_name)
+            for msg in pending:
+                if msg.get("reply_to") == request_id:
+                    return msg
+            time.sleep(poll_interval)
+
+        return None
