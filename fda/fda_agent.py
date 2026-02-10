@@ -984,12 +984,20 @@ Be specific and actionable in your recommendations."""
             "comprehensive", "detailed analysis", "thorough review",
         ]
 
+        # Explicit Claude Code delegation requests
+        claude_code_phrases = [
+            "using claude code", "use claude code", "with claude code",
+            "via claude code", "through claude code", "ask claude code",
+            "claude code", "delegate to claude",
+        ]
+
         all_capability_phrases = (
             web_search_phrases +
             realtime_phrases +
             api_phrases +
             automation_phrases +
-            research_phrases
+            research_phrases +
+            claude_code_phrases
         )
 
         return any(phrase in question_lower for phrase in all_capability_phrases)
