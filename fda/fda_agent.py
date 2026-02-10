@@ -911,12 +911,99 @@ Be specific and actionable in your recommendations."""
             "timestamp": datetime.now().isoformat(),
         }
 
+    def _explain_capability_limitation(self, question: str) -> str:
+        """
+        Explain why FDA can't fulfill a request that requires external capabilities.
+
+        Called when Claude Code isn't available but the request needs tools
+        like web search, API access, etc.
+
+        Args:
+            question: The original question.
+
+        Returns:
+            A helpful message explaining the limitation and how to resolve it.
+        """
+        return (
+            "This request requires capabilities I don't have directly "
+            "(like web search, real-time data, or external API access). "
+            "I tried to delegate to Claude Code which has these tools, "
+            "but it's not currently available.\n\n"
+            "To enable this, please:\n"
+            "1. Make sure the Executor agent is running: `fda start --all`\n"
+            "2. Or ask me through Claude Code directly if you have access\n\n"
+            "Is there something else I can help you with using my current capabilities?"
+        )
+
+    def _requires_external_capabilities(self, question: str) -> bool:
+        """
+        Check if the question requires capabilities FDA doesn't have.
+
+        FDA is a simple Claude API wrapper without tools. Requests needing
+        web search, real-time data, API access, code execution, etc.
+        should be delegated to Claude Code which has these capabilities.
+
+        Args:
+            question: The question to check.
+
+        Returns:
+            True if the question requires capabilities beyond FDA's scope.
+        """
+        question_lower = question.lower()
+
+        # Web search / internet lookups
+        web_search_phrases = [
+            "search the web", "web search", "search online", "look up online",
+            "google", "search for", "find online", "internet search",
+            "what's the latest", "current news", "recent news", "today's news",
+            "latest update", "what happened", "breaking news",
+        ]
+
+        # Real-time / live data
+        realtime_phrases = [
+            "current price", "stock price", "weather", "forecast",
+            "right now", "live", "real-time", "realtime", "real time",
+            "up to date", "latest", "current",
+        ]
+
+        # External API / integration tasks
+        api_phrases = [
+            "api", "fetch data", "download", "scrape", "crawl",
+            "call the", "query the", "access the", "connect to",
+        ]
+
+        # Code execution / automation
+        automation_phrases = [
+            "run this code", "execute", "automate", "script",
+            "install", "deploy", "build", "compile",
+        ]
+
+        # Research / complex tasks
+        research_phrases = [
+            "research", "investigate", "analyze this", "deep dive",
+            "comprehensive", "detailed analysis", "thorough review",
+        ]
+
+        all_capability_phrases = (
+            web_search_phrases +
+            realtime_phrases +
+            api_phrases +
+            automation_phrases +
+            research_phrases
+        )
+
+        return any(phrase in question_lower for phrase in all_capability_phrases)
+
     def ask(self, question: str, use_claude_code: bool = True) -> str:
         """
         Ask the FDA agent a question.
 
         By default, delegates to Claude Code (uses Max subscription).
         Falls back to direct API if Claude Code unavailable.
+
+        Automatically detects requests requiring external capabilities
+        (web search, real-time data, API access) and delegates those
+        to Claude Code which has those tools available.
 
         Args:
             question: The question to ask.
@@ -943,11 +1030,21 @@ Be specific and actionable in your recommendations."""
             "how are you", "good morning", "good evening", "good night",
         ])
 
-        # Try Claude Code for complex questions (uses Max subscription credits)
+        # Check if the request requires capabilities FDA doesn't have
+        requires_delegation = self._requires_external_capabilities(question)
+
+        # Try Claude Code for:
+        # 1. Requests requiring external capabilities (web search, APIs, etc.)
+        # 2. Complex questions that aren't simple greetings
         if use_claude_code and not is_simple_query and not peer_result:
             claude_code_result = self._try_claude_code(question)
             if claude_code_result:
                 return claude_code_result
+
+            # If Claude Code failed but this request REQUIRES external capabilities,
+            # explain the limitation instead of giving a response we can't fulfill
+            if requires_delegation:
+                return self._explain_capability_limitation(question)
 
         # Fall back to direct API call if Claude Code not available
         # Build context with user info if available
@@ -1021,12 +1118,16 @@ Please summarize and present this information naturally to the user."""
         user_goals = self.state.get_context("user_goals") or ""
 
         # Prepare the prompt with context
+        # Note: Claude Code has access to tools (web search, bash, file access)
+        # that the FDA agent's direct API calls don't have
         prompt = f"""You are FDA, a personal AI assistant for {user_name}.
 {f"They are a {user_role}." if user_role else ""}
 {f"Their goals: {user_goals}" if user_goals else ""}
 
 User's question: {question}
 
+You have access to tools like web search, file access, and command execution.
+Use them if needed to fully answer the question.
 Answer helpfully and conversationally. Be concise but thorough."""
 
         logger.info(f"[FDA] Delegating to Claude Code: {question[:50]}...")
