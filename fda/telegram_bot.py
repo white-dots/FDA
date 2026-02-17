@@ -230,11 +230,19 @@ What do you need?
             )
             return
 
+        chat_id = str(update.effective_chat.id)
+        username = update.effective_user.first_name if update.effective_user else None
         await update.message.reply_text("Thinking...")
 
         try:
-            # Get project context and answer
-            response = self._answer_question(question)
+            # Save user message to state DB
+            self.state.add_conversation_message(chat_id, "user", question, source="telegram", username=username)
+
+            response = self._answer_question(question, chat_id=chat_id)
+
+            # Save assistant response to state DB
+            self.state.add_conversation_message(chat_id, "assistant", response, source="telegram")
+
             await update.message.reply_text(response)
         except Exception as e:
             logger.error(f"[TelegramBot] Error answering question: {e}")
@@ -257,10 +265,19 @@ What do you need?
             return
 
         # Regular message - answer as a question
+        chat_id = str(update.effective_chat.id)
+        username = update.effective_user.first_name if update.effective_user else None
         await update.message.reply_text("Thinking...")
 
         try:
-            response = self._answer_question(message)
+            # Save user message to state DB
+            self.state.add_conversation_message(chat_id, "user", message, source="telegram", username=username)
+
+            response = self._answer_question(message, chat_id=chat_id)
+
+            # Save assistant response to state DB
+            self.state.add_conversation_message(chat_id, "assistant", response, source="telegram")
+
             await update.message.reply_text(response)
         except Exception as e:
             logger.error(f"[TelegramBot] Error answering message: {e}")
@@ -393,8 +410,13 @@ Keep it conversational and under 150 words. Don't use excessive formatting."""
 
             logger.info(f"[TelegramBot] Onboarding completed for {chat_id}: {user_name}")
 
-    def _answer_question(self, question: str) -> str:
-        """Answer a question using FDA agent capabilities."""
+    def _answer_question(self, question: str, chat_id: str = "telegram") -> str:
+        """Answer a question using FDA agent capabilities.
+
+        Args:
+            question: The user's question.
+            chat_id: Telegram chat ID for conversation history.
+        """
         # Build context with user info
         context = {}
 
@@ -422,6 +444,18 @@ Keep it conversational and under 150 words. Don't use excessive formatting."""
                 }
                 for e in relevant_entries
             ]
+
+        # Load recent conversation history from state DB
+        try:
+            recent_msgs = self.state.get_messages_recent(channel_id=str(chat_id), limit=20)
+            if recent_msgs:
+                convo_lines = []
+                for msg in recent_msgs:
+                    role = "User" if msg["role"] == "user" else "FDA"
+                    convo_lines.append(f"{role}: {msg['content'][:300]}")
+                context["recent_conversation_for_context"] = "\n".join(convo_lines)
+        except Exception as e:
+            logger.debug(f"[TelegramBot] Could not load conversation history: {e}")
 
         return self.chat_with_context(question, context)
 

@@ -36,6 +36,8 @@ class MessageTypes:
     KNOWLEDGE_RESULT = "knowledge_result"      # Librarian returns knowledge
     STATUS_RESPONSE = "status_response"        # Agent reports status
     CLAUDE_CODE_RESULT = "claude_code_result"  # Executor returns Claude Code output
+    PROJECT_KNOWLEDGE_REQUEST = "project_knowledge_request"  # Ask Librarian about a project
+    PROJECT_KNOWLEDGE_RESULT = "project_knowledge_result"    # Librarian returns project knowledge
 
     # Collaboration types (peer-to-peer communication)
     DISCOVERY = "discovery"                    # Agent shares something it found
@@ -153,8 +155,8 @@ class MessageBus:
 
         message = {
             "id": msg_id,
-            "from": from_agent,
-            "to": to_agent,
+            "from": from_agent.lower(),
+            "to": to_agent.lower(),
             "type": msg_type,
             "subject": subject,
             "body": body,
@@ -195,10 +197,13 @@ class MessageBus:
         finally:
             self._release_lock(fh)
 
+        # Case-insensitive matching to handle mixed casing between
+        # agent names (e.g., "Librarian") and Agents constants (e.g., "librarian")
+        agent_name_lower = agent_name.lower()
         pending = [
             msg
             for msg in bus_data["messages"]
-            if msg["to"] == agent_name and not msg["read"]
+            if msg["to"].lower() == agent_name_lower and not msg["read"]
         ]
 
         # Sort by priority (high first) then by timestamp
@@ -505,6 +510,35 @@ class MessageBus:
             to_agent=Agents.EXECUTOR,
             msg_type=MessageTypes.CLAUDE_CODE_REQUEST,
             subject=f"Claude Code: {prompt[:50]}",
+            body=body,
+            priority=priority,
+        )
+
+    def request_project_knowledge(
+        self,
+        from_agent: str,
+        question: str,
+        project_path: Optional[str] = None,
+        priority: str = "medium",
+    ) -> str:
+        """
+        Request project-level knowledge from the Librarian.
+
+        Args:
+            from_agent: Agent making the request.
+            question: Question about a project.
+            project_path: Optional specific project path.
+            priority: Request priority.
+
+        Returns:
+            Message ID for tracking the request.
+        """
+        body = json.dumps({"question": question, "project_path": project_path})
+        return self.send(
+            from_agent=from_agent,
+            to_agent=Agents.LIBRARIAN,
+            msg_type=MessageTypes.PROJECT_KNOWLEDGE_REQUEST,
+            subject=f"Project knowledge: {question[:50]}",
             body=body,
             priority=priority,
         )

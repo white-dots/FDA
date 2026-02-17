@@ -33,12 +33,14 @@ def _get_default_project_root() -> Path:
 
 # Model names for Claude API
 # Using Haiku for all agents - complex tasks are delegated to Claude Code (Max subscription)
-MODEL_FDA: Final[str] = "claude-3-5-haiku-20241022"  # Fast and cheap for routing/simple tasks
+MODEL_FDA: Final[str] = "claude-3-5-haiku-20241022"  # Fast and cheap for routing/classification
 MODEL_EXECUTOR: Final[str] = "claude-3-5-haiku-20241022"  # Fast for command execution
 MODEL_LIBRARIAN: Final[str] = "claude-3-5-haiku-20241022"  # Fast for file indexing/search
+MODEL_WORKER: Final[str] = "claude-3-5-haiku-20241022"  # Fast for file identification
 
-# Use Sonnet for quality-critical tasks (meeting summaries, daily journals)
-MODEL_MEETING_SUMMARY: Final[str] = "claude-sonnet-4-20250514"  # Better for long transcripts
+# Use Sonnet for quality-critical tasks (code generation, meeting summaries)
+MODEL_MEETING_SUMMARY: Final[str] = "claude-sonnet-4-20250514"  # Quality for code gen + summaries
+MODEL_CODE_GEN: Final[str] = "claude-sonnet-4-20250514"  # Quality code generation
 
 # Project root and directory structure
 PROJECT_ROOT: Final[Path] = _get_default_project_root()
@@ -80,8 +82,20 @@ DISCORD_CLIENT_ID_ENV: Final[str] = "DISCORD_CLIENT_ID"
 # OpenAI configuration (for Whisper STT and TTS)
 OPENAI_API_KEY_ENV: Final[str] = "OPENAI_API_KEY"
 
+# OpenAI Realtime API configuration (voice)
+OPENAI_REALTIME_MODEL: Final[str] = "gpt-4o-realtime-preview-2025-06-03"
+OPENAI_REALTIME_VOICE: Final[str] = "alloy"  # alloy, ash, ballad, coral, echo, sage, shimmer, verse
+OPENAI_REALTIME_URL: Final[str] = "wss://api.openai.com/v1/realtime"
+
 # Anthropic configuration
 ANTHROPIC_API_KEY_ENV: Final[str] = "ANTHROPIC_API_KEY"
+
+# KakaoTalk configuration
+KAKAOTALK_EXPORT_DIR: Final[Path] = Path.home() / "Documents" / "fda-exports" / "kakaotalk"
+KAKAOTALK_POLL_INTERVAL_SECONDS: Final[int] = 60  # Check for new messages every minute
+
+# Client configuration
+CLIENTS_CONFIG_DIR: Final[Path] = Path(__file__).parent / "clients" / "configs"
 
 # Logging
 LOG_DIR: Final[Path] = PROJECT_ROOT / "logs"

@@ -194,6 +194,79 @@ class ProjectState:
             )
         """)
 
+        # Projects table - discovered git repos / packages
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS projects (
+                id TEXT PRIMARY KEY,
+                path TEXT UNIQUE NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT,
+                tech_stack TEXT,
+                project_type TEXT,
+                git_remote TEXT,
+                git_branch TEXT,
+                git_commit_hash TEXT,
+                file_count INTEGER DEFAULT 0,
+                code_route_count INTEGER DEFAULT 0,
+                last_analyzed_at TIMESTAMP,
+                discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Project domains table - functional clusters within a project
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS project_domains (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                domain_name TEXT NOT NULL,
+                description TEXT,
+                file_paths TEXT,
+                entry_points TEXT,
+                keywords TEXT,
+                file_count INTEGER DEFAULT 0,
+                FOREIGN KEY (project_id) REFERENCES projects(id)
+            )
+        """)
+
+        # Project keywords table - inverted keyword index with TF-IDF weights
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS project_keywords (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                keyword TEXT NOT NULL,
+                weight REAL DEFAULT 1.0,
+                source_type TEXT,
+                source_path TEXT,
+                domain_id TEXT,
+                FOREIGN KEY (project_id) REFERENCES projects(id),
+                FOREIGN KEY (domain_id) REFERENCES project_domains(id)
+            )
+        """)
+
+        # Conversation messages table - unified history across all interfaces
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS conversation_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL DEFAULT 'discord',
+                channel_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                username TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # Keep old table name as alias for backward compat (in case DB already exists)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS discord_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                username TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         # Create indexes for common queries
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_tasks_owner ON tasks(owner)")
@@ -208,6 +281,14 @@ class ProjectState:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_code_routes_type ON code_routes(route_type)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_code_routes_name ON code_routes(name)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_code_routes_file ON code_routes(file_path)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_convo_messages_channel ON conversation_messages(channel_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_convo_messages_date ON conversation_messages(created_at)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_convo_messages_source ON conversation_messages(source)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_projects_path ON projects(path)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_project_domains_project ON project_domains(project_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_project_keywords_keyword ON project_keywords(keyword)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_project_keywords_weight ON project_keywords(weight DESC)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_project_keywords_project ON project_keywords(project_id)")
 
         conn.commit()
 
@@ -771,6 +852,125 @@ class ProjectState:
         rows = cursor.fetchall()
         return [dict(row) for row in rows]
 
+    # Conversation message methods (unified history across all interfaces)
+
+    def add_conversation_message(
+        self,
+        channel_id: str,
+        role: str,
+        content: str,
+        source: str = "discord",
+        username: Optional[str] = None,
+    ) -> None:
+        """
+        Save a conversation message to the history.
+
+        Args:
+            channel_id: Channel/chat identifier (Discord channel ID, Telegram chat ID, 'cli').
+            role: 'user' or 'assistant'.
+            content: The message content.
+            source: Interface source — 'discord', 'telegram', or 'cli'.
+            username: The user's display name (for user messages).
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO conversation_messages (source, channel_id, role, content, username, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (source, channel_id, role, content, username, datetime.now().isoformat()),
+        )
+        conn.commit()
+
+    # Backward-compat alias used by Discord bot
+    def add_discord_message(self, channel_id: str, role: str, content: str, username: Optional[str] = None) -> None:
+        self.add_conversation_message(channel_id, role, content, source="discord", username=username)
+
+    def get_messages_today(
+        self,
+        source: Optional[str] = None,
+        channel_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """
+        Get today's conversation messages across all or specific interfaces.
+
+        Args:
+            source: Optional filter by source ('discord', 'telegram', 'cli').
+            channel_id: Optional channel/chat ID to filter by.
+            limit: Maximum number of messages to return.
+
+        Returns:
+            List of message dictionaries ordered chronologically.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        today_str = datetime.now().strftime("%Y-%m-%d")
+
+        conditions = ["created_at LIKE ?"]
+        params: list[Any] = [f"{today_str}%"]
+
+        if source:
+            conditions.append("source = ?")
+            params.append(source)
+        if channel_id:
+            conditions.append("channel_id = ?")
+            params.append(channel_id)
+
+        params.append(limit)
+        where_clause = " AND ".join(conditions)
+
+        cursor.execute(
+            f"""
+            SELECT * FROM conversation_messages
+            WHERE {where_clause}
+            ORDER BY created_at ASC
+            LIMIT ?
+            """,
+            params,
+        )
+        rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    # Backward-compat alias
+    def get_discord_messages_today(self, channel_id: Optional[str] = None, limit: int = 50) -> list[dict[str, Any]]:
+        return self.get_messages_today(source=None, channel_id=channel_id, limit=limit)
+
+    def get_messages_recent(
+        self,
+        channel_id: str,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """
+        Get the most recent messages in a channel (for immediate context window).
+
+        Args:
+            channel_id: The channel/chat identifier.
+            limit: Maximum number of messages.
+
+        Returns:
+            List of message dictionaries ordered chronologically.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT * FROM conversation_messages
+            WHERE channel_id = ?
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (channel_id, limit),
+        )
+        rows = cursor.fetchall()
+        # Reverse to get chronological order
+        return [dict(row) for row in reversed(rows)]
+
+    # Backward-compat alias
+    def get_discord_messages_recent(self, channel_id: str, limit: int = 20) -> list[dict[str, Any]]:
+        return self.get_messages_recent(channel_id, limit)
+
     # File index methods (for Librarian)
 
     def add_file_to_index(
@@ -1238,6 +1438,433 @@ class ProjectState:
             (now, agent_name),
         )
         conn.commit()
+
+    # Project knowledge methods (for auto-knowledge base)
+
+    def add_project(
+        self,
+        path: str,
+        name: str,
+        description: Optional[str] = None,
+        tech_stack: Optional[list[str]] = None,
+        project_type: Optional[str] = None,
+        git_remote: Optional[str] = None,
+        git_branch: Optional[str] = None,
+        git_commit_hash: Optional[str] = None,
+        file_count: int = 0,
+        code_route_count: int = 0,
+    ) -> str:
+        """
+        Add a discovered project.
+
+        Args:
+            path: Absolute path to the project root.
+            name: Project name.
+            description: AI-generated project description.
+            tech_stack: List of technologies used.
+            project_type: Type of project (python, javascript, etc.).
+            git_remote: Git remote URL.
+            git_branch: Current git branch.
+            git_commit_hash: Current HEAD commit hash.
+            file_count: Number of files in project.
+            code_route_count: Number of code routes indexed.
+
+        Returns:
+            Generated project ID.
+        """
+        project_id = f"proj_{uuid.uuid4().hex[:8]}"
+        now = datetime.now().isoformat()
+        tech_stack_json = json.dumps(tech_stack) if tech_stack else None
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO projects
+            (id, path, name, description, tech_stack, project_type, git_remote,
+             git_branch, git_commit_hash, file_count, code_route_count, discovered_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(path) DO UPDATE SET
+                name = excluded.name,
+                description = COALESCE(excluded.description, projects.description),
+                tech_stack = COALESCE(excluded.tech_stack, projects.tech_stack),
+                project_type = COALESCE(excluded.project_type, projects.project_type),
+                git_remote = excluded.git_remote,
+                git_branch = excluded.git_branch,
+                git_commit_hash = excluded.git_commit_hash,
+                file_count = excluded.file_count,
+                code_route_count = excluded.code_route_count
+            """,
+            (project_id, path, name, description, tech_stack_json, project_type,
+             git_remote, git_branch, git_commit_hash, file_count, code_route_count, now),
+        )
+        conn.commit()
+
+        # Return the actual ID (may differ if path already existed)
+        cursor.execute("SELECT id FROM projects WHERE path = ?", (path,))
+        row = cursor.fetchone()
+        return row["id"] if row else project_id
+
+    def get_project_by_path(self, path: str) -> Optional[dict[str, Any]]:
+        """
+        Get a project by its path.
+
+        Args:
+            path: Project root path.
+
+        Returns:
+            Project dictionary or None.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM projects WHERE path = ?", (path,))
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        entry = dict(row)
+        if entry.get("tech_stack"):
+            entry["tech_stack"] = json.loads(entry["tech_stack"])
+        return entry
+
+    def get_all_projects(self) -> list[dict[str, Any]]:
+        """
+        Get all discovered projects.
+
+        Returns:
+            List of project dictionaries.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM projects ORDER BY name")
+        rows = cursor.fetchall()
+        results = []
+        for row in rows:
+            entry = dict(row)
+            if entry.get("tech_stack"):
+                entry["tech_stack"] = json.loads(entry["tech_stack"])
+            results.append(entry)
+        return results
+
+    def update_project(self, project_id: str, **fields: Any) -> None:
+        """
+        Update a project's fields.
+
+        Args:
+            project_id: Project ID.
+            **fields: Fields to update.
+        """
+        if not fields:
+            return
+
+        allowed_fields = {
+            "name", "description", "tech_stack", "project_type", "git_remote",
+            "git_branch", "git_commit_hash", "file_count", "code_route_count",
+            "last_analyzed_at",
+        }
+        update_fields = {}
+        for k, v in fields.items():
+            if k not in allowed_fields:
+                continue
+            if k == "tech_stack" and isinstance(v, list):
+                update_fields[k] = json.dumps(v)
+            else:
+                update_fields[k] = v
+
+        if not update_fields:
+            return
+
+        set_clause = ", ".join(f"{k} = ?" for k in update_fields.keys())
+        values = list(update_fields.values()) + [project_id]
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute(f"UPDATE projects SET {set_clause} WHERE id = ?", values)
+        conn.commit()
+
+    def project_needs_reanalysis(self, path: str, current_commit_hash: str) -> bool:
+        """
+        Check if a project needs re-analysis based on git commit hash.
+
+        Args:
+            path: Project root path.
+            current_commit_hash: Current HEAD commit hash.
+
+        Returns:
+            True if the project needs re-analysis.
+        """
+        project = self.get_project_by_path(path)
+        if project is None:
+            return True
+        if project.get("git_commit_hash") != current_commit_hash:
+            return True
+        if project.get("last_analyzed_at") is None:
+            return True
+        return False
+
+    def add_project_domain(
+        self,
+        project_id: str,
+        domain_name: str,
+        description: Optional[str] = None,
+        file_paths: Optional[list[str]] = None,
+        entry_points: Optional[list[str]] = None,
+        keywords: Optional[list[str]] = None,
+        file_count: int = 0,
+    ) -> str:
+        """
+        Add a domain cluster to a project.
+
+        Args:
+            project_id: Parent project ID.
+            domain_name: Name of the domain (e.g., "API Layer", "Data Models").
+            description: Domain description.
+            file_paths: List of file paths in this domain.
+            entry_points: List of entry point file paths.
+            keywords: List of domain keywords.
+            file_count: Number of files in the domain.
+
+        Returns:
+            Generated domain ID.
+        """
+        domain_id = f"dom_{uuid.uuid4().hex[:8]}"
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO project_domains
+            (id, project_id, domain_name, description, file_paths, entry_points, keywords, file_count)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (domain_id, project_id, domain_name, description,
+             json.dumps(file_paths) if file_paths else None,
+             json.dumps(entry_points) if entry_points else None,
+             json.dumps(keywords) if keywords else None,
+             file_count),
+        )
+        conn.commit()
+        return domain_id
+
+    def get_project_domains(self, project_id: str) -> list[dict[str, Any]]:
+        """
+        Get all domains for a project.
+
+        Args:
+            project_id: Project ID.
+
+        Returns:
+            List of domain dictionaries.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM project_domains WHERE project_id = ? ORDER BY domain_name",
+            (project_id,)
+        )
+        rows = cursor.fetchall()
+        results = []
+        for row in rows:
+            entry = dict(row)
+            for field in ("file_paths", "entry_points", "keywords"):
+                if entry.get(field):
+                    entry[field] = json.loads(entry[field])
+            results.append(entry)
+        return results
+
+    def clear_project_domains(self, project_id: str) -> int:
+        """
+        Clear all domains for a project (before re-analysis).
+
+        Args:
+            project_id: Project ID.
+
+        Returns:
+            Number of domains deleted.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM project_domains WHERE project_id = ?", (project_id,))
+        deleted = cursor.rowcount
+        conn.commit()
+        return deleted
+
+    def add_project_keyword(
+        self,
+        project_id: str,
+        keyword: str,
+        weight: float = 1.0,
+        source_type: Optional[str] = None,
+        source_path: Optional[str] = None,
+        domain_id: Optional[str] = None,
+    ) -> str:
+        """
+        Add a keyword to the project keyword index.
+
+        Args:
+            project_id: Project ID.
+            keyword: The keyword.
+            weight: TF-IDF weight.
+            source_type: Source type (function, class, filename, docstring, import).
+            source_path: Path to the source file.
+            domain_id: Optional domain ID this keyword belongs to.
+
+        Returns:
+            Generated keyword entry ID.
+        """
+        kw_id = f"kw_{uuid.uuid4().hex[:8]}"
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO project_keywords
+            (id, project_id, keyword, weight, source_type, source_path, domain_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (kw_id, project_id, keyword, weight, source_type, source_path, domain_id),
+        )
+        conn.commit()
+        return kw_id
+
+    def add_project_keywords_batch(
+        self,
+        keywords: list[tuple[str, str, float, Optional[str], Optional[str], Optional[str]]],
+    ) -> int:
+        """
+        Batch insert keywords for efficiency.
+
+        Args:
+            keywords: List of (project_id, keyword, weight, source_type, source_path, domain_id) tuples.
+
+        Returns:
+            Number of keywords inserted.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        rows = [
+            (f"kw_{uuid.uuid4().hex[:8]}", pid, kw, w, st, sp, did)
+            for pid, kw, w, st, sp, did in keywords
+        ]
+        cursor.executemany(
+            """
+            INSERT INTO project_keywords
+            (id, project_id, keyword, weight, source_type, source_path, domain_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        conn.commit()
+        return len(rows)
+
+    def search_project_keywords(
+        self,
+        query_keywords: list[str],
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        """
+        Search project keywords and aggregate scores by project.
+
+        Args:
+            query_keywords: List of keywords to search for.
+            limit: Maximum number of projects to return.
+
+        Returns:
+            List of dicts with project_id, total_score, matched_keywords.
+        """
+        if not query_keywords:
+            return []
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        placeholders = ", ".join("?" for _ in query_keywords)
+        lower_keywords = [kw.lower() for kw in query_keywords]
+
+        cursor.execute(
+            f"""
+            SELECT
+                pk.project_id,
+                p.name as project_name,
+                p.path as project_path,
+                SUM(pk.weight) as total_score,
+                COUNT(DISTINCT pk.keyword) as matched_count,
+                GROUP_CONCAT(DISTINCT pk.keyword) as matched_keywords
+            FROM project_keywords pk
+            JOIN projects p ON pk.project_id = p.id
+            WHERE LOWER(pk.keyword) IN ({placeholders})
+            GROUP BY pk.project_id
+            ORDER BY total_score DESC
+            LIMIT ?
+            """,
+            lower_keywords + [limit],
+        )
+        rows = cursor.fetchall()
+        results = []
+        for row in rows:
+            entry = dict(row)
+            if entry.get("matched_keywords"):
+                entry["matched_keywords"] = entry["matched_keywords"].split(",")
+            results.append(entry)
+        return results
+
+    def clear_project_keywords(self, project_id: str) -> int:
+        """
+        Clear all keywords for a project (before re-indexing).
+
+        Args:
+            project_id: Project ID.
+
+        Returns:
+            Number of keywords deleted.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM project_keywords WHERE project_id = ?", (project_id,))
+        deleted = cursor.rowcount
+        conn.commit()
+        return deleted
+
+    def get_project_summary(self, project_id: str) -> Optional[dict[str, Any]]:
+        """
+        Get a comprehensive project summary including domains and top keywords.
+
+        Args:
+            project_id: Project ID.
+
+        Returns:
+            Dictionary with project info, domains, and top keywords. None if not found.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        # Get project
+        cursor.execute("SELECT * FROM projects WHERE id = ?", (project_id,))
+        row = cursor.fetchone()
+        if row is None:
+            return None
+
+        project = dict(row)
+        if project.get("tech_stack"):
+            project["tech_stack"] = json.loads(project["tech_stack"])
+
+        # Get domains
+        domains = self.get_project_domains(project_id)
+
+        # Get top keywords
+        cursor.execute(
+            """
+            SELECT keyword, weight, source_type
+            FROM project_keywords
+            WHERE project_id = ?
+            ORDER BY weight DESC
+            LIMIT 30
+            """,
+            (project_id,),
+        )
+        top_keywords = [dict(row) for row in cursor.fetchall()]
+
+        return {
+            "project": project,
+            "domains": domains,
+            "top_keywords": top_keywords,
+        }
 
     def close(self) -> None:
         """Close the database connection."""

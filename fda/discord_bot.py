@@ -2,13 +2,17 @@
 Discord Voice Bot - PRIMARY user interface for FDA system.
 
 This is the main way users interact with FDA:
-- Voice commands in Discord channels
-- Wake word detection ("Hey FDA" or "FDA")
+- Voice commands in Discord channels via OpenAI Realtime API
+- Low-latency speech-to-speech conversation (~300-600ms)
 - Meeting attendance and transcription
-- Real-time voice responses via TTS
+- Real-time voice responses
 
 The Discord bot routes user requests to FDA, which then collaborates
 with Librarian and Executor peers to fulfill them.
+
+Voice Architecture:
+  Discord Voice (48kHz stereo) <-> VoiceStreamSink (resamples)
+      <-> OpenAI Realtime API (24kHz mono, WebSocket)
 """
 
 import asyncio
@@ -16,6 +20,7 @@ import io
 import logging
 import os
 import tempfile
+import time
 import json
 import wave
 import struct
@@ -36,29 +41,89 @@ from fda.config import (
 from fda.state.project_state import ProjectState
 from fda.comms.message_bus import MessageTypes, Agents
 
+try:
+    from discord.sinks import Sink as _PycordSink
+    _HAS_PYCORD_SINK = True
+except ImportError:
+    _PycordSink = object
+    _HAS_PYCORD_SINK = False
+
 logger = logging.getLogger(__name__)
 
 
-class VoiceListeningSink:
+class VoiceStreamSink(_PycordSink):
     """
-    Audio sink that collects voice data from Discord users.
+    Audio sink that streams Discord voice to OpenAI Realtime API.
 
-    Buffers audio per-user and detects silence to determine when
-    someone has finished speaking.
+    Extends py-cord's Sink to receive audio via VoiceClient.start_recording().
+    Instead of buffering and doing Whisper batch transcription, this streams
+    audio directly to the Realtime API WebSocket for real-time processing.
+
+    The Realtime API handles:
+    - Voice Activity Detection (VAD)
+    - Speech-to-text transcription
+    - LLM response generation
+    - Text-to-speech output
+    All in a single WebSocket connection with ~300-600ms latency.
     """
-
-    # Audio settings (Discord uses 48kHz, 16-bit, stereo)
-    SAMPLE_RATE = 48000
-    CHANNELS = 2
-    SAMPLE_WIDTH = 2  # 16-bit = 2 bytes
-
-    # Silence detection settings
-    SILENCE_THRESHOLD = 500  # RMS threshold for silence
-    SILENCE_DURATION = 1.5  # Seconds of silence to consider speech ended
-    MIN_SPEECH_DURATION = 0.5  # Minimum speech duration to process
-    MAX_SPEECH_DURATION = 30.0  # Maximum duration before forcing processing
 
     def __init__(self, agent: "DiscordVoiceAgent", loop: asyncio.AbstractEventLoop):
+        if _HAS_PYCORD_SINK:
+            super().__init__(filters=None)
+        self.agent = agent
+        self.loop = loop
+
+    def write(self, data: Any, user: Any) -> None:
+        """Called by py-cord when audio data is received from a user.
+
+        Streams audio directly to the Realtime API session.
+        This method is called from py-cord's DecodeManager thread.
+        """
+        try:
+            if user is None:
+                return
+            # Skip bot audio
+            if hasattr(user, 'bot') and user.bot:
+                return
+
+            # Convert PCM data to bytes
+            pcm_data = data.pcm if hasattr(data, 'pcm') else bytes(data)
+
+            # Stream to Realtime API (handles resampling internally)
+            if self.agent._realtime_session and self.agent._realtime_session.connected:
+                self.agent._realtime_session.send_audio(pcm_data)
+
+        except Exception as e:
+            logger.error(f"[VoiceStreamSink] Error in write(): {e}", exc_info=True)
+
+    def cleanup(self) -> None:
+        """Clean up resources."""
+        if _HAS_PYCORD_SINK:
+            try:
+                super().cleanup()
+            except Exception:
+                pass
+
+
+class VoiceListeningSink(_PycordSink):
+    """
+    Legacy audio sink for Whisper-based transcription (meeting mode).
+
+    Used only for meeting transcription mode where we need full transcripts
+    of all speakers without the Realtime API's conversational behavior.
+    """
+
+    SAMPLE_RATE = 48000
+    CHANNELS = 2
+    SAMPLE_WIDTH = 2
+    SILENCE_THRESHOLD = 500
+    SILENCE_DURATION = 1.5
+    MIN_SPEECH_DURATION = 0.5
+    MAX_SPEECH_DURATION = 30.0
+
+    def __init__(self, agent: "DiscordVoiceAgent", loop: asyncio.AbstractEventLoop):
+        if _HAS_PYCORD_SINK:
+            super().__init__(filters=None)
         self.agent = agent
         self.loop = loop
         self.user_buffers: dict[int, list[bytes]] = defaultdict(list)
@@ -66,136 +131,100 @@ class VoiceListeningSink:
         self.user_speech_start: dict[int, float] = {}
         self.processing_users: set[int] = set()
 
-    def write(self, user: Any, data: Any) -> None:
-        """Called by Discord when audio data is received from a user."""
-        if user is None or user.bot:
-            return
+    def write(self, data: Any, user: Any) -> None:
+        """Called by py-cord when audio data is received."""
+        try:
+            if user is None:
+                return
+            if hasattr(user, 'bot') and user.bot:
+                return
 
-        user_id = user.id
+            user_id = user.id if hasattr(user, 'id') else int(user)
+            if user_id in self.processing_users:
+                return
 
-        # Don't buffer if we're already processing this user's audio
-        if user_id in self.processing_users:
-            return
+            pcm_data = data.pcm if hasattr(data, 'pcm') else bytes(data)
+            rms = self._calculate_rms(pcm_data)
+            current_time = time.monotonic()
+            display_name = user.display_name if hasattr(user, 'display_name') else str(user_id)
 
-        # Convert PCM data to bytes
-        pcm_data = data.pcm if hasattr(data, 'pcm') else bytes(data)
-
-        # Calculate RMS to detect silence
-        rms = self._calculate_rms(pcm_data)
-        current_time = asyncio.get_event_loop().time()
-
-        if rms > self.SILENCE_THRESHOLD:
-            # User is speaking
-            self.user_buffers[user_id].append(pcm_data)
-            self.user_silence_start.pop(user_id, None)
-
-            if user_id not in self.user_speech_start:
-                self.user_speech_start[user_id] = current_time
-
-            # Check for max duration
-            speech_duration = current_time - self.user_speech_start.get(user_id, current_time)
-            if speech_duration > self.MAX_SPEECH_DURATION:
-                self._schedule_processing(user_id, user.display_name)
-        else:
-            # Silence detected
-            if user_id in self.user_speech_start:
-                if user_id not in self.user_silence_start:
-                    self.user_silence_start[user_id] = current_time
-                else:
-                    silence_duration = current_time - self.user_silence_start[user_id]
-                    speech_duration = self.user_silence_start[user_id] - self.user_speech_start.get(user_id, 0)
-
-                    # If enough silence and minimum speech duration met
-                    if silence_duration > self.SILENCE_DURATION and speech_duration > self.MIN_SPEECH_DURATION:
-                        self._schedule_processing(user_id, user.display_name)
+            if rms > self.SILENCE_THRESHOLD:
+                self.user_buffers[user_id].append(pcm_data)
+                self.user_silence_start.pop(user_id, None)
+                if user_id not in self.user_speech_start:
+                    self.user_speech_start[user_id] = current_time
+                speech_duration = current_time - self.user_speech_start.get(user_id, current_time)
+                if speech_duration > self.MAX_SPEECH_DURATION:
+                    self._schedule_processing(user_id, display_name)
+            else:
+                if user_id in self.user_speech_start:
+                    if user_id not in self.user_silence_start:
+                        self.user_silence_start[user_id] = current_time
+                    else:
+                        silence_duration = current_time - self.user_silence_start[user_id]
+                        speech_duration = self.user_silence_start[user_id] - self.user_speech_start.get(user_id, 0)
+                        if silence_duration > self.SILENCE_DURATION and speech_duration > self.MIN_SPEECH_DURATION:
+                            self._schedule_processing(user_id, display_name)
+        except Exception as e:
+            logger.error(f"[VoiceSink] Error in write(): {e}", exc_info=True)
 
     def _calculate_rms(self, pcm_data: bytes) -> float:
-        """Calculate RMS (Root Mean Square) of audio data."""
         if len(pcm_data) < 2:
             return 0
-
-        # Convert bytes to 16-bit samples
         samples = struct.unpack(f"{len(pcm_data) // 2}h", pcm_data)
-
         if not samples:
             return 0
-
-        # Calculate RMS
         sum_squares = sum(s * s for s in samples)
         return (sum_squares / len(samples)) ** 0.5
 
     def _schedule_processing(self, user_id: int, username: str) -> None:
-        """Schedule audio processing in the event loop."""
         if user_id in self.processing_users:
             return
-
         self.processing_users.add(user_id)
         audio_data = b"".join(self.user_buffers[user_id])
-
-        # Clear buffers
         self.user_buffers[user_id] = []
         self.user_silence_start.pop(user_id, None)
         self.user_speech_start.pop(user_id, None)
-
-        # Schedule async processing
         asyncio.run_coroutine_threadsafe(
             self._process_audio(user_id, username, audio_data),
             self.loop
         )
 
     async def _process_audio(self, user_id: int, username: str, audio_data: bytes) -> None:
-        """Process collected audio data."""
         try:
             if len(audio_data) < self.SAMPLE_RATE * self.SAMPLE_WIDTH * self.CHANNELS * 0.3:
-                # Too short, skip
                 return
-
-            # Convert to WAV format for Whisper
             wav_data = self._pcm_to_wav(audio_data)
-
-            # Transcribe
             text = await self.agent._transcribe_audio_async(wav_data)
-
             if not text or len(text.strip()) < 2:
                 return
-
-            logger.info(f"[DiscordBot] Transcribed from {username}: {text}")
-
-            # Add to transcript buffer if in meeting mode
-            if self.agent._meeting_mode:
-                self.agent._add_to_transcript(username, text)
-
-            # Check for wake word
-            wake_detected, command = self.agent._detect_wake_word(text)
-
-            if wake_detected:
-                logger.info(f"[DiscordBot] Wake word detected! Command: {command}")
-                await self.agent._handle_voice_command(username, command or text)
-
+            logger.info(f"[DiscordBot] Meeting transcription from {username}: {text}")
+            self.agent._add_to_transcript(username, text)
         except Exception as e:
             logger.error(f"[DiscordBot] Error processing audio: {e}")
         finally:
             self.processing_users.discard(user_id)
 
     def _pcm_to_wav(self, pcm_data: bytes) -> bytes:
-        """Convert raw PCM data to WAV format."""
         wav_buffer = io.BytesIO()
-
         with wave.open(wav_buffer, "wb") as wav_file:
             wav_file.setnchannels(self.CHANNELS)
             wav_file.setsampwidth(self.SAMPLE_WIDTH)
             wav_file.setframerate(self.SAMPLE_RATE)
             wav_file.writeframes(pcm_data)
-
         wav_buffer.seek(0)
         return wav_buffer.read()
 
     def cleanup(self) -> None:
-        """Clean up resources."""
         self.user_buffers.clear()
         self.user_silence_start.clear()
         self.user_speech_start.clear()
         self.processing_users.clear()
+        if _HAS_PYCORD_SINK:
+            try:
+                super().cleanup()
+            except Exception:
+                pass
 
 
 DISCORD_SYSTEM_PROMPT = """You are FDA (Facilitating Director Agent) - the user's personal AI assistant, speaking via Discord voice.
@@ -222,26 +251,61 @@ You can also attend meetings (stay in voice channel, transcribe, summarize later
 Remember: You're the voice and face of the system. Be warm, helpful, and proactive.
 """
 
+# Instructions for the OpenAI Realtime API voice session
+# These are sent as the 'instructions' field in session.update
+REALTIME_VOICE_INSTRUCTIONS = """You are FDA (Facilitating Director Agent), a personal AI assistant for John, a CEO and data scientist at Datacore.
+
+## Personality & Tone
+- Warm, professional, and efficient
+- Speak naturally — like a helpful colleague in the same room
+- Keep responses to 2-3 sentences unless the user asks for more detail
+- Use simple, clear language that sounds natural when spoken aloud
+- Address the user as "John" when appropriate
+
+## Context
+- John works on SmartStore (Naver Commerce API integration), Wholesum, and other projects
+- He manages a team and is interested in cold outreach, B2C/B2B sales, ad analytics, LinkedIn
+- Technical terms he uses: Python, backend, frontend, deploy, production, Datacore, SmartStore, aonebnh, sofsys
+
+## Language & Pronunciation
+- Always respond in English
+- The user speaks English with a Korean accent — be patient with unclear audio
+- "FDA" is pronounced "eff-dee-ay" (the agent's name)
+- If you can't understand what the user said, politely ask them to repeat
+
+## Behavior Rules
+- Never produce background sounds, music, or sound effects
+- Never switch language unless explicitly asked
+- If unsure about what the user is asking, ask a brief clarifying question
+- For complex questions that require file search or command execution, acknowledge that you would need to check and provide what you know
+- When greeted (just "hey" or "hi"), respond warmly: "Hey John, how can I help?"
+
+## Response Style
+- For quick questions: 1-2 sentences
+- For explanations: 2-3 sentences, summarize key points
+- Never give lists longer than 3 items in voice (suggest text for longer lists)
+- Use natural conversational fillers when needed ("Let me think about that...", "Good question...")
+"""
+
 
 class DiscordVoiceAgent(BaseAgent):
     """
     Discord Voice Agent - PRIMARY user interface for FDA.
 
-    This is the main way users interact with FDA:
-    - Voice commands with wake word detection
-    - Meeting attendance and transcription
-    - Real-time voice responses
-    - Delegation to peer agents (Librarian, Executor)
+    Uses OpenAI Realtime API for low-latency voice conversation:
+    - Speech-to-speech via WebSocket (~300-600ms latency)
+    - Server-side VAD (no wake word needed while in voice)
+    - Streaming audio I/O
+    - Meeting attendance and transcription (Whisper fallback)
+    - Delegation to peer agents (Librarian, Executor) via FDAAgent
     """
-
-    # Wake words that trigger FDA to respond
-    WAKE_WORDS = ["hey fda", "fda", "hey f d a", "f d a"]
 
     def __init__(
         self,
         bot_token: Optional[str] = None,
         openai_api_key: Optional[str] = None,
         project_state_path: Optional[Path] = None,
+        fda_agent: Optional[Any] = None,
     ):
         """
         Initialize the Discord Voice Agent.
@@ -252,6 +316,8 @@ class DiscordVoiceAgent(BaseAgent):
             openai_api_key: OpenAI API key for Whisper/TTS. If not provided,
                            reads from OPENAI_API_KEY environment variable.
             project_state_path: Path to the project state database.
+            fda_agent: Optional FDAAgent instance for full delegation support.
+                      If not provided, one will be created automatically.
         """
         super().__init__(
             name="DiscordBot",
@@ -260,6 +326,17 @@ class DiscordVoiceAgent(BaseAgent):
             project_state_path=project_state_path,
         )
 
+        # Initialize or create FDAAgent for proper peer delegation
+        self._fda_agent = fda_agent
+        if self._fda_agent is None:
+            try:
+                from fda.fda_agent import FDAAgent
+                self._fda_agent = FDAAgent(state_path=project_state_path)
+                logger.info("[DiscordBot] Created FDAAgent for peer delegation")
+            except Exception as e:
+                logger.warning(f"[DiscordBot] Could not create FDAAgent: {e}. "
+                             "Falling back to local answering.")
+
         self.bot_token = bot_token or os.environ.get(DISCORD_BOT_TOKEN_ENV)
         if not self.bot_token:
             raise ValueError(
@@ -267,15 +344,23 @@ class DiscordVoiceAgent(BaseAgent):
                 "environment variable or pass bot_token parameter."
             )
 
-        self.openai_api_key = openai_api_key or os.environ.get(OPENAI_API_KEY_ENV)
+        self.openai_api_key = (
+            openai_api_key
+            or os.environ.get(OPENAI_API_KEY_ENV)
+            or self.state.get_context("openai_api_key")
+        )
         self._openai_client = None
 
         self._bot = None
         self._voice_client = None
-        self._voice_sink: Optional[VoiceListeningSink] = None
+        self._voice_sink: Optional[Any] = None  # VoiceStreamSink or VoiceListeningSink
         self._current_session_id: Optional[str] = None
         self._transcript_buffer: list[dict[str, Any]] = []
         self._response_channel = None  # Channel to send text responses
+
+        # OpenAI Realtime API session
+        self._realtime_session = None  # RealtimeVoiceSession
+        self._playback_task: Optional[asyncio.Task] = None  # Audio playback loop
 
         # Meeting mode state
         self._meeting_mode = False
@@ -283,6 +368,10 @@ class DiscordVoiceAgent(BaseAgent):
 
         # Voice listening state
         self._listening_enabled = True  # Enable voice listening by default
+
+        # Use the state DB for conversation history (persists all day)
+        # The FDA agent's state DB is preferred since it feeds into the journal
+        self._state_db = self._fda_agent.state if self._fda_agent else self.state
 
     def _get_openai_client(self) -> Any:
         """Get or create OpenAI client for Whisper/TTS."""
@@ -325,6 +414,7 @@ class DiscordVoiceAgent(BaseAgent):
         intents.message_content = True
         intents.voice_states = True
         intents.guilds = True
+        intents.members = True
 
         self._bot = commands.Bot(
             command_prefix="!",
@@ -421,6 +511,11 @@ class DiscordVoiceAgent(BaseAgent):
             """Toggle voice listening on/off."""
             await self._cmd_listen(ctx, action)
 
+        @self._bot.command(name="dailybrief")
+        async def daily_brief(ctx):
+            """Give a live daily briefing via voice and text."""
+            await self._cmd_dailybrief(ctx)
+
         return self._bot
 
     async def _cmd_listen(self, ctx: Any, action: Optional[str]) -> None:
@@ -442,26 +537,114 @@ class DiscordVoiceAgent(BaseAgent):
 
         elif action in ("off", "disable", "stop"):
             self._listening_enabled = False
-            self._stop_voice_listening()
+            await self._stop_voice_listening()
             await ctx.send("Voice listening **disabled**. Use `!ask` to talk to me instead.")
 
         else:
             await ctx.send("Usage: `!listen on` or `!listen off`")
 
+    def _save_message(self, channel_id: int, role: str, content: str, username: str = None) -> None:
+        """Persist a message to the state DB."""
+        try:
+            self._state_db.add_discord_message(
+                channel_id=str(channel_id),
+                role=role,
+                content=content,
+                username=username,
+            )
+        except Exception as e:
+            logger.error(f"[DiscordBot] Failed to save message: {e}")
+
+    def _get_conversation_history(self, channel_id: int) -> list[dict[str, str]]:
+        """Load today's conversation history from the state DB for context."""
+        try:
+            # Get recent messages for this channel (last 20 for LLM context window)
+            messages = self._state_db.get_discord_messages_recent(
+                channel_id=str(channel_id),
+                limit=20,
+            )
+            return [
+                {"role": msg["role"], "content": msg["content"]}
+                for msg in messages
+            ]
+        except Exception as e:
+            logger.error(f"[DiscordBot] Failed to load history: {e}")
+            return []
+
+    async def _cmd_dailybrief(self, ctx: Any) -> None:
+        """Handle !dailybrief command - generate and speak a daily briefing."""
+        if not self._fda_agent:
+            await ctx.send("FDA agent is not available.")
+            return
+
+        # Get user name for personalized message
+        user_name = self._fda_agent.state.get_context("user_name") or "there"
+        await ctx.send(f"Good to see you, {user_name}! Let me prepare your daily briefing...")
+
+        try:
+            # Generate the brief in a background thread (blocking LLM call)
+            loop = asyncio.get_event_loop()
+            brief = await loop.run_in_executor(None, self._fda_agent.generate_daily_brief)
+
+            # Send as text in the channel
+            if len(brief) > 2000:
+                for i in range(0, len(brief), 1900):
+                    await ctx.send(brief[i:i+1900])
+            else:
+                await ctx.send(brief)
+
+            # If in voice channel, speak it out loud
+            if self._voice_client and self._voice_client.is_connected():
+                # Trim for TTS — keep under ~500 chars for natural pacing
+                tts_text = brief if len(brief) < 1000 else brief[:1000]
+                await self._speak_text(tts_text)
+
+        except Exception as e:
+            logger.error(f"[DiscordBot] Error generating daily brief: {e}")
+            await ctx.send(f"Sorry, I couldn't generate your daily briefing: {e}")
+
+    def _get_greeting(self) -> str:
+        """Get a personalized greeting using the user's name from state DB."""
+        user_name = None
+        if self._fda_agent:
+            user_name = self._fda_agent.state.get_context("user_name")
+        if not user_name:
+            user_name = self.state.get_context("user_name")
+        if user_name:
+            return f"Hey {user_name}! Give me a moment to think... 🤔"
+        return "Give me a moment to think... 🤔"
+
     async def _handle_plain_message(self, message: Any, content: str) -> None:
         """Handle plain text messages (not commands)."""
         try:
-            # Show typing indicator
-            async with message.channel.typing():
-                response = self._answer_question(content)
+            # Send immediate personalized greeting so user knows we're working
+            greeting = self._get_greeting()
+            thinking_msg = await message.reply(greeting)
 
-            # Send response
+            # Load conversation history from state DB
+            channel_id = message.channel.id
+            history = self._get_conversation_history(channel_id)
+
+            # Save user message to DB right away
+            username = str(message.author.display_name) if hasattr(message.author, 'display_name') else str(message.author)
+            self._save_message(channel_id, "user", content, username=username)
+
+            # Run the blocking LLM call in a thread to not freeze Discord
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None, self._answer_question, content, history
+            )
+
+            # Save assistant response to DB
+            self._save_message(channel_id, "assistant", response)
+
+            # Edit the "Thinking..." message with the actual response
             if len(response) > 2000:
-                # Split long responses
-                for i in range(0, len(response), 1900):
+                await thinking_msg.edit(content=response[:1900])
+                for i in range(1900, len(response), 1900):
                     await message.reply(response[i:i+1900])
             else:
-                await message.reply(response)
+                await thinking_msg.edit(content=response)
 
             # If in voice, also speak the response
             if self._voice_client and self._voice_client.is_connected():
@@ -475,11 +658,38 @@ class DiscordVoiceAgent(BaseAgent):
 
     async def _cmd_join(self, ctx: Any) -> None:
         """Handle !join command."""
-        if not ctx.author.voice:
+        if not ctx.guild:
+            await ctx.send("This command only works in a server, not in DMs.")
+            return
+
+        # Get the Member object — ctx.author might be a User without .voice
+        # Try multiple methods to get the member with voice state
+        member = None
+
+        # Method 1: ctx.author might already be a Member
+        if hasattr(ctx.author, "voice"):
+            member = ctx.author
+
+        # Method 2: look up from guild cache
+        if member is None:
+            member = ctx.guild.get_member(ctx.author.id)
+
+        # Method 3: fetch from API if cache miss
+        if member is None:
+            try:
+                member = await ctx.guild.fetch_member(ctx.author.id)
+            except Exception as e:
+                logger.error(f"[DiscordBot] Failed to fetch member: {e}")
+
+        if member is None or not hasattr(member, "voice"):
+            await ctx.send("Could not get your member info. Make sure you're in a server channel.")
+            return
+
+        if not member.voice:
             await ctx.send("You need to be in a voice channel first!")
             return
 
-        channel = ctx.author.voice.channel
+        channel = member.voice.channel
 
         try:
             if self._voice_client and self._voice_client.is_connected():
@@ -499,7 +709,7 @@ class DiscordVoiceAgent(BaseAgent):
             # Start voice listening
             if self._listening_enabled:
                 await self._start_voice_listening()
-                await ctx.send(f"Joined **{channel.name}**. I'm listening! Say \"Hey FDA\" to talk to me.")
+                await ctx.send(f"Joined **{channel.name}**. I'm listening! Just speak naturally and I'll respond.")
             else:
                 await ctx.send(f"Joined **{channel.name}**. Use `!ask` to talk to me.")
 
@@ -518,8 +728,8 @@ class DiscordVoiceAgent(BaseAgent):
         try:
             channel_name = self._voice_client.channel.name
 
-            # Stop voice listening
-            self._stop_voice_listening()
+            # Stop voice listening (async now for Realtime session cleanup)
+            await self._stop_voice_listening()
 
             await self._voice_client.disconnect()
             self._voice_client = None
@@ -547,17 +757,39 @@ class DiscordVoiceAgent(BaseAgent):
             await ctx.send("Please provide a question. Example: `!ask What are our blockers?`")
             return
 
-        await ctx.send("Thinking...")
+        greeting = self._get_greeting()
+        thinking_msg = await ctx.send(greeting)
 
         try:
-            response = self._answer_question(question)
+            # Load conversation history from state DB
+            channel_id = ctx.channel.id
+            history = self._get_conversation_history(channel_id)
 
-            # Send text response
-            await ctx.send(response)
+            # Save user message to DB
+            username = str(ctx.author.display_name) if hasattr(ctx.author, 'display_name') else str(ctx.author)
+            self._save_message(channel_id, "user", question, username=username)
+
+            # Run the blocking LLM call in a thread so Discord stays responsive
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None, self._answer_question, question, history
+            )
+
+            # Save assistant response to DB
+            self._save_message(channel_id, "assistant", response)
+
+            # Edit the greeting message with the actual response
+            if len(response) > 2000:
+                await thinking_msg.edit(content=response[:1900])
+                for i in range(1900, len(response), 1900):
+                    await ctx.send(response[i:i+1900])
+            else:
+                await thinking_msg.edit(content=response)
 
             # If in voice, also speak the response
             if self._voice_client and self._voice_client.is_connected():
-                await self._speak_text(response)
+                if len(response) < 500:
+                    await self._speak_text(response)
 
         except Exception as e:
             logger.error(f"[DiscordBot] Error answering question: {e}")
@@ -613,17 +845,18 @@ class DiscordVoiceAgent(BaseAgent):
         help_text = """**FDA Discord Bot - Your Personal AI Assistant**
 
 **Voice Commands:**
-`!join` - Join your voice channel (starts listening!)
+`!join` - Join your voice channel (starts real-time voice conversation!)
 `!leave` - Leave voice channel
 `!say <text>` - Speak text in voice channel
 `!listen on/off` - Toggle voice listening
 
-**Voice Call:**
-When I'm in a voice channel, just say **"Hey FDA"** followed by your question!
-I'll listen, understand, and respond by voice.
+**Voice Conversation:**
+When I'm in a voice channel, just **speak naturally** and I'll respond!
+No wake word needed — powered by OpenAI Realtime API for low-latency conversation.
 
 **Text Commands:**
 `!ask <question>` - Ask FDA anything (or just type without !)
+`!dailybrief` - Get your personalized daily briefing (voice + text)
 `!status` - Show project status
 
 **Meeting Mode:**
@@ -826,40 +1059,77 @@ I'll listen, understand, and respond by voice.
 
         await ctx.send("\n".join(lines))
 
-    def _answer_question(self, question: str) -> str:
-        """Answer a question using FDA agent capabilities and peer agents."""
-        question_lower = question.lower()
-        peer_result = None
+    def _answer_question_voice(self, question: str, conversation_history: list[dict[str, str]] = None) -> str:
+        """Fast voice-optimized answer — single LLM call, no delegation chain.
 
-        # Check if we should delegate to peers
-        if any(phrase in question_lower for phrase in [
-            "find file", "search", "where is", "what files", "python file"
-        ]):
-            # Delegate to Librarian
-            librarian_status = self.state.get_agent_status(Agents.LIBRARIAN)
-            if librarian_status and librarian_status.get("status") == "running":
-                msg_id = self.message_bus.request_search(
-                    from_agent=self.name.lower(),
-                    query=question,
-                )
-                response = self.message_bus.wait_for_response(
-                    agent_name=self.name.lower(),
-                    request_id=msg_id,
-                    timeout_seconds=10.0,
-                )
-                if response:
-                    try:
-                        peer_result = json.loads(response.get("body", "{}")).get("result")
-                    except Exception:
-                        pass
+        Skips Librarian/Executor/Claude Code for speed. Uses conversation
+        history and project context to answer directly.
+        """
+        agent = self._fda_agent or self
+        context = {}
 
+        # Add user context
+        user_name = agent.state.get_context("user_name")
+        if user_name:
+            context["user"] = {
+                "name": user_name,
+                "role": agent.state.get_context("user_role"),
+                "goals": agent.state.get_context("user_goals"),
+            }
+
+        # Add conversation history
+        if conversation_history:
+            convo_lines = []
+            for msg in conversation_history[-10:]:  # Last 10 messages for speed
+                role = "User" if msg.get("role") == "user" else "FDA"
+                convo_lines.append(f"{role}: {msg.get('content', '')[:200]}")
+            context["recent_conversation"] = "\n".join(convo_lines)
+
+        # Add project context (lightweight)
+        try:
+            project_ctx = agent.get_project_context()
+            context.update(project_ctx)
+        except Exception:
+            pass
+
+        # Single fast LLM call
+        voice_prompt = (
+            f"{question}\n\n"
+            "[VOICE MODE: Keep your response concise and conversational — "
+            "2-3 sentences max. This will be spoken aloud via TTS.]"
+        )
+
+        try:
+            return agent.chat_with_context(voice_prompt, context)
+        except Exception as e:
+            logger.error(f"[DiscordBot] Voice answer failed: {e}")
+            return "Sorry, I had trouble with that. Could you try again?"
+
+    def _answer_question(self, question: str, conversation_history: list[dict[str, str]] = None) -> str:
+        """Answer a question using FDAAgent's full delegation pipeline.
+
+        Delegates to FDAAgent.ask() which handles routing to:
+        - Librarian (file search, knowledge queries)
+        - Executor (command execution, Claude Code)
+        - Direct API response (simple questions)
+
+        Args:
+            question: The user's question.
+            conversation_history: Recent conversation exchanges for context continuity.
+        """
+        # Use FDAAgent for full peer delegation support
+        if self._fda_agent is not None:
+            try:
+                return self._fda_agent.ask(question, conversation_history=conversation_history)
+            except Exception as e:
+                logger.error(f"[DiscordBot] FDAAgent.ask() failed: {e}")
+                # Fall through to local fallback
+
+        # Fallback: answer directly if FDAAgent is unavailable
+        logger.warning("[DiscordBot] FDAAgent unavailable, answering directly")
         context = self.get_project_context()
 
-        # Add peer result if available
-        if peer_result:
-            context["peer_agent_result"] = peer_result
-
-        # Search journal
+        # Search journal for relevant context
         relevant = self.search_journal(question, top_n=3)
         if relevant:
             context["relevant_history"] = [
@@ -867,18 +1137,7 @@ I'll listen, understand, and respond by voice.
                 for e in relevant
             ]
 
-        # If we have peer results, incorporate them
-        if peer_result:
-            enhanced_question = f"""{question}
-
-[Librarian found this information:]
-{json.dumps(peer_result, indent=2)[:1000]}
-
-Please summarize naturally for voice response."""
-        else:
-            enhanced_question = question
-
-        return self.chat_with_context(enhanced_question, context)
+        return self.chat_with_context(question, context)
 
     def _detect_wake_word(self, text: str) -> tuple[bool, str]:
         """
@@ -891,12 +1150,18 @@ Please summarize naturally for voice response."""
             Tuple of (wake_word_detected, command_after_wake_word)
         """
         text_lower = text.lower().strip()
+        # Normalize: remove dots/periods and collapse multiple spaces
+        text_normalized = text_lower.replace(".", " ").replace(",", " ")
+        import re as _re
+        text_normalized = _re.sub(r'\s+', ' ', text_normalized).strip()
 
         for wake_word in self.WAKE_WORDS:
-            if wake_word in text_lower:
-                # Extract the command after the wake word
-                idx = text_lower.find(wake_word)
-                command = text[idx + len(wake_word):].strip()
+            # Check both original and normalized text
+            if wake_word in text_lower or wake_word in text_normalized:
+                # Find position in whichever matched
+                matched_text = text_normalized if wake_word in text_normalized else text_lower
+                idx = matched_text.find(wake_word)
+                command = matched_text[idx + len(wake_word):].strip()
                 # Remove leading punctuation
                 command = command.lstrip(",.!? ")
                 return (True, command) if command else (True, "")
@@ -948,31 +1213,120 @@ Keep it concise but capture the important points."""
 {summary}"""
 
     async def _start_voice_listening(self) -> None:
-        """Start listening to voice in the connected channel."""
+        """Start listening to voice in the connected channel.
+
+        Creates an OpenAI Realtime API session and streams Discord audio to it.
+        The Realtime API handles VAD, STT, LLM response, and TTS — all in one
+        WebSocket connection for ultra-low latency.
+        """
         if not self._voice_client or not self._voice_client.is_connected():
             return
 
         try:
-            # Create voice sink
             loop = asyncio.get_event_loop()
-            self._voice_sink = VoiceListeningSink(self, loop)
 
-            # Start listening (Discord.py voice receive)
+            # Create and connect the Realtime API session
+            from fda.realtime_voice import RealtimeVoiceSession
+
+            # Build personalized instructions
+            instructions = REALTIME_VOICE_INSTRUCTIONS
+            user_name = None
+            if self._fda_agent:
+                user_name = self._fda_agent.state.get_context("user_name")
+            if not user_name:
+                user_name = self.state.get_context("user_name")
+            if user_name:
+                instructions = instructions.replace("John", user_name)
+
+            self._realtime_session = RealtimeVoiceSession(
+                api_key=self.openai_api_key,
+                on_audio_out=self._on_realtime_audio_out,
+                on_transcript_in=self._on_realtime_transcript_in,
+                on_transcript_out=self._on_realtime_transcript_out,
+                on_speech_started=self._on_realtime_speech_started,
+                on_response_done=self._on_realtime_response_done,
+                on_error=self._on_realtime_error,
+                instructions=instructions,
+            )
+
+            await self._realtime_session.connect()
+
+            # Inject recent conversation context so the AI knows what's been discussed
+            channel_id = self._response_channel.id if self._response_channel else 0
+            if channel_id:
+                history = self._get_conversation_history(channel_id)
+                if history:
+                    context_text = "Recent conversation context:\n"
+                    for msg in history[-5:]:
+                        role = "User" if msg.get("role") == "user" else "FDA"
+                        context_text += f"{role}: {msg.get('content', '')[:200]}\n"
+                    await self._realtime_session.inject_context(context_text, role="user")
+                    await self._realtime_session.inject_context(
+                        "Got it, I have the conversation context. I'm ready to continue helping.",
+                        role="assistant",
+                    )
+
+            # Create the streaming audio sink and start recording from Discord
+            self._voice_sink = VoiceStreamSink(self, loop)
             self._voice_client.start_recording(
                 self._voice_sink,
                 self._on_voice_receive_finished,
-                None
+                None,
             )
-            logger.info("[DiscordBot] Voice listening started")
+
+            # Start the audio playback loop (streams Realtime API audio to Discord)
+            self._playback_task = asyncio.create_task(self._audio_playback_loop())
+
+            logger.info("[DiscordBot] Realtime voice session started")
 
         except Exception as e:
-            logger.error(f"[DiscordBot] Failed to start voice listening: {e}")
-            # Voice receiving might not be available
+            logger.error(f"[DiscordBot] Failed to start Realtime voice: {e}", exc_info=True)
+            self._realtime_session = None
             self._voice_sink = None
 
-    def _stop_voice_listening(self) -> None:
-        """Stop voice listening."""
-        if self._voice_client and self._voice_client.is_recording():
+            # Fallback: try legacy Whisper-based listening
+            logger.info("[DiscordBot] Falling back to legacy Whisper-based voice...")
+            await self._start_voice_listening_legacy()
+
+    async def _start_voice_listening_legacy(self) -> None:
+        """Legacy Whisper-based voice listening (fallback / meeting mode)."""
+        if not self._voice_client or not self._voice_client.is_connected():
+            return
+
+        try:
+            loop = asyncio.get_event_loop()
+            self._voice_sink = VoiceListeningSink(self, loop)
+            self._voice_client.start_recording(
+                self._voice_sink,
+                self._on_voice_receive_finished,
+                None,
+            )
+            logger.info("[DiscordBot] Legacy voice listening started")
+        except Exception as e:
+            logger.error(f"[DiscordBot] Failed to start legacy voice listening: {e}")
+            self._voice_sink = None
+
+    async def _stop_voice_listening(self) -> None:
+        """Stop voice listening and disconnect Realtime session."""
+        # Stop the playback task
+        if self._playback_task:
+            self._playback_task.cancel()
+            try:
+                await self._playback_task
+            except asyncio.CancelledError:
+                pass
+            self._playback_task = None
+
+        # Disconnect Realtime session
+        if self._realtime_session:
+            try:
+                await self._realtime_session.disconnect()
+            except Exception as e:
+                logger.error(f"[RealtimeVoice] Error disconnecting: {e}")
+            self._realtime_session = None
+
+        # Stop Discord recording
+        if self._voice_client and self._voice_sink:
             try:
                 self._voice_client.stop_recording()
             except Exception as e:
@@ -985,8 +1339,117 @@ Keep it concise but capture the important points."""
         logger.info("[DiscordBot] Voice listening stopped")
 
     def _on_voice_receive_finished(self, sink: Any, *args) -> None:
-        """Callback when voice recording is stopped."""
+        """Callback when voice recording is stopped (py-cord callback)."""
         logger.info("[DiscordBot] Voice receive finished")
+
+    # ----- Realtime API audio playback -----
+
+    async def _audio_playback_loop(self) -> None:
+        """Monitor and manage audio playback from Realtime API to Discord.
+
+        Checks for buffered audio from the Realtime session and starts
+        Discord playback when audio is available. The actual PCM reading
+        is done by _RealtimePCMSource in Discord's player thread.
+        """
+        logger.info("[DiscordBot] Audio playback loop started")
+
+        try:
+            while self._realtime_session and self._realtime_session.connected:
+                if not self._voice_client or not self._voice_client.is_connected():
+                    await asyncio.sleep(0.1)
+                    continue
+
+                # If there's audio to play and we're not already playing
+                if (self._realtime_session.has_output_audio()
+                        and not self._voice_client.is_playing()):
+                    try:
+                        source = _RealtimePCMSource(self._realtime_session)
+                        self._voice_client.play(
+                            source,
+                            after=lambda e: logger.debug("[DiscordBot] PCM playback segment finished")
+                        )
+                    except Exception as e:
+                        if "Already playing" not in str(e):
+                            logger.error(f"[DiscordBot] Playback error: {e}")
+
+                await asyncio.sleep(0.02)  # 20ms check interval
+
+        except asyncio.CancelledError:
+            logger.info("[DiscordBot] Audio playback loop cancelled")
+        except Exception as e:
+            logger.error(f"[DiscordBot] Audio playback loop error: {e}", exc_info=True)
+
+    # ----- Realtime API callbacks -----
+
+    async def _on_realtime_audio_out(self, pcm_48k_stereo: bytes) -> None:
+        """Called when Realtime API produces audio output.
+
+        Audio is buffered in the session. The playback loop handles starting
+        Discord playback when audio is available. This callback is for logging only.
+        """
+        pass  # Playback managed by _audio_playback_loop
+
+    async def _on_realtime_transcript_in(self, transcript: str) -> None:
+        """Called when user's speech is transcribed by the Realtime API."""
+        logger.info(f"[DiscordBot] User said: {transcript}")
+
+        # Save to conversation history
+        channel_id = self._response_channel.id if self._response_channel else 0
+        if channel_id:
+            self._save_message(channel_id, "user", transcript)
+
+        # Add to transcript buffer
+        self._add_to_transcript("User", transcript)
+
+        # Post to text channel
+        if self._response_channel:
+            try:
+                await self._response_channel.send(f"**User**: {transcript}")
+            except Exception:
+                pass
+
+    async def _on_realtime_transcript_out(self, transcript: str) -> None:
+        """Called when assistant's speech transcript is complete."""
+        logger.info(f"[DiscordBot] FDA said: {transcript}")
+
+        # Save to conversation history
+        channel_id = self._response_channel.id if self._response_channel else 0
+        if channel_id:
+            self._save_message(channel_id, "assistant", transcript)
+
+        # Add to transcript buffer
+        self._add_to_transcript("FDA", transcript)
+
+        # Post to text channel
+        if self._response_channel:
+            try:
+                await self._response_channel.send(f"**FDA**: {transcript}")
+            except Exception:
+                pass
+
+    async def _on_realtime_speech_started(self) -> None:
+        """Called when VAD detects user speech (useful for interruptions)."""
+        # If Discord is playing our audio, stop it to let the user speak
+        if self._voice_client and self._voice_client.is_playing():
+            self._voice_client.stop()
+            logger.debug("[DiscordBot] Stopped playback for user interruption")
+
+    async def _on_realtime_response_done(self, response: dict) -> None:
+        """Called when a full Realtime API response is complete."""
+        usage = response.get("usage", {})
+        logger.info(
+            f"[DiscordBot] Response complete. "
+            f"Tokens: {usage.get('total_tokens', '?')}"
+        )
+
+    async def _on_realtime_error(self, error_msg: str) -> None:
+        """Called when the Realtime API reports an error."""
+        logger.error(f"[DiscordBot] Realtime API error: {error_msg}")
+        if self._response_channel:
+            try:
+                await self._response_channel.send(f"⚠️ Voice error: {error_msg[:200]}")
+            except Exception:
+                pass
 
     async def _transcribe_audio_async(self, audio_data: bytes) -> str:
         """Transcribe audio using Whisper API (async wrapper)."""
@@ -1007,6 +1470,17 @@ Keep it concise but capture the important points."""
             response = client.audio.transcriptions.create(
                 model="whisper-1",
                 file=audio_file,
+                language="en",
+                prompt=(
+                    "Hey FDA, FDA, daily brief, SmartStore, Datacore, "
+                    "cold mail, cold email, sending cold mails, B2C, B2B, "
+                    "outreach, prospecting, client acquisition, "
+                    "aonebnh, sofsys, Naver, Commerce API, "
+                    "Wholesum, sales dashboard, ad stats, "
+                    "CEO, data scientist, LinkedIn, resume, "
+                    "journal, librarian, executor, agent, "
+                    "Python, backend, frontend, deploy, production"
+                ),
             )
 
             return response.text
@@ -1018,15 +1492,36 @@ Keep it concise but capture the important points."""
     async def _handle_voice_command(self, username: str, command: str) -> None:
         """Handle a voice command after wake word detection."""
         if not command:
-            # Just wake word with no command
-            await self._speak_text("Yes? How can I help you?")
+            # Just wake word with no command — greet by name
+            user_name = None
+            if self._fda_agent:
+                user_name = self._fda_agent.state.get_context("user_name")
+            if not user_name:
+                user_name = self.state.get_context("user_name")
+            greeting = f"Hey {user_name}, how may I assist you today?" if user_name else "Hey, how may I assist you today?"
+            await self._speak_text(greeting)
             return
 
         logger.info(f"[DiscordBot] Processing voice command from {username}: {command}")
 
         try:
-            # Get response from FDA
-            response = self._answer_question(command)
+            # Load conversation history from state DB
+            channel_id = self._response_channel.id if self._response_channel else 0
+            history = self._get_conversation_history(channel_id) if channel_id else []
+
+            # Save user voice message to DB
+            if channel_id:
+                self._save_message(channel_id, "user", command, username=username)
+
+            # Get response from FDA using fast voice path (single LLM call)
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None, lambda: self._answer_question_voice(command, history)
+            )
+
+            # Save assistant response to DB
+            if channel_id:
+                self._save_message(channel_id, "assistant", response)
 
             # Speak the response
             await self._speak_text(response)
@@ -1058,6 +1553,7 @@ Keep it concise but capture the important points."""
                 model="tts-1",
                 voice="alloy",
                 input=text,
+                speed=1.15,
             )
 
             # Save to temp file
@@ -1092,6 +1588,17 @@ Keep it concise but capture the important points."""
             response = client.audio.transcriptions.create(
                 model="whisper-1",
                 file=audio_file,
+                language="en",
+                prompt=(
+                    "Hey FDA, FDA, daily brief, SmartStore, Datacore, "
+                    "cold mail, cold email, sending cold mails, B2C, B2B, "
+                    "outreach, prospecting, client acquisition, "
+                    "aonebnh, sofsys, Naver, Commerce API, "
+                    "Wholesum, sales dashboard, ad stats, "
+                    "CEO, data scientist, LinkedIn, resume, "
+                    "journal, librarian, executor, agent, "
+                    "Python, backend, frontend, deploy, production"
+                ),
             )
 
             return response.text
@@ -1202,6 +1709,61 @@ Keep it concise but capture the important points."""
         # Permissions: Connect, Speak, Send Messages, Read Message History
         permissions = 3148800
         return f"https://discord.com/api/oauth2/authorize?client_id={cid}&permissions={permissions}&scope=bot"
+
+
+class _RealtimePCMSource:
+    """Discord AudioSource that reads PCM from a RealtimeVoiceSession's output buffer.
+
+    Implements discord.AudioSource interface by providing a read() method
+    that returns 20ms frames of 48kHz stereo 16-bit PCM audio.
+    """
+
+    # 20ms frame at 48kHz, stereo, 16-bit = 3840 bytes
+    FRAME_SIZE = 3840
+
+    def __init__(self, session):
+        self._session = session
+        self._buffer = bytearray()
+        self._finished = False
+
+    def read(self) -> bytes:
+        """Read one 20ms audio frame for Discord.
+
+        Returns exactly FRAME_SIZE bytes of PCM data, or empty bytes
+        if no more audio is available (which stops the player).
+        """
+        if self._finished:
+            return b""
+
+        # Try to pull from session's synchronous buffer
+        try:
+            # We need to access the buffer synchronously since read() is called
+            # from Discord's player thread (not the asyncio loop)
+            buf = self._session._output_audio_buffer
+            if len(buf) >= self.FRAME_SIZE:
+                # Take exactly one frame
+                frame = bytes(buf[:self.FRAME_SIZE])
+                del buf[:self.FRAME_SIZE]
+                return frame
+            elif len(buf) > 0:
+                # Pad with silence to fill the frame
+                frame = bytes(buf) + b"\x00" * (self.FRAME_SIZE - len(buf))
+                buf.clear()
+                return frame
+            else:
+                # No audio available — return silence briefly, then stop
+                # Return empty to indicate we're done for now
+                return b""
+        except Exception:
+            return b""
+
+    def is_opus(self) -> bool:
+        """We provide raw PCM, not Opus."""
+        return False
+
+    def cleanup(self) -> None:
+        """Clean up when player stops."""
+        self._finished = True
 
 
 def get_bot_token() -> Optional[str]:

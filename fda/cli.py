@@ -313,7 +313,30 @@ def handle_ask(args: argparse.Namespace) -> int:
         print(f"Question: {args.question}")
         print()
 
-        response = agent.ask(args.question)
+        # Load recent CLI conversation history for context
+        try:
+            recent_msgs = agent.state.get_messages_recent(channel_id="cli", limit=20)
+            conversation_history = [
+                {"role": msg["role"], "content": msg["content"]}
+                for msg in recent_msgs
+            ]
+        except Exception:
+            conversation_history = None
+
+        # Save user message to state DB
+        try:
+            agent.state.add_conversation_message("cli", "user", args.question, source="cli", username=user_name)
+        except Exception:
+            pass
+
+        response = agent.ask(args.question, conversation_history=conversation_history)
+
+        # Save assistant response to state DB
+        try:
+            agent.state.add_conversation_message("cli", "assistant", response, source="cli")
+        except Exception:
+            pass
+
         print(response)
         return 0
     except Exception as e:
@@ -890,6 +913,7 @@ def handle_discord_status(args: argparse.Namespace) -> int:
 def handle_discord_start(args: argparse.Namespace) -> int:
     """Start the Discord bot."""
     from fda.discord_bot import DiscordVoiceAgent, get_bot_token
+    from fda.fda_agent import FDAAgent
 
     token = get_bot_token()
     if not token:
@@ -900,7 +924,8 @@ def handle_discord_start(args: argparse.Namespace) -> int:
     print("Press Ctrl+C to stop.\n")
 
     try:
-        bot = DiscordVoiceAgent(bot_token=token)
+        fda_agent = FDAAgent()
+        bot = DiscordVoiceAgent(bot_token=token, fda_agent=fda_agent)
         bot.start()
     except KeyboardInterrupt:
         print("\nStopping bot...")
@@ -1182,6 +1207,115 @@ def handle_calendar_upcoming(args: argparse.Namespace) -> int:
             print(f"    📍 {event.get('location')}")
         print()
 
+    return 0
+
+
+def handle_discover(args: argparse.Namespace) -> int:
+    """Discover and analyze projects in exploration roots."""
+    from fda.librarian_agent import LibrarianAgent
+
+    ensure_fda_initialized()
+
+    try:
+        librarian = LibrarianAgent()
+
+        # If a specific path is given, analyze just that project
+        if args.path:
+            path = str(Path(args.path).expanduser().resolve())
+            if not Path(path).is_dir():
+                print(f"Error: Not a directory: {path}")
+                return 1
+
+            if args.skip_analysis:
+                project = librarian._analyze_project_root(path)
+                if project:
+                    librarian.state.add_project(
+                        path=project["path"],
+                        name=project["name"],
+                        project_type=project["project_type"],
+                        tech_stack=project.get("tech_stack"),
+                        git_remote=project.get("git_remote"),
+                        git_branch=project.get("git_branch"),
+                        git_commit_hash=project.get("git_commit_hash"),
+                    )
+                    print(f"Discovered: {project['name']} ({project['project_type']})")
+                else:
+                    print("Could not identify a project at that path.")
+                    return 1
+            else:
+                stats = librarian.build_project_knowledge(path, force=args.force)
+                if stats.get("cached"):
+                    print(f"Project unchanged (cached). Use --force to re-analyze.")
+                else:
+                    print(f"Analysis complete:")
+                    print(f"  Files analyzed: {stats.get('files_analyzed', 0)}")
+                    print(f"  Domains found: {stats.get('domains', 0)}")
+                    print(f"  Keywords indexed: {stats.get('keywords', 0)}")
+            return 0
+
+        # Discover all projects
+        print("Discovering projects across exploration roots...")
+        projects = librarian.discover_projects()
+
+        if not projects:
+            print("No projects found.")
+            return 0
+
+        if args.skip_analysis:
+            print(f"\nDiscovered {len(projects)} projects (analysis skipped):")
+            for p in projects:
+                print(f"  - {p['name']} ({p['project_type']}) at {p['path']}")
+            return 0
+
+        # Analyze each project
+        print(f"\nAnalyzing {len(projects)} projects...")
+        for project in projects:
+            stats = librarian.build_project_knowledge(project["path"], force=args.force)
+            if stats.get("cached"):
+                print(f"  [cached] {project['name']}")
+            else:
+                print(f"  [analyzed] {project['name']}: {stats.get('domains', 0)} domains, {stats.get('keywords', 0)} keywords")
+
+        print(f"\nDone! Run 'fda projects' to see all discovered projects.")
+        return 0
+
+    except Exception as e:
+        print(f"Error: {e}")
+        return 1
+
+
+def handle_projects(args: argparse.Namespace) -> int:
+    """List all discovered projects."""
+    ensure_fda_initialized()
+    state = ProjectState()
+
+    projects = state.get_all_projects()
+    if not projects:
+        print("No projects discovered yet. Run 'fda discover' first.")
+        return 0
+
+    print(f"Discovered Projects ({len(projects)} total)")
+    print("=" * 60)
+
+    for project in projects:
+        tech = ", ".join(project.get("tech_stack", [])[:5]) if project.get("tech_stack") else "unknown"
+        analyzed = project.get("last_analyzed_at", "never")
+        if analyzed and analyzed != "never":
+            analyzed = analyzed[:10]  # Just the date
+
+        print(f"\n  {project.get('name', 'Unknown')}")
+        print(f"    Path: {project.get('path')}")
+        print(f"    Type: {project.get('project_type', 'unknown')}")
+        print(f"    Tech: {tech}")
+        print(f"    Files: {project.get('file_count', 0)} | Routes: {project.get('code_route_count', 0)}")
+        print(f"    Last analyzed: {analyzed}")
+        if project.get("description"):
+            desc = project["description"][:120]
+            print(f"    Description: {desc}{'...' if len(project['description']) > 120 else ''}")
+        if project.get("git_branch"):
+            print(f"    Branch: {project['git_branch']}")
+
+    print()
     return 0
 
 
@@ -1692,6 +1826,34 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="Show detailed pip output",
     )
     setup_deps_parser.set_defaults(func=handle_setup_deps)
+
+    # discover command - discover and analyze projects
+    discover_parser = subparsers.add_parser(
+        "discover",
+        help="Discover and analyze projects in exploration roots",
+    )
+    discover_parser.add_argument(
+        "--path",
+        help="Analyze a specific project path instead of scanning exploration roots",
+    )
+    discover_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Force re-analysis even if git commit hasn't changed",
+    )
+    discover_parser.add_argument(
+        "--skip-analysis",
+        action="store_true",
+        help="Only discover projects, don't build knowledge base",
+    )
+    discover_parser.set_defaults(func=handle_discover)
+
+    # projects command - list discovered projects
+    projects_parser = subparsers.add_parser(
+        "projects",
+        help="List all discovered projects with their stats",
+    )
+    projects_parser.set_defaults(func=handle_projects)
 
     args = parser.parse_args(argv)
 

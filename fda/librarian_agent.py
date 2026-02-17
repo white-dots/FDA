@@ -21,6 +21,9 @@ from typing import Any, Optional
 from datetime import datetime, timedelta
 
 from fda.base_agent import BaseAgent
+import math
+from collections import Counter
+
 from fda.config import MODEL_LIBRARIAN, DEFAULT_CHECK_INTERVAL_MINUTES, PROJECT_ROOT
 from fda.comms.message_bus import MessageTypes, Agents
 
@@ -124,6 +127,7 @@ class LibrarianAgent(BaseAgent):
         self.exploration_depth = exploration_depth
         self._exploration_complete = False
         self._routing_complete = False
+        self._project_knowledge_complete = False
 
     def run_event_loop(self) -> None:
         """
@@ -179,6 +183,21 @@ class LibrarianAgent(BaseAgent):
             except Exception as e:
                 logger.error(f"[Librarian] Routing system error: {e}")
                 print(f"[Librarian] Routing system error: {e}")
+
+        # Build project knowledge base after routing system
+        if self._routing_complete and not self._project_knowledge_complete:
+            self.state.update_agent_status(self.name.lower(), "analyzing", "Building project knowledge base")
+            try:
+                print("[Librarian] Discovering and analyzing projects...")
+                projects = self.discover_projects()
+                for project in projects:
+                    self.build_project_knowledge(project["path"])
+                self._project_knowledge_complete = True
+                print(f"[Librarian] Project knowledge base complete! {len(projects)} projects analyzed")
+            except Exception as e:
+                logger.error(f"[Librarian] Project knowledge error: {e}")
+                print(f"[Librarian] Project knowledge error: {e}")
+                self._project_knowledge_complete = True  # Don't retry on error
 
         # Check for messages frequently (every 1 second) for responsive inter-agent comms
         # Maintenance tasks run less frequently
@@ -298,19 +317,29 @@ class LibrarianAgent(BaseAgent):
         body = message.get("body", "")
 
         # Parse the request
+        default_path = self.exploration_roots[0] if self.exploration_roots else str(Path.home())
+        explicit_path_provided = False
         try:
             request = json.loads(body)
             query = request.get("query", "")
             # Use first exploration root as default search path
-            path = request.get("path", self.exploration_roots[0] if self.exploration_roots else str(Path.home()))
+            # Note: request.get("path") returns None when path is JSON null,
+            # so we need an explicit fallback with `or`
+            raw_path = request.get("path")
+            if raw_path and os.path.exists(raw_path):
+                path = raw_path
+                explicit_path_provided = True
+                logger.info(f"[Librarian] Using explicit path from FDA: {path}")
+            else:
+                path = default_path
             search_type = request.get("search_type", "smart")  # smart, routes, files, journal
         except (json.JSONDecodeError, TypeError):
             # Body is just the query string
             query = body
-            path = self.exploration_roots[0] if self.exploration_roots else str(Path.home())
+            path = default_path
             search_type = "smart"
 
-        logger.info(f"[Librarian] Searching for: {query} (type: {search_type})")
+        logger.info(f"[Librarian] Searching for: {query} (type: {search_type}, path: {path})")
 
         # Execute appropriate search
         if search_type == "routes":
@@ -339,7 +368,7 @@ class LibrarianAgent(BaseAgent):
             }
         else:
             # Smart search: search everything
-            results = self._smart_search(query, path)
+            results = self._smart_search(query, path, explicit_path=explicit_path_provided)
 
             # Also search code routes
             route_results = self.search_routes(query)
@@ -650,18 +679,23 @@ Be concise but helpful."""
             logger.error(f"[Librarian] grep error: {e}")
             return []
 
-    def _smart_search(self, query: str, path: str) -> dict[str, Any]:
+    def _smart_search(self, query: str, path: str, explicit_path: bool = False) -> dict[str, Any]:
         """
         Perform a smart search based on the query.
 
         Determines the best search strategy based on the query:
         - File extension search: "*.py files" or "python files"
+        - Filename search: find files by name across exploration roots
         - Pattern search: "TODO", "FIXME", function names
         - Content search: general text search
+
+        When explicit_path is True, the user provided the path directly,
+        so we search ONLY within that path instead of all exploration roots.
 
         Args:
             query: The search query.
             path: Path to search in.
+            explicit_path: If True, restrict search to the given path only.
 
         Returns:
             Search results dictionary.
@@ -675,6 +709,36 @@ Be concise but helpful."""
         }
 
         query_lower = query.lower()
+
+        # When the user gave an explicit directory path, list its contents first
+        if explicit_path and os.path.isdir(path):
+            logger.info(f"[Librarian] Exploring user-specified directory: {path}")
+            import subprocess
+            try:
+                result = subprocess.run(
+                    ["find", path, "-maxdepth", "3",
+                     "-not", "-path", "*/.*",
+                     "-not", "-path", "*/node_modules/*",
+                     "-not", "-path", "*/__pycache__/*",
+                     "-not", "-path", "*/.venv/*"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if result.stdout.strip():
+                    all_files = result.stdout.strip().split("\n")
+                    results["files"] = all_files[:30]
+                    results["summary"] = f"Found {len(all_files)} items in '{path}'"
+            except (subprocess.TimeoutExpired, Exception) as e:
+                logger.warning(f"[Librarian] Error exploring explicit path: {e}")
+
+            # Also try content search within the explicit path
+            keywords = self._extract_search_keywords(query)
+            if keywords:
+                content_matches = self.grep_for_pattern(keywords, path)
+                if content_matches:
+                    results["matches"] = content_matches
+                    results["summary"] += f" + {len(content_matches)} content matches"
+
+            return results
 
         # Check for file type searches
         if "python" in query_lower or ".py" in query_lower:
@@ -695,10 +759,29 @@ Be concise but helpful."""
             results["files"] = self.find_files_by_extension(path, ["md", "txt", "rst"])
             results["summary"] = f"Found {len(results['files'])} documentation files"
 
-        # Pattern/content search
+        # General search: try both filename search and content search
         else:
-            results["matches"] = self.grep_for_pattern(query, path)
-            results["summary"] = f"Found {len(results['matches'])} matches for '{query}'"
+            # Extract keywords for filename search (strip common filler words)
+            keywords = self._extract_search_keywords(query)
+
+            # 1. Search for files by name across all exploration roots
+            if keywords:
+                filename_results = self._find_files_by_name(keywords)
+                if filename_results:
+                    results["files"] = filename_results
+                    results["summary"] = f"Found {len(filename_results)} file(s) matching '{keywords}'"
+
+            # 2. Also try content search (grep) in the specified path
+            content_matches = self.grep_for_pattern(query, path)
+            if content_matches:
+                results["matches"] = content_matches
+                if results["summary"]:
+                    results["summary"] += f" + {len(content_matches)} content matches"
+                else:
+                    results["summary"] = f"Found {len(content_matches)} content matches for '{query}'"
+
+            if not results["summary"]:
+                results["summary"] = f"Found 0 matches for '{query}'"
 
         # Also search the journal
         journal_results = self.search_journal(query, top_n=3)
@@ -707,6 +790,73 @@ Be concise but helpful."""
             results["summary"] += f" + {len(journal_results)} journal entries"
 
         return results
+
+    def _extract_search_keywords(self, query: str) -> str:
+        """
+        Extract meaningful search keywords from a natural language query.
+
+        Strips common filler words to get the core search term(s).
+
+        Args:
+            query: Natural language query.
+
+        Returns:
+            Extracted keyword string, or empty string if nothing useful.
+        """
+        filler_words = {
+            "do", "you", "see", "a", "an", "the", "is", "are", "there",
+            "find", "search", "for", "look", "looking", "where", "what",
+            "can", "could", "please", "help", "me", "my", "i", "have",
+            "any", "some", "that", "that's", "which", "about", "related", "to",
+            "file", "files", "picture", "image", "document", "named",
+            "called", "with", "of", "in", "on", "at", "it", "its", "it's",
+            "how", "show", "get", "locate", "does", "did", "has",
+            "don't", "doesn't", "isn't", "aren't", "wasn't", "weren't",
+            "i'm", "i've", "i'll", "you're", "you've", "there's",
+        }
+        words = query.lower().split()
+        keywords = [w.strip("'\".,!?") for w in words if w.strip("'\".,!?") not in filler_words]
+        return " ".join(keywords) if keywords else ""
+
+    def _find_files_by_name(self, keywords: str) -> list[str]:
+        """
+        Search for files by name across all exploration roots.
+
+        Uses the `find` command to locate files whose names contain
+        any of the given keywords.
+
+        Args:
+            keywords: Space-separated keywords to search for in filenames.
+
+        Returns:
+            List of matching file paths.
+        """
+        import subprocess
+
+        found_files = []
+        # Search each keyword individually for better coverage
+        search_terms = keywords.split()
+
+        for search_dir in self.exploration_roots:
+            if not os.path.isdir(search_dir):
+                continue
+            for term in search_terms:
+                if len(term) < 2:  # Skip very short terms
+                    continue
+                try:
+                    result = subprocess.run(
+                        ["find", search_dir, "-maxdepth", str(self.exploration_depth),
+                         "-iname", f"*{term}*",
+                         "-not", "-path", "*/.*"],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    if result.stdout.strip():
+                        found_files.extend(result.stdout.strip().split("\n"))
+                except (subprocess.TimeoutExpired, Exception):
+                    continue
+
+        # Deduplicate while preserving order
+        return list(dict.fromkeys(found_files))[:20]
 
     def index_file(self, file_path: str) -> Optional[str]:
         """
@@ -1542,3 +1692,732 @@ Focus on information that remains relevant over time."""
             Dictionary with total routes and breakdown by type.
         """
         return self.state.get_code_routes_stats()
+
+    # ========== Project Discovery & Knowledge Base ==========
+
+    # Marker files that identify project roots
+    PROJECT_MARKERS = {
+        "python": ["pyproject.toml", "setup.py", "setup.cfg", "requirements.txt", "Pipfile"],
+        "javascript": ["package.json"],
+        "typescript": ["package.json", "tsconfig.json"],
+        "go": ["go.mod"],
+        "rust": ["Cargo.toml"],
+        "java": ["pom.xml", "build.gradle", "build.gradle.kts"],
+        "ruby": ["Gemfile"],
+        "csharp": ["*.csproj", "*.sln"],
+    }
+
+    # Stopwords to filter from keyword indexing
+    KEYWORD_STOPWORDS = {
+        "self", "none", "true", "false", "return", "import", "from", "class",
+        "def", "if", "else", "for", "while", "try", "except", "with", "as",
+        "in", "not", "and", "or", "is", "the", "a", "an", "of", "to", "it",
+        "this", "that", "get", "set", "init", "main", "new", "str", "int",
+        "list", "dict", "bool", "float", "type", "any", "all", "has", "can",
+        "do", "be", "was", "are", "test", "args", "kwargs", "var", "val",
+        "let", "const", "function", "export", "default", "module", "require",
+    }
+
+    def discover_projects(self, max_depth: int = 4) -> list[dict[str, Any]]:
+        """
+        Discover projects (git repos, packages) across exploration roots.
+
+        Walks each exploration root looking for .git/ directories and
+        marker files (pyproject.toml, package.json, etc.).
+
+        Args:
+            max_depth: Maximum directory depth to search.
+
+        Returns:
+            List of discovered project dictionaries.
+        """
+        logger.info("[Librarian] Starting project discovery...")
+        print("[Librarian] Discovering projects...")
+
+        discovered = []
+        seen_paths = set()
+
+        for root in self.exploration_roots:
+            if not os.path.isdir(root):
+                continue
+
+            print(f"[Librarian] Scanning: {root}")
+
+            # Find .git directories as primary project indicators
+            try:
+                result = subprocess.run(
+                    ["find", root, "-maxdepth", str(max_depth),
+                     "-type", "d", "-name", ".git",
+                     "-not", "-path", "*/node_modules/*",
+                     "-not", "-path", "*/.venv/*",
+                     "-not", "-path", "*/venv/*"],
+                    capture_output=True, text=True, timeout=60,
+                )
+                for git_dir in result.stdout.strip().split("\n"):
+                    if not git_dir:
+                        continue
+                    project_path = os.path.dirname(git_dir)
+                    if project_path in seen_paths:
+                        continue
+                    seen_paths.add(project_path)
+
+                    project = self._analyze_project_root(project_path)
+                    if project:
+                        discovered.append(project)
+                        print(f"[Librarian] Found project: {project['name']} ({project['project_type']}) at {project_path}")
+
+            except (subprocess.TimeoutExpired, Exception) as e:
+                logger.warning(f"[Librarian] Error scanning {root}: {e}")
+
+            # Also look for standalone marker files (projects without .git)
+            for lang, markers in self.PROJECT_MARKERS.items():
+                for marker in markers:
+                    if "*" in marker:
+                        continue  # Skip glob patterns for find
+                    try:
+                        result = subprocess.run(
+                            ["find", root, "-maxdepth", str(max_depth),
+                             "-name", marker, "-type", "f",
+                             "-not", "-path", "*/node_modules/*",
+                             "-not", "-path", "*/.venv/*"],
+                            capture_output=True, text=True, timeout=30,
+                        )
+                        for marker_path in result.stdout.strip().split("\n"):
+                            if not marker_path:
+                                continue
+                            project_path = os.path.dirname(marker_path)
+                            if project_path in seen_paths:
+                                continue
+                            seen_paths.add(project_path)
+
+                            project = self._analyze_project_root(project_path)
+                            if project:
+                                discovered.append(project)
+                                print(f"[Librarian] Found project: {project['name']} ({project['project_type']}) at {project_path}")
+
+                    except (subprocess.TimeoutExpired, Exception):
+                        continue
+
+        # Store all discovered projects
+        for project in discovered:
+            self.state.add_project(
+                path=project["path"],
+                name=project["name"],
+                project_type=project["project_type"],
+                tech_stack=project.get("tech_stack"),
+                git_remote=project.get("git_remote"),
+                git_branch=project.get("git_branch"),
+                git_commit_hash=project.get("git_commit_hash"),
+            )
+
+        print(f"[Librarian] Discovery complete: found {len(discovered)} projects")
+        logger.info(f"[Librarian] Discovered {len(discovered)} projects")
+        return discovered
+
+    def _analyze_project_root(self, path: str) -> Optional[dict[str, Any]]:
+        """
+        Analyze a project root directory to extract metadata.
+
+        Args:
+            path: Path to the project root.
+
+        Returns:
+            Project metadata dictionary, or None if not a valid project.
+        """
+        project: dict[str, Any] = {"path": path}
+
+        # Get git info
+        git_info = self._get_git_info(path)
+        project.update(git_info)
+
+        # Detect tech stack and project type
+        tech_stack, project_type = self._detect_tech_stack(path)
+        project["tech_stack"] = tech_stack
+        project["project_type"] = project_type
+
+        # Extract project name
+        project["name"] = self._extract_project_name(path, project_type)
+
+        return project
+
+    def _get_git_info(self, path: str) -> dict[str, Any]:
+        """
+        Get git information for a project.
+
+        Args:
+            path: Project root path.
+
+        Returns:
+            Dictionary with git_commit_hash, git_remote, git_branch.
+        """
+        info: dict[str, Any] = {}
+
+        git_commands = {
+            "git_commit_hash": ["git", "rev-parse", "HEAD"],
+            "git_remote": ["git", "remote", "get-url", "origin"],
+            "git_branch": ["git", "branch", "--show-current"],
+        }
+
+        for key, cmd in git_commands.items():
+            try:
+                result = subprocess.run(
+                    cmd, capture_output=True, text=True,
+                    timeout=5, cwd=path,
+                )
+                if result.returncode == 0:
+                    info[key] = result.stdout.strip()
+            except (subprocess.TimeoutExpired, Exception):
+                pass
+
+        return info
+
+    def _detect_tech_stack(self, path: str) -> tuple[list[str], str]:
+        """
+        Detect the tech stack and project type from marker files.
+
+        Args:
+            path: Project root path.
+
+        Returns:
+            Tuple of (tech_stack list, project_type string).
+        """
+        tech_stack = []
+        project_type = "unknown"
+
+        # Check Python markers
+        pyproject = os.path.join(path, "pyproject.toml")
+        setup_py = os.path.join(path, "setup.py")
+        requirements = os.path.join(path, "requirements.txt")
+
+        if os.path.exists(pyproject) or os.path.exists(setup_py):
+            tech_stack.append("python")
+            project_type = "python"
+            # Try to read dependencies from pyproject.toml
+            if os.path.exists(pyproject):
+                try:
+                    with open(pyproject, "r", encoding="utf-8") as f:
+                        content = f.read()
+                    deps = self._extract_python_deps(content)
+                    tech_stack.extend(deps)
+                except Exception:
+                    pass
+        elif os.path.exists(requirements):
+            tech_stack.append("python")
+            project_type = "python"
+            try:
+                with open(requirements, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#"):
+                            pkg = re.split(r'[>=<\[!]', line)[0].strip()
+                            if pkg:
+                                tech_stack.append(pkg.lower())
+            except Exception:
+                pass
+
+        # Check JS/TS markers
+        package_json = os.path.join(path, "package.json")
+        if os.path.exists(package_json):
+            if "python" not in tech_stack:
+                project_type = "javascript"
+            tech_stack.append("javascript")
+            try:
+                with open(package_json, "r", encoding="utf-8") as f:
+                    pkg = json.load(f)
+                deps = list((pkg.get("dependencies", {}) or {}).keys())[:10]
+                tech_stack.extend(deps)
+                if "typescript" in pkg.get("devDependencies", {}) or os.path.exists(os.path.join(path, "tsconfig.json")):
+                    tech_stack.append("typescript")
+                    project_type = "typescript"
+            except Exception:
+                pass
+
+        # Check other markers
+        if os.path.exists(os.path.join(path, "go.mod")):
+            tech_stack.append("go")
+            project_type = "go"
+        if os.path.exists(os.path.join(path, "Cargo.toml")):
+            tech_stack.append("rust")
+            project_type = "rust"
+        if os.path.exists(os.path.join(path, "pom.xml")) or os.path.exists(os.path.join(path, "build.gradle")):
+            tech_stack.append("java")
+            project_type = "java"
+
+        # Deduplicate
+        tech_stack = list(dict.fromkeys(tech_stack))[:20]
+        return tech_stack, project_type
+
+    def _extract_python_deps(self, pyproject_content: str) -> list[str]:
+        """Extract dependency names from pyproject.toml content."""
+        deps = []
+        in_deps = False
+        for line in pyproject_content.split("\n"):
+            line = line.strip()
+            if line.startswith("dependencies") and "=" in line:
+                in_deps = True
+                continue
+            if in_deps:
+                if line.startswith("]"):
+                    break
+                # Extract package name from "package>=version" or "package"
+                match = re.match(r'"([a-zA-Z0-9_-]+)', line)
+                if match:
+                    deps.append(match.group(1).lower())
+        return deps[:15]
+
+    def _extract_project_name(self, path: str, project_type: str) -> str:
+        """
+        Extract project name from config files or directory name.
+
+        Args:
+            path: Project root path.
+            project_type: Detected project type.
+
+        Returns:
+            Project name.
+        """
+        # Try pyproject.toml
+        pyproject = os.path.join(path, "pyproject.toml")
+        if os.path.exists(pyproject):
+            try:
+                with open(pyproject, "r", encoding="utf-8") as f:
+                    for line in f:
+                        match = re.match(r'^name\s*=\s*"([^"]+)"', line.strip())
+                        if match:
+                            return match.group(1)
+            except Exception:
+                pass
+
+        # Try package.json
+        package_json = os.path.join(path, "package.json")
+        if os.path.exists(package_json):
+            try:
+                with open(package_json, "r", encoding="utf-8") as f:
+                    pkg = json.load(f)
+                    if "name" in pkg:
+                        return pkg["name"]
+            except Exception:
+                pass
+
+        # Fall back to directory name
+        return os.path.basename(path)
+
+    def build_project_knowledge(self, project_path: str, force: bool = False) -> dict[str, Any]:
+        """
+        Build knowledge base for a project: domains, keywords, description.
+
+        Args:
+            project_path: Path to the project root.
+            force: If True, re-analyze even if git commit hasn't changed.
+
+        Returns:
+            Statistics about the knowledge built.
+        """
+        logger.info(f"[Librarian] Building knowledge for: {project_path}")
+        print(f"[Librarian] Analyzing project: {project_path}")
+
+        stats: dict[str, Any] = {
+            "path": project_path,
+            "domains": 0,
+            "keywords": 0,
+            "files_analyzed": 0,
+            "cached": False,
+        }
+
+        # Check cache
+        git_info = self._get_git_info(project_path)
+        current_hash = git_info.get("git_commit_hash", "")
+
+        if not force and current_hash:
+            if not self.state.project_needs_reanalysis(project_path, current_hash):
+                print(f"[Librarian] Skipping (unchanged): {project_path}")
+                stats["cached"] = True
+                return stats
+
+        # Get or create project record
+        project = self.state.get_project_by_path(project_path)
+        if not project:
+            # Discover it first
+            proj_info = self._analyze_project_root(project_path)
+            if not proj_info:
+                return stats
+            project_id = self.state.add_project(
+                path=project_path,
+                name=proj_info["name"],
+                project_type=proj_info["project_type"],
+                tech_stack=proj_info.get("tech_stack"),
+                git_remote=proj_info.get("git_remote"),
+                git_branch=proj_info.get("git_branch"),
+                git_commit_hash=proj_info.get("git_commit_hash"),
+            )
+        else:
+            project_id = project["id"]
+
+        # Clear old data
+        self.state.clear_project_domains(project_id)
+        self.state.clear_project_keywords(project_id)
+
+        # Scan project files
+        code_extensions = ["py", "js", "ts", "go", "rs", "java"]
+        all_files: list[str] = []
+        for ext in code_extensions:
+            files = self.find_files_by_extension(project_path, [ext], max_depth=6)
+            all_files.extend(files)
+
+        stats["files_analyzed"] = len(all_files)
+
+        # Analyze code files and collect routes
+        all_routes: list[dict[str, Any]] = []
+        file_routes_map: dict[str, list[dict[str, Any]]] = {}
+
+        for file_path in all_files:
+            ext = os.path.splitext(file_path)[1].lstrip(".")
+            try:
+                routes = self._analyze_code_file(file_path, ext)
+                all_routes.extend(routes)
+                file_routes_map[file_path] = routes
+            except Exception:
+                continue
+
+        # Domain clustering
+        domains = self._cluster_domains(project_path, all_files, file_routes_map)
+        for domain in domains:
+            domain_id = self.state.add_project_domain(
+                project_id=project_id,
+                domain_name=domain["name"],
+                description=domain.get("description"),
+                file_paths=domain["files"],
+                entry_points=domain.get("entry_points"),
+                keywords=domain.get("keywords"),
+                file_count=len(domain["files"]),
+            )
+            domain["id"] = domain_id
+
+        stats["domains"] = len(domains)
+
+        # Keyword indexing with TF-IDF
+        keywords_data = self._build_keyword_index(
+            project_id, project_path, all_files, all_routes, file_routes_map, domains
+        )
+        if keywords_data:
+            self.state.add_project_keywords_batch(keywords_data)
+        stats["keywords"] = len(keywords_data)
+
+        # Generate AI description
+        description = self._generate_project_description(
+            project_path, stats, domains, all_routes[:50]
+        )
+
+        # Update project record
+        self.state.update_project(
+            project_id,
+            description=description,
+            file_count=len(all_files),
+            code_route_count=len(all_routes),
+            git_commit_hash=current_hash,
+            last_analyzed_at=datetime.now().isoformat(),
+        )
+
+        print(f"[Librarian] Analyzed: {len(all_files)} files, {len(domains)} domains, {len(keywords_data)} keywords")
+        return stats
+
+    def _cluster_domains(
+        self,
+        project_path: str,
+        all_files: list[str],
+        file_routes_map: dict[str, list[dict[str, Any]]],
+    ) -> list[dict[str, Any]]:
+        """
+        Cluster files into functional domains by top-level subdirectory.
+
+        Args:
+            project_path: Project root path.
+            all_files: All code file paths.
+            file_routes_map: Map of file path to extracted routes.
+
+        Returns:
+            List of domain dictionaries.
+        """
+        # Group files by top-level subdirectory relative to project root
+        dir_groups: dict[str, list[str]] = {}
+        for f in all_files:
+            try:
+                rel = os.path.relpath(f, project_path)
+            except ValueError:
+                continue
+            parts = rel.split(os.sep)
+            if len(parts) > 1:
+                group_key = parts[0]
+            else:
+                group_key = "(root)"
+            if group_key not in dir_groups:
+                dir_groups[group_key] = []
+            dir_groups[group_key].append(f)
+
+        domains = []
+        small_groups: list[tuple[str, list[str]]] = []
+
+        for dir_name, files in dir_groups.items():
+            if len(files) < 3:
+                small_groups.append((dir_name, files))
+                continue
+
+            # Infer domain purpose from function/class names
+            route_names = []
+            for f in files:
+                for route in file_routes_map.get(f, []):
+                    route_names.append(route["name"].lower())
+
+            domain_name = self._infer_domain_name(dir_name, route_names)
+            keywords = self._extract_domain_keywords(route_names)
+
+            # Find entry points (files with most routes)
+            file_route_counts = [
+                (f, len(file_routes_map.get(f, [])))
+                for f in files
+            ]
+            file_route_counts.sort(key=lambda x: x[1], reverse=True)
+            entry_points = [f for f, _ in file_route_counts[:3]]
+
+            domains.append({
+                "name": domain_name,
+                "files": files,
+                "entry_points": entry_points,
+                "keywords": keywords,
+                "description": f"{domain_name} ({len(files)} files)",
+            })
+
+        # Merge small groups
+        if small_groups:
+            merged_files = []
+            merged_names = []
+            for name, files in small_groups:
+                merged_files.extend(files)
+                merged_names.append(name)
+
+            if merged_files:
+                route_names = []
+                for f in merged_files:
+                    for route in file_routes_map.get(f, []):
+                        route_names.append(route["name"].lower())
+
+                domains.append({
+                    "name": "Utilities & Config",
+                    "files": merged_files,
+                    "entry_points": merged_files[:3],
+                    "keywords": self._extract_domain_keywords(route_names),
+                    "description": f"Utilities & Config ({len(merged_files)} files from {', '.join(merged_names[:5])})",
+                })
+
+        return domains
+
+    def _infer_domain_name(self, dir_name: str, route_names: list[str]) -> str:
+        """Infer a human-readable domain name from directory and route names."""
+        # Check for common patterns
+        dir_lower = dir_name.lower()
+        patterns = {
+            "api": "API Layer",
+            "routes": "API Routes",
+            "handlers": "Request Handlers",
+            "models": "Data Models",
+            "schemas": "Data Schemas",
+            "services": "Business Logic",
+            "controllers": "Controllers",
+            "middleware": "Middleware",
+            "utils": "Utilities",
+            "helpers": "Helpers",
+            "tests": "Tests",
+            "test": "Tests",
+            "config": "Configuration",
+            "db": "Database",
+            "database": "Database",
+            "auth": "Authentication",
+            "components": "UI Components",
+            "pages": "Pages",
+            "views": "Views",
+            "templates": "Templates",
+            "static": "Static Assets",
+            "scripts": "Scripts",
+            "lib": "Library",
+            "core": "Core",
+            "cmd": "CLI Commands",
+            "internal": "Internal",
+            "pkg": "Packages",
+            "src": "Source",
+        }
+
+        for pattern, name in patterns.items():
+            if pattern in dir_lower:
+                return name
+
+        # Check route names for clues
+        name_counter = Counter()
+        for name in route_names:
+            parts = re.findall(r'[A-Z][a-z]*|[a-z]+', name)
+            for p in parts:
+                if len(p) > 2 and p.lower() not in self.KEYWORD_STOPWORDS:
+                    name_counter[p.lower()] += 1
+
+        if name_counter:
+            top_word = name_counter.most_common(1)[0][0]
+            return f"{top_word.title()} Module"
+
+        return dir_name.replace("_", " ").replace("-", " ").title()
+
+    def _extract_domain_keywords(self, route_names: list[str]) -> list[str]:
+        """Extract keywords from a list of route/function names."""
+        word_counter: Counter = Counter()
+        for name in route_names:
+            parts = re.findall(r'[A-Z][a-z]*|[a-z]+', name)
+            for p in parts:
+                p_lower = p.lower()
+                if len(p_lower) > 2 and p_lower not in self.KEYWORD_STOPWORDS:
+                    word_counter[p_lower] += 1
+
+        return [word for word, _ in word_counter.most_common(20)]
+
+    def _build_keyword_index(
+        self,
+        project_id: str,
+        project_path: str,
+        all_files: list[str],
+        all_routes: list[dict[str, Any]],
+        file_routes_map: dict[str, list[dict[str, Any]]],
+        domains: list[dict[str, Any]],
+    ) -> list[tuple[str, str, float, Optional[str], Optional[str], Optional[str]]]:
+        """
+        Build a TF-IDF weighted keyword index for a project.
+
+        Args:
+            project_id: Project ID.
+            project_path: Project root path.
+            all_files: All code files.
+            all_routes: All extracted routes.
+            file_routes_map: Map of file to routes.
+            domains: Clustered domains.
+
+        Returns:
+            List of (project_id, keyword, weight, source_type, source_path, domain_id) tuples.
+        """
+        # Build domain lookup
+        domain_lookup: dict[str, Optional[str]] = {}
+        for domain in domains:
+            domain_id = domain.get("id")
+            for f in domain.get("files", []):
+                domain_lookup[f] = domain_id
+
+        # Collect keyword occurrences: keyword -> list of (source_type, source_path)
+        keyword_sources: dict[str, list[tuple[str, str]]] = {}
+        # Track document frequency: keyword -> set of files
+        keyword_df: dict[str, set[str]] = {}
+
+        total_files = max(len(all_files), 1)
+
+        for file_path, routes in file_routes_map.items():
+            file_keywords: set[str] = set()
+
+            # Keywords from file name
+            basename = os.path.splitext(os.path.basename(file_path))[0]
+            name_parts = re.findall(r'[A-Z][a-z]*|[a-z]+', basename)
+            for p in name_parts:
+                kw = p.lower()
+                if len(kw) > 1 and kw not in self.KEYWORD_STOPWORDS:
+                    file_keywords.add(kw)
+                    if kw not in keyword_sources:
+                        keyword_sources[kw] = []
+                    keyword_sources[kw].append(("filename", file_path))
+
+            for route in routes:
+                # Keywords from function/class name
+                name_parts = re.findall(r'[A-Z][a-z]*|[a-z]+', route["name"])
+                source_type = route["type"]  # function, class, etc.
+                for p in name_parts:
+                    kw = p.lower()
+                    if len(kw) > 1 and kw not in self.KEYWORD_STOPWORDS:
+                        file_keywords.add(kw)
+                        if kw not in keyword_sources:
+                            keyword_sources[kw] = []
+                        keyword_sources[kw].append((source_type, file_path))
+
+                # Keywords from docstring
+                if route.get("docstring"):
+                    doc_words = re.findall(r'[a-zA-Z]{3,}', route["docstring"][:200])
+                    for w in doc_words:
+                        kw = w.lower()
+                        if kw not in self.KEYWORD_STOPWORDS:
+                            file_keywords.add(kw)
+                            if kw not in keyword_sources:
+                                keyword_sources[kw] = []
+                            keyword_sources[kw].append(("docstring", file_path))
+
+                # Keywords from existing route keywords
+                for kw in route.get("keywords", []):
+                    kw_lower = kw.lower()
+                    if len(kw_lower) > 1 and kw_lower not in self.KEYWORD_STOPWORDS:
+                        file_keywords.add(kw_lower)
+                        if kw_lower not in keyword_sources:
+                            keyword_sources[kw_lower] = []
+                        keyword_sources[kw_lower].append((source_type, file_path))
+
+            # Update document frequency
+            for kw in file_keywords:
+                if kw not in keyword_df:
+                    keyword_df[kw] = set()
+                keyword_df[kw].add(file_path)
+
+        # Compute TF-IDF weights and build output tuples
+        results = []
+        for keyword, sources in keyword_sources.items():
+            tf = len(sources)  # Term frequency (number of occurrences)
+            df = len(keyword_df.get(keyword, set()))  # Document frequency
+            idf = math.log(total_files / max(df, 1)) + 1.0
+            weight = tf * idf
+
+            # Use the first source as representative
+            source_type = sources[0][0]
+            source_path = sources[0][1]
+            domain_id = domain_lookup.get(source_path)
+
+            results.append((project_id, keyword, weight, source_type, source_path, domain_id))
+
+        # Sort by weight descending and cap at 10,000
+        results.sort(key=lambda x: x[2], reverse=True)
+        return results[:10000]
+
+    def _generate_project_description(
+        self,
+        project_path: str,
+        stats: dict[str, Any],
+        domains: list[dict[str, Any]],
+        sample_routes: list[dict[str, Any]],
+    ) -> str:
+        """
+        Generate an AI description for a project.
+
+        Args:
+            project_path: Project root path.
+            stats: Analysis statistics.
+            domains: Discovered domains.
+            sample_routes: Sample code routes for context.
+
+        Returns:
+            2-3 sentence project description.
+        """
+        domain_summary = ", ".join(d["name"] for d in domains[:5])
+        route_names = [r["name"] for r in sample_routes[:20]]
+
+        prompt = f"""Write exactly 2-3 sentences describing this software project. Start directly with the description, no preamble.
+
+Project: {os.path.basename(project_path)}
+Path: {project_path}
+Files: {stats.get('files_analyzed', 0)}
+Domains: {domain_summary}
+Key symbols: {', '.join(route_names[:15])}
+
+Focus on what the project does and its purpose."""
+
+        try:
+            return self.chat(prompt, include_history=False, max_tokens=200)
+        except Exception as e:
+            logger.warning(f"[Librarian] Could not generate description: {e}")
+            return f"Software project at {project_path} with {stats.get('files_analyzed', 0)} code files."

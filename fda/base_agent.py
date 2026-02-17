@@ -248,7 +248,7 @@ class BaseAgent(ABC):
         Returns:
             List of pending message dictionaries.
         """
-        return self.message_bus.get_pending(self.name)
+        return self.message_bus.get_pending(self.name.lower())
 
     def process_message(self, message: dict[str, Any]) -> Optional[str]:
         """

@@ -11,6 +11,8 @@ FDA does NOT boss the other agents - they are equals collaborating via message b
 import logging
 import time
 import json
+import re
+import os
 from pathlib import Path
 from typing import Any, Optional
 from datetime import datetime
@@ -310,6 +312,8 @@ class FDAAgent(BaseAgent):
             if response:
                 self._handle_peer_response(response)
                 return self.pending_requests[msg_id].get("response")
+            # Timed out waiting for response - return a dict that indicates timeout
+            return {"request_id": msg_id, "timed_out": True}
 
         return {"request_id": msg_id}
 
@@ -784,6 +788,21 @@ Keep it warm and conversational. Don't use excessive formatting. End by asking w
         ]
         context["decisions_today"] = [d.get("title") for d in today_decisions]
 
+        # Get today's conversations from ALL interfaces (Discord, Telegram, CLI)
+        try:
+            all_messages = self.state.get_messages_today(limit=200)
+            if all_messages:
+                convo_summary = []
+                for msg in all_messages:
+                    source = msg.get("source", "unknown")
+                    role = msg.get("username", "User") if msg["role"] == "user" else "FDA"
+                    # Truncate long messages for summary
+                    content = msg["content"][:200]
+                    convo_summary.append(f"[{source}] {role}: {content}")
+                context["conversations_today"] = convo_summary
+        except Exception as e:
+            logger.debug(f"Could not fetch conversation messages: {e}")
+
         return context
 
     def generate_daily_journal(self, context: dict[str, Any], current_time: datetime) -> str:
@@ -807,6 +826,7 @@ Keep it warm and conversational. Don't use excessive formatting. End by asking w
         journal_entries = context.get("journal_entries_today", [])
         alerts = context.get("alerts_today", [])
         decisions = context.get("decisions_today", [])
+        discord_convos = context.get("conversations_today", [])
 
         prompt = f"""Based on today's activities, write a personal daily journal entry for {user_name}.
 
@@ -834,6 +854,9 @@ Role: {user_role}
 ### Decisions Made
 {chr(10).join(f'- {d}' for d in decisions) if decisions else '- No major decisions recorded'}
 
+### Conversations Today (Discord, Telegram, CLI)
+{chr(10).join(f'- {c}' for c in discord_convos[:30]) if discord_convos else '- No conversations today'}
+
 ---
 
 Write a reflective journal entry that:
@@ -847,6 +870,63 @@ Write in first person, conversational tone as if {user_name} is writing their ow
 Keep it meaningful but concise (200-400 words).
 Format as markdown with appropriate headers.
 Don't be overly positive if nothing was accomplished - be honest and reflective."""
+
+        return self.chat(prompt, include_history=False)
+
+    def generate_daily_brief(self) -> str:
+        """
+        Generate a concise, spoken-friendly daily briefing.
+
+        Gathers today's context (tasks, calendar, alerts, journal) and
+        produces a natural-sounding brief suitable for text-to-speech.
+
+        Returns:
+            A spoken-friendly daily briefing string.
+        """
+        from datetime import timedelta
+
+        now = datetime.now()
+        start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_of_day = start_of_day + timedelta(days=1)
+
+        # Gather today's context
+        context = self.gather_daily_context(start_of_day, end_of_day)
+
+        user_name = context.get("user_name", "there")
+        user_role = context.get("user_role", "")
+        tasks_completed = context.get("tasks_completed_today", [])
+        tasks_in_progress = context.get("tasks_in_progress", [])
+        calendar_events = context.get("calendar_events", [])
+        journal_entries = context.get("journal_entries_today", [])
+        alerts = context.get("alerts_today", [])
+        decisions = context.get("decisions_today", [])
+        user_goals = context.get("user_goals", "")
+        discord_convos = context.get("conversations_today", [])
+
+        prompt = f"""Generate a spoken daily briefing for {user_name}.
+Today is {context.get('date')}, current time is {now.strftime('%I:%M %p')}.
+
+Here's today's context:
+
+Tasks completed today: {', '.join(tasks_completed) if tasks_completed else 'None yet'}
+Tasks in progress: {', '.join(tasks_in_progress) if tasks_in_progress else 'None tracked'}
+Calendar events: {', '.join(e.get('subject', 'Unknown') + ' at ' + str(e.get('start', ''))[:16] for e in calendar_events) if calendar_events else 'No events scheduled'}
+Alerts: {', '.join(alerts) if alerts else 'No alerts'}
+Recent notes: {', '.join(journal_entries[:5]) if journal_entries else 'No journal entries'}
+Decisions made today: {', '.join(decisions) if decisions else 'None'}
+Their goals: {user_goals if user_goals else 'Not specified'}
+Today's conversations: {chr(10).join(discord_convos[:20]) if discord_convos else 'No conversations yet'}
+
+Write a warm, natural spoken briefing as if you're a personal assistant greeting {user_name} for the day.
+Keep it conversational and concise (under 200 words) — this will be read aloud via text-to-speech.
+Start with a greeting, then cover:
+1. Quick overview of the day ahead (calendar)
+2. Current task status
+3. Any alerts or items needing attention
+4. A motivational or helpful closing thought
+
+Do NOT use markdown, bullet points, or special formatting — just natural spoken language.
+Do NOT use emojis."""
 
         return self.chat(prompt, include_history=False)
 
@@ -1002,7 +1082,7 @@ Be specific and actionable in your recommendations."""
 
         return any(phrase in question_lower for phrase in all_capability_phrases)
 
-    def ask(self, question: str, use_claude_code: bool = True) -> str:
+    def ask(self, question: str, use_claude_code: bool = True, conversation_history: list[dict[str, str]] = None) -> str:
         """
         Ask the FDA agent a question.
 
@@ -1016,27 +1096,32 @@ Be specific and actionable in your recommendations."""
         Args:
             question: The question to ask.
             use_claude_code: If True (default), try to use Claude Code via Max subscription.
+            conversation_history: Recent conversation exchanges for context continuity.
 
         Returns:
             The FDA agent's response.
         """
         question_lower = question.lower()
 
+        # Classify the user's intent using LLM
+        intent = self._classify_intent(question)
+        logger.info(f"[FDA] Intent classified as: {intent}")
+
         # Check if this should be delegated to a peer agent
         peer_result = None
 
-        # File search requests → Librarian
-        if any(phrase in question_lower for phrase in [
-            "find file", "search for", "where is", "list file", "python file",
-            "what files", "show file", "config file", "look for"
-        ]):
+        # If user mentions an explicit path, remember it as the active project path
+        explicit_path = self._extract_path_from_question(question)
+        if explicit_path:
+            self.state.set_context("active_project_path", explicit_path)
+            logger.info(f"[FDA] Saved active project path: {explicit_path}")
+
+        # File/knowledge requests → Librarian
+        if intent == "librarian":
             peer_result = self._delegate_to_librarian(question)
 
         # Simple status/info queries - answer directly without Claude Code
-        is_simple_query = any(phrase in question_lower for phrase in [
-            "what time", "hello", "hi ", "hey ", "thanks", "thank you",
-            "how are you", "good morning", "good evening", "good night",
-        ])
+        is_simple_query = intent == "greeting"
 
         # Check if the request requires capabilities FDA doesn't have
         requires_delegation = self._requires_external_capabilities(question)
@@ -1047,12 +1132,13 @@ Be specific and actionable in your recommendations."""
         if use_claude_code and not is_simple_query and not peer_result:
             claude_code_result = self._try_claude_code(question)
             if claude_code_result:
+                self._journal_interaction(question, claude_code_result, source="claude_code")
                 return claude_code_result
 
-            # If Claude Code failed but this request REQUIRES external capabilities,
-            # explain the limitation instead of giving a response we can't fulfill
+            # If Claude Code failed, always fall through to direct API.
+            # FDA can still give a helpful answer even without web search/tools.
             if requires_delegation:
-                return self._explain_capability_limitation(question)
+                logger.info("[FDA] Claude Code unavailable for capability-heavy request, answering directly")
 
         # Fall back to direct API call if Claude Code not available
         # Build context with user info if available
@@ -1072,6 +1158,11 @@ Be specific and actionable in your recommendations."""
         project_context = self.get_project_context()
         context.update(project_context)
 
+        # Add project knowledge context
+        project_knowledge = self._get_relevant_project_knowledge(question)
+        if project_knowledge:
+            context["project_knowledge"] = project_knowledge
+
         # Add peer agent results if we delegated
         if peer_result:
             context["peer_agent_result"] = peer_result
@@ -1089,6 +1180,15 @@ Be specific and actionable in your recommendations."""
                 for e in relevant_entries
             ]
 
+        # Add conversation history for context continuity
+        if conversation_history:
+            # Format as readable conversation log
+            convo_lines = []
+            for msg in conversation_history:
+                role = "User" if msg.get("role") == "user" else "FDA"
+                convo_lines.append(f"{role}: {msg.get('content', '')[:300]}")
+            context["recent_conversation_for_context"] = "\n".join(convo_lines)
+
         # If we got a peer result, include it in the prompt
         if peer_result:
             enhanced_question = f"""{question}
@@ -1102,7 +1202,94 @@ Please summarize and present this information naturally to the user."""
 
         response = self.chat_with_context(enhanced_question, context)
 
+        if not is_simple_query:
+            source = "librarian+fda" if peer_result else "fda"
+            self._journal_interaction(question, response, source=source)
+
         return response
+
+    def _classify_intent(self, question: str) -> str:
+        """
+        Classify the user's question intent using the LLM.
+
+        Returns one of:
+        - 'greeting': simple greetings, thanks, small talk
+        - 'librarian': finding files, searching documents, looking up info on disk
+        - 'executor': running commands, executing code, making changes
+        - 'general': everything else (project questions, status, advice, etc.)
+        """
+        try:
+            prompt = (
+                "Classify this user message into exactly one category. "
+                "Reply with ONLY the category name, nothing else.\n\n"
+                "Categories:\n"
+                "- greeting: greetings, thanks, small talk (hi, hello, thanks, how are you)\n"
+                "- librarian: finding/locating/searching for files, images, documents, "
+                "or information stored on disk\n"
+                "- executor: running commands, executing scripts, making file changes, "
+                "deploying, building\n"
+                "- general: project questions, status, advice, planning, or anything else\n\n"
+                f"Message: {question[:300]}\n\n"
+                "Category:"
+            )
+            result = self.chat(prompt, include_history=False, max_tokens=20, temperature=0.0)
+            intent = result.strip().lower().rstrip(".")
+
+            if intent in ("greeting", "librarian", "executor", "general"):
+                return intent
+
+            # Fuzzy match in case the model adds extra words
+            for category in ("greeting", "librarian", "executor", "general"):
+                if category in intent:
+                    return category
+
+            return "general"
+        except Exception as e:
+            logger.debug(f"[FDA] Intent classification failed: {e}")
+            return "general"
+
+    def _journal_interaction(
+        self,
+        question: str,
+        response: str,
+        source: str = "fda",
+    ) -> None:
+        """
+        Summarize and journal a Q&A interaction.
+
+        Uses Claude to generate a concise summary, then saves it to the
+        journal so FDA retains memory of conversations.
+
+        Args:
+            question: The user's question.
+            response: The response that was given.
+            source: Where the response came from (fda, claude_code, librarian+fda).
+        """
+        try:
+            summary_prompt = (
+                f"Summarize this interaction in one sentence (max 20 words) "
+                f"for a journal log. Focus on what was asked and the key outcome.\n\n"
+                f"Question: {question[:500]}\n"
+                f"Response: {response[:1000]}"
+            )
+            summary = self.chat(summary_prompt, include_history=False, max_tokens=100)
+            summary = summary.strip().rstrip(".")
+
+            content = (
+                f"## Q&A Interaction\n\n"
+                f"**Source:** {source}\n\n"
+                f"**Question:** {question}\n\n"
+                f"**Response:**\n{response}\n"
+            )
+
+            self.log_to_journal(
+                summary=summary,
+                content=content,
+                tags=["interaction", source.replace("+", "-")],
+                relevance_decay="medium",
+            )
+        except Exception as e:
+            logger.debug(f"[FDA] Failed to journal interaction: {e}")
 
     def _try_claude_code(self, question: str) -> Optional[str]:
         """
@@ -1162,19 +1349,263 @@ Answer helpfully and conversationally. Be concise but thorough."""
 
         return None
 
+    @staticmethod
+    def _extract_path_from_question(question: str) -> Optional[str]:
+        """
+        Extract an explicit filesystem path from the user's question.
+
+        Detects absolute paths (starting with / or ~) that the user explicitly
+        references so we can search there directly instead of relying on default
+        exploration roots.
+
+        Args:
+            question: The user's question text.
+
+        Returns:
+            An existing directory or file path if found, else None.
+        """
+        # Match absolute paths like /Users/foo/bar or ~/Documents/project
+        path_patterns = [
+            r'(/[A-Za-z][A-Za-z0-9_.\-/]*(?:/[A-Za-z0-9_.\-]+)+)',  # /absolute/path
+            r'(~/[A-Za-z0-9_.\-/]+)',  # ~/relative/path
+        ]
+        for pattern in path_patterns:
+            matches = re.findall(pattern, question)
+            for match in matches:
+                # Expand ~ to home directory
+                expanded = os.path.expanduser(match)
+                # Strip trailing punctuation that might have been captured
+                expanded = expanded.rstrip('.,;:!?)"\'')
+                if os.path.exists(expanded):
+                    logger.info(f"[FDA] Extracted explicit path from question: {expanded}")
+                    return expanded
+        return None
+
+    def _get_relevant_project_knowledge(self, question: str) -> Optional[dict[str, Any]]:
+        """
+        Search the project knowledge base for relevant project context.
+
+        Splits the question into keywords, searches the project_keywords table,
+        and returns a summary of the top-scoring project.
+
+        Args:
+            question: The user's question.
+
+        Returns:
+            Dictionary with project info, domains, and keywords, or None.
+        """
+        # Split question into keywords
+        words = re.findall(r'[a-zA-Z]{2,}', question)
+        if not words:
+            return None
+
+        # Filter out common stopwords
+        stopwords = {
+            "the", "is", "are", "was", "were", "do", "does", "did", "have", "has",
+            "had", "be", "been", "being", "will", "would", "could", "should", "may",
+            "can", "what", "where", "when", "how", "why", "who", "which", "that",
+            "this", "with", "for", "from", "about", "into", "through", "during",
+            "before", "after", "above", "below", "between", "and", "but", "or",
+            "not", "no", "yes", "all", "any", "each", "every", "some", "many",
+            "much", "more", "most", "few", "less", "other", "another", "such",
+            "only", "own", "same", "than", "too", "very", "just", "also",
+        }
+        keywords = [w.lower() for w in words if w.lower() not in stopwords]
+        if not keywords:
+            return None
+
+        try:
+            results = self.state.search_project_keywords(keywords, limit=3)
+            if not results:
+                return None
+
+            # Get summary for the top-scoring project
+            top = results[0]
+            summary = self.state.get_project_summary(top["project_id"])
+            if not summary:
+                return None
+
+            project = summary["project"]
+            domains = summary["domains"]
+            top_keywords = summary["top_keywords"]
+
+            return {
+                "project_name": project.get("name"),
+                "project_path": project.get("path"),
+                "project_type": project.get("project_type"),
+                "description": project.get("description"),
+                "tech_stack": project.get("tech_stack"),
+                "domains": [
+                    {"name": d["domain_name"], "description": d.get("description"), "file_count": d.get("file_count")}
+                    for d in domains[:5]
+                ],
+                "relevance_score": top.get("total_score"),
+                "matched_keywords": top.get("matched_keywords"),
+            }
+        except Exception as e:
+            logger.debug(f"[FDA] Project knowledge lookup failed: {e}")
+            return None
+
     def _delegate_to_librarian(self, question: str) -> Optional[dict[str, Any]]:
         """Delegate a search/knowledge request to Librarian."""
         logger.info(f"[FDA] Delegating to Librarian: {question}")
 
+        # Extract explicit path from the user's question (e.g. /Users/.../Smartstore)
+        explicit_path = self._extract_path_from_question(question)
+        if not explicit_path:
+            # Fall back to previously-stored active project path
+            stored_path = self.state.get_context("active_project_path")
+            if stored_path and os.path.exists(stored_path):
+                explicit_path = stored_path
+                logger.info(f"[FDA] Using stored active project path: {explicit_path}")
+        if explicit_path:
+            logger.info(f"[FDA] User specified explicit path: {explicit_path}")
+
         # Check if Librarian is running
         librarian_status = self.get_peer_status(Agents.LIBRARIAN)
-        if not librarian_status or librarian_status.get("status") != "running":
-            logger.warning("[FDA] Librarian is not running, cannot delegate")
+        if librarian_status and librarian_status.get("status") == "running":
+            # Send request and wait for response, passing explicit path if found
+            result = self.request_file_search(question, path=explicit_path, wait_for_response=True, timeout=15.0)
+
+            # Validate that Librarian actually returned a *useful* result.
+            # request_file_search returns {"request_id": ...} on timeout, or
+            # {"success": false, "error": ...} when Librarian fails, or
+            # {"success": true, "result": {...}} with empty files/matches.
+            if result and isinstance(result, dict):
+                if result.get("success") is True and result.get("result"):
+                    inner = result["result"]
+                    # Check if Librarian actually found files or content matches
+                    has_files = bool(inner.get("files"))
+                    has_matches = bool(inner.get("matches"))
+                    has_routes = bool(inner.get("routes"))
+                    if has_files or has_matches or has_routes:
+                        logger.info("[FDA] Librarian returned useful results")
+                        return result
+                    else:
+                        logger.info("[FDA] Librarian returned no file matches, falling back")
+                elif result.get("request_id"):
+                    logger.warning("[FDA] Librarian timed out, falling back to filesystem search")
+                else:
+                    error = result.get("error", "unknown error")
+                    logger.warning(f"[FDA] Librarian returned error: {error}, falling back")
+        else:
+            logger.info("[FDA] Librarian not running")
+
+        # Fallback: search the filesystem directly using find command
+        logger.info("[FDA] Searching filesystem directly as fallback")
+        return self._search_filesystem_directly(question, explicit_path=explicit_path)
+
+    def _search_filesystem_directly(self, question: str, explicit_path: Optional[str] = None) -> Optional[dict[str, Any]]:
+        """
+        Search the filesystem directly as a fallback when Librarian can't find files.
+
+        If an explicit_path is provided (extracted from the user's question),
+        search ONLY within that path. Otherwise, uses an LLM call to extract
+        search terms and searches the home directory.
+
+        Args:
+            question: The user's question about files.
+            explicit_path: An explicit path the user referenced in the question.
+
+        Returns:
+            Search results dict, or None if nothing found.
+        """
+        import subprocess
+
+        try:
+            # If the user gave us an explicit directory, list its contents directly
+            if explicit_path and os.path.isdir(explicit_path):
+                logger.info(f"[FDA] Exploring explicit directory: {explicit_path}")
+                found_files = []
+                try:
+                    result = subprocess.run(
+                        ["find", explicit_path, "-maxdepth", "3",
+                         "-not", "-path", "*/.*",
+                         "-not", "-path", "*/node_modules/*",
+                         "-not", "-path", "*/__pycache__/*",
+                         "-not", "-path", "*/.venv/*"],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    if result.stdout.strip():
+                        found_files = result.stdout.strip().split("\n")
+                except (subprocess.TimeoutExpired, Exception) as e:
+                    logger.warning(f"[FDA] find command failed on explicit path: {e}")
+
+                found_files = list(dict.fromkeys(found_files))
+                if found_files:
+                    return {
+                        "success": True,
+                        "explicit_path": explicit_path,
+                        "files_found": found_files[:30],
+                        "count": len(found_files),
+                        "summary": f"Found {len(found_files)} file(s) in '{explicit_path}'",
+                    }
+
+            # If explicit path is a file, read its info directly
+            if explicit_path and os.path.isfile(explicit_path):
+                logger.info(f"[FDA] Explicit path is a file: {explicit_path}")
+                return {
+                    "success": True,
+                    "explicit_path": explicit_path,
+                    "files_found": [explicit_path],
+                    "count": 1,
+                    "summary": f"Found file: {explicit_path}",
+                }
+
+            # No explicit path - extract search term via LLM
+            extract_prompt = (
+                "Extract the filename, file pattern, or search keyword from this question. "
+                "Reply with ONLY the search term (e.g., 'linkedin', '*.py', 'resume.pdf'). "
+                "No explanation.\n\n"
+                f"Question: {question[:300]}\n\n"
+                "Search term:"
+            )
+            search_term = self.chat(
+                extract_prompt, include_history=False, max_tokens=30, temperature=0.0
+            ).strip().strip("'\"")
+
+            if not search_term:
+                return None
+
+            logger.info(f"[FDA] Filesystem search for: {search_term}")
+
+            # Search from the user's home directory with reasonable depth
+            home = os.path.expanduser("~")
+            found_files = []
+            try:
+                result = subprocess.run(
+                    ["find", home, "-maxdepth", "5",
+                     "-iname", f"*{search_term}*",
+                     "-not", "-path", "*/.*",
+                     "-not", "-path", "*/node_modules/*",
+                     "-not", "-path", "*/__pycache__/*",
+                     "-not", "-path", "*/.venv/*"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if result.stdout.strip():
+                    found_files = result.stdout.strip().split("\n")
+            except (subprocess.TimeoutExpired, Exception) as e:
+                logger.warning(f"[FDA] find command failed: {e}")
+
+            # Deduplicate while preserving order
+            found_files = list(dict.fromkeys(found_files))
+
+            if found_files:
+                return {
+                    "success": True,
+                    "search_term": search_term,
+                    "files_found": found_files[:20],
+                    "count": len(found_files),
+                    "summary": f"Found {len(found_files)} file(s) matching '{search_term}'",
+                }
+
+            # No files found - return None so the caller can try other approaches
+            logger.info(f"[FDA] No files matching '{search_term}' found in filesystem")
             return None
 
-        # Send request and wait for response
-        result = self.request_file_search(question, wait_for_response=True, timeout=15.0)
-        return result
+        except Exception as e:
+            logger.warning(f"[FDA] Direct filesystem search failed: {e}")
+            return None
 
     def _delegate_to_executor(self, question: str) -> Optional[dict[str, Any]]:
         """Delegate an execution request to Executor."""

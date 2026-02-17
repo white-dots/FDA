@@ -1333,6 +1333,14 @@ def create_setup_app() -> Any:
     app = Flask(__name__)
     app.secret_key = os.urandom(24)
 
+    # Enable CORS for API routes (allows chat.html opened as file:// or from other origins)
+    @app.after_request
+    def add_cors_headers(response):
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        return response
+
     # Initialize state
     state = ProjectState()
 
@@ -1364,6 +1372,14 @@ def create_setup_app() -> Any:
     def index():
         """Serve the setup page."""
         return render_template_string(SETUP_PAGE_HTML)
+
+    @app.route("/chat")
+    def chat_page():
+        """Serve the standalone chat interface."""
+        chat_html_path = Path(__file__).parent.parent / "chat.html"
+        if chat_html_path.exists():
+            return chat_html_path.read_text(encoding="utf-8")
+        return "chat.html not found. Place it in the project root.", 404
 
     @app.route("/api/status")
     def get_status():

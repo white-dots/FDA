@@ -1,0 +1,50 @@
+# Example client config — copy to client_a.yaml and fill in real values
+
+client:
+  id: "client_a"
+  name: "Client A"
+  company: "Example Corp"
+  kakaotalk_room: "Example Corp Project"  # Exact KakaoTalk chat room name
+
+infrastructure:
+  vm:
+    host: "vm1.eastus.cloudapp.azure.com"
+    ssh_user: "deploy"
+    ssh_key: "~/.ssh/client_a_key"
+    port: 22
+  database:
+    type: "postgresql"
+    host: "localhost"  # accessed via SSH tunnel
+    port: 5432
+    name: "client_a_db"
+    user: "app_user"
+    password_env: "CLIENT_A_DB_PASSWORD"  # env var name, never put actual password here
+
+project:
+  repo_path: "/home/deploy/app"           # path on the VM
+  local_mirror: "~/repos/client_a"         # local mirror on Mac Mini
+  tech_stack: "Python/FastAPI/PostgreSQL"
+  deploy_command: "sudo systemctl restart client-a-app"
+  pre_deploy_command: "cd /home/deploy/app && pip install -r requirements.txt"
+  health_check_command: "curl -sf http://localhost:8000/health"
+  backup_dir: "/home/deploy/backups"
+
+business_context: |
+  Client A runs an inventory management system for their warehouse operations.
+  The system tracks product quantities, locations, and movements.
+  Key features: real-time inventory tracking, barcode scanning, reporting dashboard.
+  They are sensitive about data accuracy — double-check any changes to calculation logic.
+
+key_contacts:
+  "김대리": "warehouse manager, primary point of contact"
+  "박과장": "IT lead, handles deployment approvals"
+
+common_requests:
+  - "Field visibility changes on inventory pages"
+  - "Report format tweaks and new filter options"
+  - "Bug fixes in quantity calculations"
+  - "Adding new product categories"
+
+notes: |
+  Prefers changes deployed during lunch break (12:00-13:00 KST).
+  Always test with their staging data before deploying.
