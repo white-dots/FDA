@@ -1,33 +1,38 @@
 """
-FDA Orchestrator — the main entry point for Datacore's client automation.
+FDA Orchestrator — unified single-process entry point.
 
-Ties together all components:
+Runs all components in one process on the Mac Mini:
 - KakaoTalk reader: monitors client chat rooms for new messages
-- FDA agent: classifies messages and creates task briefs with business context
+- FDA agent: classifies messages, creates task briefs, monitors calendar
 - Worker agent: analyzes codebases and generates fixes
-- Telegram bot: sends approval requests and handles responses
-- Deployer: pushes approved changes to Azure VMs
+- Telegram bot: user Q&A + approval requests for code changes
+- Discord bot: joins meetings, takes notes, answers questions via voice
+- Outlook calendar: monitors schedule, prepares meeting briefs
 
-This is the process that runs continuously on the Mac Mini.
+This is the process that `fda start` launches.
 """
 
 import asyncio
 import json
 import logging
+import os
+import signal
 import threading
 import time
 from typing import Any, Optional
 from datetime import datetime
 from pathlib import Path
 
-import anthropic
-
+from fda.claude_backend import get_claude_backend
 from fda.config import (
     MODEL_FDA,
     MODEL_MEETING_SUMMARY,
     STATE_DB_PATH,
     MESSAGE_BUS_PATH,
     PROJECT_ROOT,
+    DEFAULT_CALENDAR_CHECK_INTERVAL_MINUTES,
+    TELEGRAM_BOT_TOKEN_ENV,
+    DISCORD_BOT_TOKEN_ENV,
 )
 from fda.state.project_state import ProjectState
 from fda.comms.message_bus import MessageBus
@@ -35,7 +40,13 @@ from fda.clients.client_config import ClientManager, ClientConfig
 from fda.kakaotalk.reader import KakaoTalkReader
 from fda.kakaotalk.parser import KakaoMessage
 from fda.worker_agent import WorkerAgent
-from fda.telegram_approval import ApprovalManager, PendingApproval
+from fda.telegram_approval import (
+    ApprovalManager,
+    PendingApproval,
+    register_approval_handlers,
+)
+from fda.fda_agent import FDAAgent
+from fda.outlook import OutlookCalendar
 
 logger = logging.getLogger(__name__)
 
@@ -59,10 +70,13 @@ Respond with ONLY the category name (TASK_REQUEST, QUESTION, INFORMATION, or GRE
 
 class FDAOrchestrator:
     """
-    Main orchestrator for Datacore's FDA system.
+    Unified orchestrator for the FDA system.
 
-    Runs on the Mac Mini, continuously monitoring KakaoTalk messages
-    and coordinating between agents to handle client requests.
+    Runs on the Mac Mini as a single process, managing all subsystems:
+    - KakaoTalk polling → message classification → Worker → Telegram approval
+    - Telegram bot (user Q&A + /approve /reject commands)
+    - Discord bot (voice meetings, note-taking)
+    - Outlook calendar monitoring (meeting prep with SharePoint file search)
     """
 
     def __init__(
@@ -71,6 +85,9 @@ class FDAOrchestrator:
         export_dir: Optional[Path] = None,
         auto_export: bool = False,
         poll_interval_seconds: int = 60,
+        enable_telegram: bool = True,
+        enable_discord: bool = True,
+        enable_calendar: bool = True,
     ):
         """
         Initialize the orchestrator.
@@ -80,11 +97,14 @@ class FDAOrchestrator:
             export_dir: Directory for KakaoTalk exports.
             auto_export: Whether to auto-trigger KakaoTalk exports.
             poll_interval_seconds: How often to check for new messages.
+            enable_telegram: Start Telegram bot.
+            enable_discord: Start Discord bot.
+            enable_calendar: Start Outlook calendar monitoring.
         """
         # Core components
         self.state = ProjectState(STATE_DB_PATH)
         self.message_bus = MessageBus(MESSAGE_BUS_PATH)
-        self.claude = anthropic.Anthropic()
+        self._backend = get_claude_backend()
 
         # Client management
         self.client_manager = ClientManager(clients_dir)
@@ -95,12 +115,15 @@ class FDAOrchestrator:
             auto_export=auto_export,
         )
 
-        # Worker agent
+        # Worker agent (merged Librarian + Executor)
         self.worker = WorkerAgent(
             client_manager=self.client_manager,
             message_bus=self.message_bus,
             db_path=str(STATE_DB_PATH),
         )
+
+        # FDA agent (for calendar monitoring and meeting prep)
+        self.fda_agent: Optional[FDAAgent] = None
 
         # Telegram approval system
         self.approval_manager = ApprovalManager()
@@ -109,13 +132,156 @@ class FDAOrchestrator:
             on_reject=self._handle_rejection,
         )
 
+        # Feature flags
+        self._enable_telegram = enable_telegram
+        self._enable_discord = enable_discord
+        self._enable_calendar = enable_calendar
+
         # Configuration
         self.poll_interval = poll_interval_seconds
         self._running = False
         self._paused = False
+        self._threads: list[threading.Thread] = []
 
         # Restore last-checked timestamps from state
         self._restore_checkpoints()
+
+    # ------------------------------------------------------------------
+    # Initialization helpers
+    # ------------------------------------------------------------------
+
+    def _init_calendar(self) -> Optional[OutlookCalendar]:
+        """Initialize Outlook calendar if user is logged in."""
+        try:
+            calendar = OutlookCalendar()
+            if calendar.is_logged_in():
+                if calendar.authenticate():
+                    logger.info("✓ Outlook calendar connected")
+                    return calendar
+                else:
+                    logger.warning("Outlook token expired — run: fda calendar login")
+            else:
+                logger.info("Outlook calendar not configured — run: fda calendar login")
+        except Exception as e:
+            logger.warning(f"Outlook calendar init failed: {e}")
+        return None
+
+    def _init_fda_agent(self, calendar: Optional[OutlookCalendar]) -> FDAAgent:
+        """Initialize the FDA agent with optional calendar."""
+        outlook_config = None
+        if calendar:
+            # Pass the already-authenticated calendar instance
+            agent = FDAAgent()
+            agent.calendar = calendar
+            return agent
+        return FDAAgent()
+
+    # ------------------------------------------------------------------
+    # Thread launchers
+    # ------------------------------------------------------------------
+
+    def _start_telegram_bot(self) -> Optional[threading.Thread]:
+        """Start the Telegram bot in a daemon thread."""
+        try:
+            from fda.telegram_bot import TelegramBotAgent, get_bot_token
+
+            bot_token = get_bot_token()
+            if not bot_token:
+                logger.info("Telegram bot not configured — skipping")
+                return None
+
+            bot = TelegramBotAgent(bot_token=bot_token)
+
+            # Register approval command handlers (/approve, /reject, etc.)
+            app = bot._get_application()
+            register_approval_handlers(app, self.approval_manager)
+
+            thread = threading.Thread(
+                target=bot.run_event_loop,
+                daemon=True,
+                name="telegram-bot",
+            )
+            thread.start()
+            logger.info("✓ Telegram bot started")
+            return thread
+
+        except ImportError:
+            logger.warning("python-telegram-bot not installed — skipping Telegram")
+        except Exception as e:
+            logger.error(f"Failed to start Telegram bot: {e}")
+        return None
+
+    def _start_discord_bot(self) -> Optional[threading.Thread]:
+        """Start the Discord bot in a daemon thread."""
+        try:
+            from fda.discord_bot import DiscordVoiceAgent, get_bot_token
+
+            bot_token = get_bot_token()
+            if not bot_token:
+                logger.info("Discord bot not configured — skipping")
+                return None
+
+            discord_bot = DiscordVoiceAgent(
+                bot_token=bot_token,
+                fda_agent=self.fda_agent,
+            )
+
+            thread = threading.Thread(
+                target=discord_bot.run_event_loop,
+                daemon=True,
+                name="discord-bot",
+            )
+            thread.start()
+            logger.info("✓ Discord bot started")
+            return thread
+
+        except ImportError:
+            logger.warning("py-cord not installed — skipping Discord")
+        except Exception as e:
+            logger.error(f"Failed to start Discord bot: {e}")
+        return None
+
+    def _start_calendar_monitor(self) -> Optional[threading.Thread]:
+        """Start Outlook calendar monitoring in a daemon thread."""
+        if not self.fda_agent or not self.fda_agent.calendar:
+            logger.info("No calendar connection — skipping calendar monitor")
+            return None
+
+        def _calendar_loop():
+            interval = DEFAULT_CALENDAR_CHECK_INTERVAL_MINUTES * 60
+            logger.info(
+                f"Calendar monitor running (every {DEFAULT_CALENDAR_CHECK_INTERVAL_MINUTES} min)"
+            )
+            while self._running:
+                try:
+                    self.fda_agent._check_upcoming_meetings()
+                except Exception as e:
+                    logger.error(f"Calendar check error: {e}")
+                time.sleep(interval)
+
+        thread = threading.Thread(
+            target=_calendar_loop,
+            daemon=True,
+            name="calendar-monitor",
+        )
+        thread.start()
+        logger.info("✓ Calendar monitor started")
+        return thread
+
+    def _start_worker(self) -> threading.Thread:
+        """Start the Worker agent in a daemon thread."""
+        thread = threading.Thread(
+            target=self.worker.run_event_loop,
+            daemon=True,
+            name="worker-agent",
+        )
+        thread.start()
+        logger.info("✓ Worker agent started")
+        return thread
+
+    # ------------------------------------------------------------------
+    # Checkpoint management
+    # ------------------------------------------------------------------
 
     def _restore_checkpoints(self) -> None:
         """Restore last-checked timestamps from persistent state."""
@@ -144,21 +310,19 @@ class FDAOrchestrator:
                 last_checked.isoformat(),
             )
 
+    # ------------------------------------------------------------------
+    # KakaoTalk message processing
+    # ------------------------------------------------------------------
+
     def classify_message(self, message: KakaoMessage, client: ClientConfig) -> str:
         """
         Classify an incoming KakaoTalk message.
-
-        Args:
-            message: The parsed message.
-            client: Client context.
 
         Returns:
             Category: TASK_REQUEST, QUESTION, INFORMATION, or GREETING.
         """
         try:
-            response = self.claude.messages.create(
-                model=MODEL_FDA,
-                max_tokens=50,
+            raw = self._backend.complete(
                 system=MESSAGE_CLASSIFIER_PROMPT,
                 messages=[{
                     "role": "user",
@@ -168,13 +332,14 @@ class FDAOrchestrator:
                         f"Message: {message.text}"
                     ),
                 }],
+                model=MODEL_FDA,
+                max_tokens=50,
             )
-            category = response.content[0].text.strip().upper()
+            category = raw.strip().upper()
 
             if category in ("TASK_REQUEST", "QUESTION", "INFORMATION", "GREETING"):
                 return category
 
-            # Default to INFORMATION if classification is unclear
             return "INFORMATION"
 
         except Exception as e:
@@ -190,14 +355,6 @@ class FDAOrchestrator:
         Create a task brief from client messages with full business context.
 
         This is what gets sent to the Worker agent.
-
-        Args:
-            messages: Recent messages from the client (may be multiple
-                      related messages).
-            client: Client configuration with business context.
-
-        Returns:
-            Detailed task brief string.
         """
         messages_text = "\n".join(
             f"[{msg.sender} {msg.timestamp.strftime('%H:%M')}] {msg.text}"
@@ -221,23 +378,18 @@ Be specific and actionable. The developer needs to know exactly what to change.
 """
 
         try:
-            response = self.claude.messages.create(
-                model=MODEL_MEETING_SUMMARY,  # Use Sonnet for quality
-                max_tokens=1000,
+            return self._backend.complete(
+                system="",
                 messages=[{"role": "user", "content": prompt}],
-            )
-            return response.content[0].text.strip()
+                model=MODEL_MEETING_SUMMARY,
+                max_tokens=1000,
+            ).strip()
         except Exception as e:
             logger.error(f"Error creating task brief: {e}")
-            # Fallback: just forward the messages
             return f"Client {client.name} request:\n{messages_text}"
 
     def process_new_messages(self) -> None:
-        """
-        Check all client chat rooms for new messages and process them.
-
-        This is the main polling loop body.
-        """
+        """Check all client chat rooms for new messages and process them."""
         if self._paused:
             return
 
@@ -273,7 +425,6 @@ Be specific and actionable. The developer needs to know exactly what to change.
                 if category == "TASK_REQUEST":
                     task_messages.append(msg)
                 elif category == "QUESTION":
-                    # TODO: Auto-answer questions using client context
                     logger.info(f"Question from {client.name} — queued for review")
 
             # Process task requests
@@ -296,10 +447,8 @@ Be specific and actionable. The developer needs to know exactly what to change.
         3. Worker analyzes and generates fix
         4. Queue approval for user via Telegram
         """
-        # Create task brief
         task_brief = self.create_task_brief(messages, client)
 
-        # Log the task
         task_id = self.state.add_task(
             title=f"[{client.name}] {messages[0].text[:100]}",
             description=task_brief,
@@ -308,7 +457,6 @@ Be specific and actionable. The developer needs to know exactly what to change.
         )
         logger.info(f"Task created: {task_id} for {client.name}")
 
-        # Send to Worker for analysis
         logger.info(f"Sending task to Worker for {client.name}...")
         fix_result = self.worker.analyze_and_fix(
             client_id=client.client_id,
@@ -316,7 +464,6 @@ Be specific and actionable. The developer needs to know exactly what to change.
         )
 
         if fix_result.get("success"):
-            # Queue for user approval via Telegram
             approval = self.approval_manager.add_approval(
                 client_id=client.client_id,
                 client_name=client.name,
@@ -328,16 +475,12 @@ Be specific and actionable. The developer needs to know exactly what to change.
                 warnings=fix_result.get("warnings", []),
             )
 
-            # Send to Telegram
             self._send_approval_to_telegram(approval)
-
-            # Update task status
             self.state.update_task(task_id, status="awaiting_approval")
         else:
             error = fix_result.get("error", "Unknown error")
             logger.error(f"Worker failed for {client.name}: {error}")
 
-            # Notify user about the failure
             self._send_telegram_notification(
                 f"⚠️ Failed to generate fix for {client.name}\n\n"
                 f"Request: {messages[0].text[:200]}\n"
@@ -347,24 +490,22 @@ Be specific and actionable. The developer needs to know exactly what to change.
 
             self.state.update_task(task_id, status="blocked")
 
+    # ------------------------------------------------------------------
+    # Telegram notification helpers
+    # ------------------------------------------------------------------
+
     def _send_approval_to_telegram(self, approval: PendingApproval) -> None:
         """Send an approval request to the user via Telegram."""
         message = approval.format_telegram_message()
         self._send_telegram_notification(message)
 
     def _send_telegram_notification(self, text: str) -> None:
-        """
-        Send a notification to the user via Telegram.
-
-        Uses the stored bot token and chat ID.
-        """
+        """Send a notification to the user via Telegram."""
         try:
             import telegram
 
             bot_token = self.state.get_context("telegram_bot_token")
             if not bot_token:
-                import os
-                from fda.config import TELEGRAM_BOT_TOKEN_ENV
                 bot_token = os.environ.get(TELEGRAM_BOT_TOKEN_ENV)
 
             if not bot_token:
@@ -388,7 +529,6 @@ Be specific and actionable. The developer needs to know exactly what to change.
                         )
                     )
                 except RuntimeError:
-                    # No event loop running, create one
                     loop = asyncio.new_event_loop()
                     loop.run_until_complete(
                         bot.send_message(
@@ -403,6 +543,10 @@ Be specific and actionable. The developer needs to know exactly what to change.
             logger.error("python-telegram-bot not installed")
         except Exception as e:
             logger.error(f"Failed to send Telegram notification: {e}")
+
+    # ------------------------------------------------------------------
+    # Approval callbacks
+    # ------------------------------------------------------------------
 
     async def _handle_approval(self, approval: PendingApproval) -> None:
         """Called when user approves a code change."""
@@ -419,11 +563,10 @@ Be specific and actionable. The developer needs to know exactly what to change.
                 f"{result.summary()}"
             )
 
-            # Log decision
             self.state.add_decision(
                 title=f"Deployed fix for {approval.client_name}",
                 rationale=approval.explanation,
-                decision_maker="john (approved via telegram)",
+                decision_maker="user (approved via telegram)",
                 impact=f"Files changed: {', '.join(approval.file_changes.keys())}",
             )
         else:
@@ -439,24 +582,32 @@ Be specific and actionable. The developer needs to know exactly what to change.
             f"Change rejected for {approval.client_name}: {reason}"
         )
 
-        # Log the rejection
         self.state.add_decision(
             title=f"Rejected fix for {approval.client_name}",
             rationale=f"Rejection reason: {reason}",
-            decision_maker="john (rejected via telegram)",
+            decision_maker="user (rejected via telegram)",
             impact="No changes deployed",
         )
 
+    # ------------------------------------------------------------------
+    # Main entry point
+    # ------------------------------------------------------------------
+
     def run(self) -> None:
         """
-        Run the orchestrator — main entry point.
+        Run the orchestrator — unified single-process entry point.
 
-        Starts the KakaoTalk polling loop and Telegram bot in parallel.
+        Starts all subsystems in parallel threads:
+        1. Worker agent
+        2. Telegram bot (with approval handlers)
+        3. Discord bot (voice meetings)
+        4. Outlook calendar monitor
+        5. KakaoTalk polling loop (main thread)
         """
         logger.info("=" * 60)
-        logger.info("FDA Orchestrator starting...")
+        logger.info("FDA Orchestrator starting (unified mode)")
         logger.info(f"Clients loaded: {len(self.client_manager.list_clients())}")
-        logger.info(f"Poll interval: {self.poll_interval}s")
+        logger.info(f"KakaoTalk poll interval: {self.poll_interval}s")
         logger.info("=" * 60)
 
         # List loaded clients
@@ -474,15 +625,47 @@ Be specific and actionable. The developer needs to know exactly what to change.
 
         self._running = True
 
-        # Start Worker agent in a separate thread
-        worker_thread = threading.Thread(
-            target=self.worker.run_event_loop,
-            daemon=True,
-            name="worker-agent",
-        )
-        worker_thread.start()
+        # --- Initialize optional components ---
 
-        # Main polling loop
+        # Outlook calendar
+        calendar = None
+        if self._enable_calendar:
+            calendar = self._init_calendar()
+
+        # FDA agent (needs calendar for meeting prep)
+        self.fda_agent = self._init_fda_agent(calendar)
+
+        # --- Start subsystem threads ---
+
+        # 1. Worker agent
+        self._threads.append(self._start_worker())
+
+        # 2. Telegram bot (with /approve, /reject, /pending commands)
+        if self._enable_telegram:
+            t = self._start_telegram_bot()
+            if t:
+                self._threads.append(t)
+
+        # 3. Discord bot (voice meetings)
+        if self._enable_discord:
+            t = self._start_discord_bot()
+            if t:
+                self._threads.append(t)
+
+        # 4. Calendar monitor
+        if self._enable_calendar:
+            t = self._start_calendar_monitor()
+            if t:
+                self._threads.append(t)
+
+        # --- Summary ---
+        logger.info("-" * 40)
+        logger.info(f"Running threads: {len(self._threads)}")
+        for t in self._threads:
+            logger.info(f"  • {t.name}")
+        logger.info("-" * 40)
+
+        # 5. KakaoTalk polling (main thread)
         logger.info(f"Starting KakaoTalk polling (every {self.poll_interval}s)...")
         try:
             while self._running:
@@ -504,11 +687,11 @@ Be specific and actionable. The developer needs to know exactly what to change.
         self._running = False
 
     def pause(self) -> None:
-        """Pause message processing."""
+        """Pause KakaoTalk message processing."""
         self._paused = True
         logger.info("Orchestrator paused")
 
     def resume(self) -> None:
-        """Resume message processing."""
+        """Resume KakaoTalk message processing."""
         self._paused = False
         logger.info("Orchestrator resumed")

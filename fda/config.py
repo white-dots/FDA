@@ -31,9 +31,11 @@ def _get_default_project_root() -> Path:
         return Path.home() / ".fda"
 
 
-# Model names for Claude API
-# Using Haiku for all agents - complex tasks are delegated to Claude Code (Max subscription)
-MODEL_FDA: Final[str] = "claude-3-5-haiku-20241022"  # Fast and cheap for routing/classification
+# Model names — used by the API backend; ignored when running via Claude Code CLI
+# (Max subscription). The CLI always uses your subscription's model.
+# Set FDA_CLAUDE_BACKEND=cli (or just install `claude`) to use Max subscription.
+# Set FDA_CLAUDE_BACKEND=api  to use the Anthropic API (pay-per-token).
+MODEL_FDA: Final[str] = "claude-3-5-haiku-20241022"  # Fast for routing/classification
 MODEL_EXECUTOR: Final[str] = "claude-3-5-haiku-20241022"  # Fast for command execution
 MODEL_LIBRARIAN: Final[str] = "claude-3-5-haiku-20241022"  # Fast for file indexing/search
 MODEL_WORKER: Final[str] = "claude-3-5-haiku-20241022"  # Fast for file identification

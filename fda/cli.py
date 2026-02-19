@@ -20,12 +20,9 @@ from fda.config import (
     DEFAULT_DAILY_CHECKIN_TIME,
     DEFAULT_CALENDAR_CHECK_INTERVAL_MINUTES,
     MODEL_FDA,
-    MODEL_EXECUTOR,
-    MODEL_LIBRARIAN,
 )
 from fda.state.project_state import ProjectState
 from fda.comms.message_bus import MessageBus
-from fda.scheduler import Scheduler
 from fda.journal.writer import JournalWriter
 from fda.journal.retriever import JournalRetriever
 
@@ -60,178 +57,53 @@ def ensure_fda_initialized() -> ProjectState:
 
 
 def handle_start(args: argparse.Namespace) -> int:
-    """Start the FDA system."""
+    """Start the FDA system — unified single-process orchestrator.
 
-    # Check if starting all peer agents
-    if getattr(args, 'all_agents', False):
-        return handle_start_all_agents(args)
+    Launches all subsystems in one process:
+    - Worker agent (code analysis + deployment)
+    - Telegram bot (user Q&A + /approve /reject)
+    - Discord bot (voice meetings, note-taking)
+    - Outlook calendar monitor (meeting prep)
+    - KakaoTalk polling (client message classification)
+    """
+    import logging
 
-    print("Starting FDA system...")
+    # Configure logging
+    log_level = logging.DEBUG if getattr(args, "verbose", False) else logging.INFO
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
 
-    # Initialize components
-    state = ProjectState()
-    scheduler = Scheduler()
+    ensure_fda_initialized()
 
-    # Register scheduled tasks
-    def daily_checkin():
-        print(f"[{__import__('datetime').datetime.now()}] Daily checkin triggered")
-
-    def calendar_check():
-        print(f"[{__import__('datetime').datetime.now()}] Calendar check triggered")
-
-    scheduler.register_daily_checkin(DEFAULT_DAILY_CHECKIN_TIME, daily_checkin)
-    scheduler.register_calendar_watcher(DEFAULT_CALENDAR_CHECK_INTERVAL_MINUTES, calendar_check)
-
-    print(f"  Daily checkin scheduled at {DEFAULT_DAILY_CHECKIN_TIME}")
-    print(f"  Calendar check every {DEFAULT_CALENDAR_CHECK_INTERVAL_MINUTES} minutes")
-
-    if args.daemon:
-        print("Running in daemon mode (background)...")
-        thread = scheduler.run_in_background()
-        print("FDA system started in background. Press Ctrl+C to stop.")
-        try:
-            thread.join()
-        except KeyboardInterrupt:
-            print("\nStopping FDA system...")
-            scheduler.stop()
-    else:
-        print("Running in foreground. Press Ctrl+C to stop.")
-        try:
-            scheduler.run()
-        except KeyboardInterrupt:
-            print("\nStopping FDA system...")
-            scheduler.stop()
-
-    return 0
-
-
-def handle_start_all_agents(args: argparse.Namespace) -> int:
-    """Start all peer agents (FDA, Librarian, Executor)."""
-    import threading
-    import signal
-    import sys
+    from fda.orchestrator import FDAOrchestrator
 
     print("=" * 60)
-    print("FDA PEER-BASED MULTI-AGENT SYSTEM")
+    print("FDA SYSTEM — UNIFIED MODE")
     print("=" * 60)
     print()
-    print("Starting peer agents:")
-    print("  - FDA (User Interface)")
-    print("  - Librarian (Knowledge & Discovery)")
-    print("  - Executor (Actions)")
+    print("Subsystems:")
+    print("  • Worker agent (code analysis + SSH deploy)")
+    print("  • Telegram bot (user Q&A + code approval)")
+    print("  • Discord bot (voice meetings + note-taking)")
+    print("  • Outlook calendar (meeting prep)")
+    print("  • KakaoTalk reader (client messages)")
     print()
 
-    from fda.fda_agent import FDAAgent
-    from fda.librarian_agent import LibrarianAgent
-    from fda.executor_agent import ExecutorAgent
+    # Parse feature flags
+    enable_telegram = not getattr(args, "no_telegram", False)
+    enable_discord = not getattr(args, "no_discord", False)
+    enable_calendar = not getattr(args, "no_calendar", False)
 
-    # Track threads and stop event
-    threads = []
-    stop_event = threading.Event()
+    orchestrator = FDAOrchestrator(
+        enable_telegram=enable_telegram,
+        enable_discord=enable_discord,
+        enable_calendar=enable_calendar,
+    )
 
-    def signal_handler(sig, frame):
-        print("\n\nShutting down all agents...")
-        stop_event.set()
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, signal_handler)
-
-    try:
-        # Start Librarian in background thread
-        # Default folders: Desktop, Downloads, Documents
-        # Plus any additional folders configured by the user
-        home = Path.home()
-        default_folders = ["Desktop", "Downloads", "Documents"]
-        exploration_roots = [
-            str(home / folder)
-            for folder in default_folders
-            if (home / folder).exists()
-        ]
-
-        # Check for user-configured additional folders
-        state = ProjectState()
-        additional_folders = state.get_context("exploration_folders")
-        if additional_folders:
-            try:
-                extra_folders = json.loads(additional_folders) if isinstance(additional_folders, str) else additional_folders
-                for folder in extra_folders:
-                    folder_path = Path(folder).expanduser()
-                    if folder_path.exists() and str(folder_path) not in exploration_roots:
-                        exploration_roots.append(str(folder_path))
-            except (json.JSONDecodeError, TypeError):
-                pass
-
-        print("[1/3] Starting Librarian agent...")
-        print(f"      Exploration folders: {', '.join(exploration_roots)}")
-        librarian = LibrarianAgent(exploration_roots=exploration_roots)
-
-        def run_librarian():
-            try:
-                librarian.start()
-            except Exception as e:
-                print(f"Librarian error: {e}")
-
-        librarian_thread = threading.Thread(target=run_librarian, daemon=True)
-        librarian_thread.start()
-        threads.append(("Librarian", librarian_thread, librarian))
-        print("      ✓ Librarian started")
-
-        # Start Executor in background thread
-        print("[2/3] Starting Executor agent...")
-        executor = ExecutorAgent()
-
-        def run_executor():
-            try:
-                executor.start()
-            except Exception as e:
-                print(f"Executor error: {e}")
-
-        executor_thread = threading.Thread(target=run_executor, daemon=True)
-        executor_thread.start()
-        threads.append(("Executor", executor_thread, executor))
-        print("      ✓ Executor started")
-
-        # Start FDA in main thread (or background if specified)
-        print("[3/3] Starting FDA agent...")
-        fda = FDAAgent()
-
-        def run_fda():
-            try:
-                fda.start()
-            except Exception as e:
-                print(f"FDA error: {e}")
-
-        fda_thread = threading.Thread(target=run_fda, daemon=True)
-        fda_thread.start()
-        threads.append(("FDA", fda_thread, fda))
-        print("      ✓ FDA started")
-
-        print()
-        print("=" * 60)
-        print("All agents running! Press Ctrl+C to stop.")
-        print()
-        print("To interact:")
-        print("  - Discord: fda discord start (PRIMARY)")
-        print("  - Telegram: fda telegram start")
-        print("  - CLI: fda ask \"<question>\"")
-        print("=" * 60)
-        print()
-
-        # Keep main thread alive
-        while not stop_event.is_set():
-            stop_event.wait(1)
-
-    except KeyboardInterrupt:
-        pass
-    finally:
-        print("\nStopping agents...")
-        for name, thread, agent in threads:
-            try:
-                agent.stop()
-                print(f"  ✓ {name} stopped")
-            except Exception as e:
-                print(f"  ✗ {name} error: {e}")
-
+    orchestrator.run()
     return 0
 
 
@@ -1514,17 +1386,26 @@ def main(argv: Optional[list[str]] = None) -> int:
     subparsers = parser.add_subparsers(dest="command", help="Command to execute")
 
     # start command
-    start_parser = subparsers.add_parser("start", help="Start the FDA system")
+    start_parser = subparsers.add_parser("start", help="Start the FDA system (unified)")
     start_parser.add_argument(
-        "--daemon",
+        "--no-telegram",
         action="store_true",
-        help="Run in daemon mode",
+        help="Disable Telegram bot",
     )
     start_parser.add_argument(
-        "--all", "-a",
-        dest="all_agents",
+        "--no-discord",
         action="store_true",
-        help="Start all peer agents (FDA, Librarian, Executor)",
+        help="Disable Discord bot",
+    )
+    start_parser.add_argument(
+        "--no-calendar",
+        action="store_true",
+        help="Disable Outlook calendar monitoring",
+    )
+    start_parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Enable debug logging",
     )
     start_parser.set_defaults(func=handle_start)
 

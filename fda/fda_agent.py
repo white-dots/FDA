@@ -1,11 +1,9 @@
 """
 FDA (Facilitating Director Agent) implementation.
 
-FDA is a PEER agent - the user-facing interface of the multi-agent system.
-It communicates with users via Discord voice (primary) and Telegram (secondary),
-and collaborates with Librarian and Executor agents to fulfill requests.
-
-FDA does NOT boss the other agents - they are equals collaborating via message bus.
+FDA is the user-facing interface of the system. It communicates with users
+via Discord voice (primary) and Telegram (secondary), and delegates work
+to the Worker agent for code analysis, fixes, and deployments.
 """
 
 import logging
@@ -25,23 +23,21 @@ from fda.comms.message_bus import MessageTypes, Agents
 logger = logging.getLogger(__name__)
 
 
-FDA_SYSTEM_PROMPT = """You are FDA (Facilitating Director Agent), a personal AI assistant - a PERSONA living on the user's computer.
+FDA_SYSTEM_PROMPT = """You are FDA (Facilitating Director Agent), a personal AI assistant living on the user's computer.
 
-You are the user-facing interface of a multi-agent system. You work with two peer agents:
-- **Librarian**: Knows about files, documents, and knowledge on the computer
-- **Executor**: Can run commands, create files, and take actions
+You are the user-facing interface of a unified system. You work with:
+- **Worker agent**: Handles code analysis, generating fixes, and deploying to client VMs via SSH
 
-You collaborate with these peers - you don't boss them around. When the user asks for something:
-- If it's about finding files or information → Ask Librarian
-- If it's about running commands or making changes → Ask Executor
-- If you can answer directly from your knowledge → Do so
+The system also monitors:
+- **KakaoTalk**: Client messages are classified and turned into tasks for the Worker
+- **Outlook calendar**: Upcoming meetings are tracked; you prepare briefs with SharePoint files
+- **Discord voice**: You join meetings, take notes, and answer questions in real-time
 
 Your scope is the user's entire work environment:
-- Their calendar and meetings
-- Their tasks and to-do items
-- Their communications (Telegram, Discord voice)
-- Their files and documents (via Librarian)
-- Commands and actions (via Executor)
+- Their calendar and meetings (Outlook)
+- Client requests (KakaoTalk → task briefs → Worker → approval via Telegram)
+- Their communications (Telegram for Q&A and approvals, Discord for voice)
+- Code changes across client VMs (reviewed and approved before deployment)
 
 Your personality:
 - Helpful and proactive, like a skilled executive assistant
@@ -54,7 +50,7 @@ When responding:
 - Talk naturally, like a helpful colleague
 - Don't use excessive formatting unless it helps clarity
 - Be brief for simple questions, detailed when needed
-- When you need to search or run something, tell the user you're asking your peers
+- When you need code changes, tell the user the Worker is on it
 
 You are the voice and face of the system. The user talks to YOU via Discord voice or Telegram.
 """
@@ -62,10 +58,10 @@ You are the voice and face of the system. The user talks to YOU via Discord voic
 
 class FDAAgent(BaseAgent):
     """
-    Facilitating Director Agent - the user-facing peer agent.
+    Facilitating Director Agent - the user-facing agent.
 
     FDA is the primary interface for users via Discord voice and Telegram.
-    It collaborates with Librarian and Executor agents to fulfill requests.
+    It delegates code work to the Worker agent.
     """
 
     def __init__(
@@ -103,8 +99,7 @@ class FDAAgent(BaseAgent):
         """
         Run the main event loop for the FDA agent.
 
-        As a peer agent:
-        1. Process messages from peer agents (Librarian, Executor)
+        1. Process messages from Worker agent
         2. Handle user requests from Discord/Telegram
         3. Monitor project health and upcoming meetings
         """

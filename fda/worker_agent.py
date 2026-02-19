@@ -19,9 +19,8 @@ import difflib
 from typing import Any, Optional
 from datetime import datetime
 
-import anthropic
-
 from fda.base_agent import BaseAgent
+from fda.claude_backend import get_claude_backend
 from fda.config import MODEL_EXECUTOR, MODEL_MEETING_SUMMARY
 from fda.clients.client_config import ClientConfig, ClientManager
 from fda.remote.ssh_manager import SSHManager
@@ -81,7 +80,7 @@ Important rules:
             db_path=db_path,
         )
         self.client_manager = client_manager
-        self.claude = anthropic.Anthropic()
+        self._backend = get_claude_backend()
 
         # Cache SSH connections per client
         self._ssh_connections: dict[str, SSHManager] = {}
@@ -245,9 +244,7 @@ Important rules:
         # Use Claude to pick relevant files
         files_list = "\n".join(all_files[:300])  # Limit to avoid token overflow
 
-        response = self.claude.messages.create(
-            model=MODEL_EXECUTOR,
-            max_tokens=1000,
+        text = self._backend.complete(
             system="You are a code analyst. Given a task description and a list of files in a repository, identify which files are most likely relevant to the task. Return ONLY a JSON array of file paths, nothing else.",
             messages=[{
                 "role": "user",
@@ -262,11 +259,13 @@ Which files should I read to understand and fix this issue?
 Return a JSON array of the most relevant file paths (max 15 files).
 """,
             }],
+            model=MODEL_EXECUTOR,
+            max_tokens=1000,
         )
 
         try:
             # Extract JSON from response
-            text = response.content[0].text.strip()
+            text = text.strip()
             # Handle markdown code blocks
             if text.startswith("```"):
                 text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
@@ -355,14 +354,12 @@ Only include files that actually changed.
 """
 
         try:
-            response = self.claude.messages.create(
-                model=MODEL_MEETING_SUMMARY,  # Use Sonnet for quality code generation
-                max_tokens=8000,
+            text = self._backend.complete(
                 system=self.SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": prompt}],
-            )
-
-            text = response.content[0].text.strip()
+                model=MODEL_MEETING_SUMMARY,  # Use Sonnet for quality code generation
+                max_tokens=8000,
+            ).strip()
 
             # Extract JSON from response
             if text.startswith("```"):

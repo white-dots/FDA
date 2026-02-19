@@ -2,7 +2,8 @@
 Base Agent class with shared functionality.
 
 Provides common utilities for all FDA system agents including
-Claude API integration, message bus access, and state management.
+Claude integration (via Max subscription CLI or API), message bus
+access, and state management.
 """
 
 import logging
@@ -11,15 +12,14 @@ from pathlib import Path
 from typing import Any, Optional
 from datetime import datetime
 
-from anthropic import Anthropic
-
 import os
 
+from fda.claude_backend import ClaudeBackend, get_claude_backend
 from fda.state.project_state import ProjectState
 from fda.comms.message_bus import MessageBus
 from fda.journal.writer import JournalWriter
 from fda.journal.retriever import JournalRetriever
-from fda.config import STATE_DB_PATH, MESSAGE_BUS_PATH, JOURNAL_DIR, ANTHROPIC_API_KEY_ENV
+from fda.config import STATE_DB_PATH, MESSAGE_BUS_PATH, JOURNAL_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -28,8 +28,8 @@ class BaseAgent(ABC):
     """
     Abstract base class for all FDA system agents.
 
-    Provides shared functionality for Claude API calls, state access,
-    inter-agent messaging, and journal operations.
+    Provides shared functionality for Claude calls (via Max subscription
+    or API), state access, inter-agent messaging, and journal operations.
     """
 
     def __init__(
@@ -38,31 +38,29 @@ class BaseAgent(ABC):
         model: str,
         system_prompt: str,
         project_state_path: Optional[Path] = None,
+        **kwargs,
     ):
         """
         Initialize the base agent.
 
         Args:
             name: Agent name (used for messaging and logging).
-            model: Claude model to use.
+            model: Claude model to use (passed to API backend; ignored by CLI).
             system_prompt: System prompt for the agent.
             project_state_path: Optional path to project state database.
+            **kwargs: Extra keyword args (e.g. message_bus, db_path) accepted
+                      for forward-compatibility with subclasses.
         """
         self.name = name
         self.model = model
         self.system_prompt = system_prompt
 
-        # Initialize shared components first (needed to get API key from DB)
+        # Initialize shared components
         self.state = ProjectState(project_state_path or STATE_DB_PATH)
 
-        # Initialize Anthropic client with API key from env or database
-        api_key = os.environ.get(ANTHROPIC_API_KEY_ENV) or self.state.get_context("anthropic_api_key")
-        if not api_key:
-            raise ValueError(
-                "Anthropic API key not found. Set ANTHROPIC_API_KEY environment variable "
-                "or configure via 'fda setup' web interface."
-            )
-        self.client = Anthropic(api_key=api_key)
+        # Claude backend — auto-detects CLI (Max subscription) or API
+        self.backend: ClaudeBackend = get_claude_backend()
+
         self.message_bus = MessageBus(MESSAGE_BUS_PATH)
         self.journal_writer = JournalWriter(JOURNAL_DIR)
         self.journal_retriever = JournalRetriever(JOURNAL_DIR)
@@ -101,15 +99,13 @@ class BaseAgent(ABC):
         messages.append({"role": "user", "content": message})
 
         try:
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=max_tokens,
+            assistant_message = self.backend.complete(
                 system=self.system_prompt,
                 messages=messages,
+                model=self.model,
+                max_tokens=max_tokens,
                 temperature=temperature,
             )
-
-            assistant_message = response.content[0].text
 
             # Update conversation history
             if include_history:
@@ -121,7 +117,7 @@ class BaseAgent(ABC):
             return assistant_message
 
         except Exception as e:
-            logger.error(f"Error calling Claude API: {e}")
+            logger.error(f"Error calling Claude: {e}")
             raise
 
     def chat_with_context(
@@ -171,16 +167,15 @@ class BaseAgent(ABC):
             Claude's response text.
         """
         try:
-            response = self.client.messages.create(
-                model=model,
-                max_tokens=max_tokens,
+            return self.backend.complete(
                 system=self.system_prompt,
                 messages=[{"role": "user", "content": message}],
+                model=model,
+                max_tokens=max_tokens,
                 temperature=temperature,
             )
-            return response.content[0].text
         except Exception as e:
-            logger.error(f"Error calling Claude API with model {model}: {e}")
+            logger.error(f"Error calling Claude with model {model}: {e}")
             raise
 
     def _format_context(self, context: dict[str, Any]) -> str:
