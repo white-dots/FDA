@@ -29,12 +29,18 @@ class OutlookCalendar:
     """
 
     GRAPH_API_BASE = "https://graph.microsoft.com/v1.0"
-    SCOPES = ["Calendars.Read", "Calendars.ReadWrite", "User.Read"]
+    SCOPES = [
+        "Calendars.Read",
+        "Calendars.ReadWrite",
+        "User.Read",
+        "Sites.Read.All",
+        "Files.Read.All",
+    ]
 
     # Pre-registered multi-tenant app for FDA system
     # This allows any Office 365 user to log in without app registration
     # To use your own app, set FDA_OUTLOOK_CLIENT_ID environment variable
-    DEFAULT_CLIENT_ID = "YOUR_REGISTERED_APP_CLIENT_ID"  # Replace after registering
+    DEFAULT_CLIENT_ID = "b745d468-7cbc-4442-96ce-ef75e8a421ff"
     DEFAULT_TENANT = "common"  # "common" allows any Microsoft account
 
     def __init__(
@@ -567,3 +573,530 @@ class OutlookCalendar:
 
         result = self._make_request("POST", endpoint, json_data=data or None)
         return result is not None
+
+    # ========== SharePoint / OneDrive File Access ==========
+
+    def search_files(
+        self,
+        query: str,
+        max_results: int = 10,
+    ) -> list[dict[str, Any]]:
+        """
+        Search for files across the user's OneDrive and SharePoint using
+        Microsoft Search API.
+
+        Args:
+            query: Search query string (keywords, phrases, etc.).
+            max_results: Maximum number of results to return.
+
+        Returns:
+            List of file metadata dictionaries.
+        """
+        self._ensure_authenticated()
+
+        # Use Microsoft Search API — searches across OneDrive + all SharePoint
+        endpoint = "/search/query"
+        search_body = {
+            "requests": [
+                {
+                    "entityTypes": ["driveItem"],
+                    "query": {"queryString": query},
+                    "from": 0,
+                    "size": max_results,
+                    "fields": [
+                        "id", "name", "webUrl", "lastModifiedDateTime",
+                        "createdBy", "lastModifiedBy", "size",
+                        "parentReference",
+                    ],
+                }
+            ]
+        }
+
+        response = self._make_request("POST", endpoint, json_data=search_body)
+
+        if not response or "value" not in response:
+            return []
+
+        return self._parse_search_results(response["value"])
+
+    def _parse_search_results(
+        self, search_response: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Parse Microsoft Search API response into clean file metadata."""
+        files = []
+
+        for result_set in search_response:
+            hits = result_set.get("hitsContainers", [])
+            for container in hits:
+                for hit in container.get("hits", []):
+                    resource = hit.get("resource", {})
+                    summary = hit.get("summary", "")
+
+                    # Extract drive and item IDs from the resource ID
+                    # Resource ID format varies; we also get it from parentReference
+                    parent_ref = resource.get("parentReference", {})
+
+                    files.append({
+                        "id": resource.get("id"),
+                        "name": resource.get("name", "Unknown"),
+                        "web_url": resource.get("webUrl"),
+                        "last_modified": resource.get("lastModifiedDateTime"),
+                        "size": resource.get("size"),
+                        "created_by": (
+                            resource.get("createdBy", {})
+                            .get("user", {})
+                            .get("displayName")
+                        ),
+                        "modified_by": (
+                            resource.get("lastModifiedBy", {})
+                            .get("user", {})
+                            .get("displayName")
+                        ),
+                        "drive_id": parent_ref.get("driveId"),
+                        "site_id": parent_ref.get("siteId"),
+                        "hit_summary": summary,  # Search snippet with highlights
+                    })
+
+        return files
+
+    def search_files_in_drive(
+        self,
+        query: str,
+        drive_id: Optional[str] = None,
+        max_results: int = 10,
+    ) -> list[dict[str, Any]]:
+        """
+        Search for files in a specific drive (OneDrive or SharePoint doc library).
+
+        Args:
+            query: Search query string.
+            drive_id: Specific drive ID. If None, searches user's OneDrive.
+            max_results: Maximum results to return.
+
+        Returns:
+            List of file metadata dictionaries.
+        """
+        self._ensure_authenticated()
+
+        if drive_id:
+            endpoint = f"/drives/{drive_id}/root/search(q='{query}')"
+        else:
+            endpoint = f"/me/drive/root/search(q='{query}')"
+
+        params = {"$top": max_results}
+        response = self._make_request("GET", endpoint, params=params)
+
+        if not response or "value" not in response:
+            return []
+
+        results = []
+        for item in response["value"]:
+            parent_ref = item.get("parentReference", {})
+            results.append({
+                "id": item.get("id"),
+                "name": item.get("name"),
+                "web_url": item.get("webUrl"),
+                "last_modified": item.get("lastModifiedDateTime"),
+                "size": item.get("size"),
+                "mime_type": item.get("file", {}).get("mimeType"),
+                "drive_id": parent_ref.get("driveId"),
+                "parent_path": parent_ref.get("path"),
+            })
+
+        return results
+
+    def get_file_content(
+        self,
+        item_id: str,
+        drive_id: Optional[str] = None,
+        max_size_mb: float = 10.0,
+    ) -> Optional[bytes]:
+        """
+        Download the content of a file from OneDrive/SharePoint.
+
+        Args:
+            item_id: The item (file) ID.
+            drive_id: The drive ID. If None, uses user's OneDrive.
+            max_size_mb: Maximum file size to download in MB.
+
+        Returns:
+            File content as bytes, or None if failed.
+        """
+        try:
+            import requests as req_lib
+        except ImportError:
+            raise ImportError("requests is required. Install with: pip install requests")
+
+        self._ensure_authenticated()
+
+        if drive_id:
+            endpoint = f"/drives/{drive_id}/items/{item_id}/content"
+        else:
+            endpoint = f"/me/drive/items/{item_id}/content"
+
+        url = f"{self.GRAPH_API_BASE}{endpoint}"
+        headers = {
+            "Authorization": f"Bearer {self.access_token}",
+        }
+
+        try:
+            response = req_lib.get(url, headers=headers, timeout=60, stream=True)
+            response.raise_for_status()
+
+            # Check content length before downloading
+            content_length = int(response.headers.get("Content-Length", 0))
+            if content_length > max_size_mb * 1024 * 1024:
+                logger.warning(
+                    f"File too large ({content_length / 1024 / 1024:.1f} MB), "
+                    f"skipping (max {max_size_mb} MB)"
+                )
+                return None
+
+            return response.content
+
+        except req_lib.HTTPError as e:
+            logger.error(f"Failed to download file {item_id}: {e}")
+            return None
+        except req_lib.RequestException as e:
+            logger.error(f"Request failed for file {item_id}: {e}")
+            return None
+
+    def get_file_text_content(
+        self,
+        item_id: str,
+        drive_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        Get the text content of a file. Handles common Office formats
+        by extracting plain text.
+
+        Supports: .txt, .csv, .json, .md, .html, .docx, .pptx, .xlsx, .pdf
+
+        Args:
+            item_id: The item (file) ID.
+            drive_id: The drive ID. If None, uses user's OneDrive.
+
+        Returns:
+            Extracted text content, or None if failed/unsupported.
+        """
+        # First get file metadata to determine type
+        self._ensure_authenticated()
+
+        if drive_id:
+            endpoint = f"/drives/{drive_id}/items/{item_id}"
+        else:
+            endpoint = f"/me/drive/items/{item_id}"
+
+        metadata = self._make_request("GET", endpoint, params={"$select": "name,size,file"})
+        if not metadata:
+            return None
+
+        file_name = metadata.get("name", "")
+        mime_type = metadata.get("file", {}).get("mimeType", "")
+        file_ext = Path(file_name).suffix.lower()
+
+        # For plain text formats, download directly
+        if file_ext in (".txt", ".csv", ".json", ".md", ".html", ".xml", ".log"):
+            content = self.get_file_content(item_id, drive_id)
+            if content:
+                try:
+                    return content.decode("utf-8")
+                except UnicodeDecodeError:
+                    return content.decode("utf-8", errors="replace")
+            return None
+
+        # For Office documents, try to extract text
+        content = self.get_file_content(item_id, drive_id)
+        if not content:
+            return None
+
+        return self._extract_text_from_binary(content, file_ext, file_name)
+
+    def _extract_text_from_binary(
+        self,
+        content: bytes,
+        file_ext: str,
+        file_name: str,
+    ) -> Optional[str]:
+        """
+        Extract text from binary file formats (docx, pptx, xlsx, pdf).
+
+        Args:
+            content: Raw file bytes.
+            file_ext: File extension (e.g. '.docx').
+            file_name: Original file name.
+
+        Returns:
+            Extracted text or None.
+        """
+        import io
+
+        if file_ext == ".docx":
+            return self._extract_docx_text(io.BytesIO(content))
+        elif file_ext == ".pptx":
+            return self._extract_pptx_text(io.BytesIO(content))
+        elif file_ext == ".xlsx":
+            return self._extract_xlsx_text(io.BytesIO(content))
+        elif file_ext == ".pdf":
+            return self._extract_pdf_text(io.BytesIO(content))
+        else:
+            logger.info(f"Unsupported file type for text extraction: {file_ext} ({file_name})")
+            return None
+
+    @staticmethod
+    def _extract_docx_text(file_obj: Any) -> Optional[str]:
+        """Extract text from a .docx file."""
+        try:
+            import zipfile
+            import xml.etree.ElementTree as ET
+
+            with zipfile.ZipFile(file_obj) as zf:
+                if "word/document.xml" not in zf.namelist():
+                    return None
+                xml_content = zf.read("word/document.xml")
+                tree = ET.fromstring(xml_content)
+                # Extract all text nodes
+                ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+                paragraphs = []
+                for p in tree.iter(f"{{{ns['w']}}}p"):
+                    texts = [t.text for t in p.iter(f"{{{ns['w']}}}t") if t.text]
+                    if texts:
+                        paragraphs.append("".join(texts))
+                return "\n".join(paragraphs)
+        except Exception as e:
+            logger.warning(f"Failed to extract docx text: {e}")
+            return None
+
+    @staticmethod
+    def _extract_pptx_text(file_obj: Any) -> Optional[str]:
+        """Extract text from a .pptx file."""
+        try:
+            import zipfile
+            import xml.etree.ElementTree as ET
+
+            slides_text = []
+            with zipfile.ZipFile(file_obj) as zf:
+                slide_files = sorted(
+                    [f for f in zf.namelist() if f.startswith("ppt/slides/slide") and f.endswith(".xml")]
+                )
+                for slide_file in slide_files:
+                    xml_content = zf.read(slide_file)
+                    tree = ET.fromstring(xml_content)
+                    # Extract all text from the slide
+                    ns = {"a": "http://schemas.openxmlformats.org/drawingml/2006/main"}
+                    texts = [t.text for t in tree.iter(f"{{{ns['a']}}}t") if t.text]
+                    if texts:
+                        slide_num = slide_file.split("slide")[-1].replace(".xml", "")
+                        slides_text.append(f"[Slide {slide_num}]\n" + "\n".join(texts))
+
+            return "\n\n".join(slides_text) if slides_text else None
+        except Exception as e:
+            logger.warning(f"Failed to extract pptx text: {e}")
+            return None
+
+    @staticmethod
+    def _extract_xlsx_text(file_obj: Any) -> Optional[str]:
+        """Extract text from a .xlsx file (first sheet, headers + sample rows)."""
+        try:
+            import zipfile
+            import xml.etree.ElementTree as ET
+
+            with zipfile.ZipFile(file_obj) as zf:
+                # Read shared strings
+                shared_strings = []
+                if "xl/sharedStrings.xml" in zf.namelist():
+                    ss_xml = zf.read("xl/sharedStrings.xml")
+                    ss_tree = ET.fromstring(ss_xml)
+                    ns = {"s": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+                    for si in ss_tree.iter(f"{{{ns['s']}}}si"):
+                        texts = [t.text or "" for t in si.iter(f"{{{ns['s']}}}t")]
+                        shared_strings.append("".join(texts))
+
+                # Read first sheet
+                if "xl/worksheets/sheet1.xml" not in zf.namelist():
+                    return None
+                sheet_xml = zf.read("xl/worksheets/sheet1.xml")
+                sheet_tree = ET.fromstring(sheet_xml)
+                ns = {"s": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+
+                rows_text = []
+                for row in list(sheet_tree.iter(f"{{{ns['s']}}}row"))[:20]:  # First 20 rows
+                    cells = []
+                    for cell in row.iter(f"{{{ns['s']}}}c"):
+                        cell_type = cell.get("t", "")
+                        value_el = cell.find(f"{{{ns['s']}}}v")
+                        if value_el is not None and value_el.text:
+                            if cell_type == "s":
+                                idx = int(value_el.text)
+                                cells.append(shared_strings[idx] if idx < len(shared_strings) else "")
+                            else:
+                                cells.append(value_el.text)
+                        else:
+                            cells.append("")
+                    rows_text.append(" | ".join(cells))
+
+                return "\n".join(rows_text) if rows_text else None
+        except Exception as e:
+            logger.warning(f"Failed to extract xlsx text: {e}")
+            return None
+
+    @staticmethod
+    def _extract_pdf_text(file_obj: Any) -> Optional[str]:
+        """Extract text from a PDF file. Requires PyPDF2 or falls back to basic extraction."""
+        try:
+            import PyPDF2
+            reader = PyPDF2.PdfReader(file_obj)
+            pages_text = []
+            for i, page in enumerate(reader.pages[:20]):  # First 20 pages
+                text = page.extract_text()
+                if text and text.strip():
+                    pages_text.append(f"[Page {i + 1}]\n{text.strip()}")
+            return "\n\n".join(pages_text) if pages_text else None
+        except ImportError:
+            logger.info("PyPDF2 not installed — skipping PDF text extraction")
+            return None
+        except Exception as e:
+            logger.warning(f"Failed to extract PDF text: {e}")
+            return None
+
+    def search_files_for_meeting(
+        self,
+        event_details: dict[str, Any],
+        max_files: int = 5,
+        max_text_length: int = 3000,
+    ) -> list[dict[str, Any]]:
+        """
+        Search SharePoint/OneDrive for files relevant to a meeting.
+
+        Builds search queries from the meeting subject, body, and attendee names,
+        then returns file metadata + extracted text summaries.
+
+        Args:
+            event_details: Event details dict from get_event_details().
+            max_files: Maximum number of files to retrieve content for.
+            max_text_length: Max characters of text to extract per file.
+
+        Returns:
+            List of dicts with file metadata and extracted text content.
+        """
+        subject = event_details.get("subject", "")
+        body_preview = event_details.get("body_preview") or event_details.get("body", "")
+        attendees = event_details.get("attendees", [])
+
+        if not subject:
+            return []
+
+        # Build search queries from meeting context
+        queries = self._build_meeting_search_queries(subject, body_preview, attendees)
+
+        # Search and deduplicate results
+        seen_ids: set[str] = set()
+        all_results: list[dict[str, Any]] = []
+
+        for query in queries:
+            try:
+                results = self.search_files(query, max_results=5)
+                for r in results:
+                    file_id = r.get("id")
+                    if file_id and file_id not in seen_ids:
+                        seen_ids.add(file_id)
+                        all_results.append(r)
+            except Exception as e:
+                logger.warning(f"SharePoint search failed for query '{query}': {e}")
+
+        # Sort by last_modified (most recent first) and limit
+        all_results.sort(
+            key=lambda x: x.get("last_modified", ""),
+            reverse=True,
+        )
+        top_results = all_results[:max_files]
+
+        # Extract text content for top results
+        enriched = []
+        for file_meta in top_results:
+            file_id = file_meta.get("id")
+            drive_id = file_meta.get("drive_id")
+
+            text_content = None
+            try:
+                text_content = self.get_file_text_content(file_id, drive_id)
+            except Exception as e:
+                logger.warning(f"Could not extract text from {file_meta.get('name')}: {e}")
+
+            enriched.append({
+                **file_meta,
+                "text_content": (
+                    text_content[:max_text_length] + "..." if text_content and len(text_content) > max_text_length
+                    else text_content
+                ),
+            })
+
+        return enriched
+
+    @staticmethod
+    def _build_meeting_search_queries(
+        subject: str,
+        body: str,
+        attendees: list[dict[str, Any]],
+    ) -> list[str]:
+        """
+        Build search queries from meeting metadata.
+
+        Generates multiple queries to maximize relevant file discovery:
+        1. Full subject line
+        2. Key terms from subject (removing common words)
+        3. Attendee names (people often share files with their name)
+
+        Args:
+            subject: Meeting subject.
+            body: Meeting body/description.
+            attendees: List of attendee dicts.
+
+        Returns:
+            List of search query strings (deduplicated).
+        """
+        queries = []
+
+        # 1. Full subject as a query
+        if subject:
+            queries.append(subject)
+
+        # 2. Extract key terms from subject (drop noise words)
+        noise_words = {
+            "meeting", "call", "sync", "catchup", "catch-up", "check-in",
+            "checkin", "discussion", "review", "update", "weekly", "daily",
+            "monthly", "bi-weekly", "standup", "stand-up", "1:1", "1on1",
+            "the", "a", "an", "and", "or", "for", "with", "about", "on",
+            "in", "at", "to", "of", "re", "fwd", "fw",
+        }
+        if subject:
+            key_terms = [
+                w for w in subject.split()
+                if w.lower().strip(":-/()[]") not in noise_words
+                and len(w) > 2
+            ]
+            if key_terms and " ".join(key_terms) != subject:
+                queries.append(" ".join(key_terms))
+
+        # 3. Search by attendee names (top 3, skip the organizer if many)
+        attendee_names = [
+            a.get("name") or a.get("email", "").split("@")[0]
+            for a in attendees[:3]
+            if a.get("name") or a.get("email")
+        ]
+        for name in attendee_names:
+            if name and subject:
+                # Combine attendee name with key subject terms for relevance
+                short_subject = " ".join(key_terms[:2]) if key_terms else subject.split()[0]
+                queries.append(f"{name} {short_subject}")
+
+        # Deduplicate while preserving order
+        seen: set[str] = set()
+        unique_queries = []
+        for q in queries:
+            q_lower = q.lower().strip()
+            if q_lower and q_lower not in seen:
+                seen.add(q_lower)
+                unique_queries.append(q)
+
+        return unique_queries[:5]  # Cap at 5 queries to avoid rate limits

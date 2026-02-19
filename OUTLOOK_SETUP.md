@@ -50,17 +50,22 @@ After registration, you'll see the **Overview** page. Copy these values:
    - `Calendars.Read`
    - `Calendars.ReadWrite`
    - `User.Read`
+   - `Sites.Read.All` (or `AllSites.Read` in the UI) — for SharePoint file search
+   - `Files.Read.All` — for reading file contents from OneDrive/SharePoint
 6. Click **Add permissions**
 
 Your permissions should look like:
 
-| Permission | Type | Status |
-|------------|------|--------|
-| Calendars.Read | Delegated | Granted |
-| Calendars.ReadWrite | Delegated | Granted |
-| User.Read | Delegated | Granted |
+| Permission | Type | Status | Purpose |
+|------------|------|--------|---------|
+| Calendars.Read | Delegated | Granted | Read calendar events |
+| Calendars.ReadWrite | Delegated | Granted | Create/modify events |
+| User.Read | Delegated | Granted | Basic user profile |
+| Sites.Read.All | Delegated | Granted | Search SharePoint sites |
+| Files.Read.All | Delegated | Granted | Read files for meeting prep |
 
 > **Note**: For organizational accounts, an admin may need to grant consent. For personal Microsoft accounts, users grant consent themselves during login.
+> The SharePoint/Files permissions are used to search for and read documents relevant to upcoming meetings.
 
 ---
 
@@ -178,7 +183,7 @@ fda calendar logout
 - Tokens are cached locally with restricted file permissions (600)
 - No client secret is used (public client flow)
 - Users authenticate with their own credentials
-- The app only requests calendar permissions, not full mailbox access
+- The app requests calendar and read-only SharePoint/OneDrive permissions — no write access to files
 - Users can revoke access anytime at [myapps.microsoft.com](https://myapps.microsoft.com)
 
 ---

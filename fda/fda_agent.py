@@ -1843,6 +1843,10 @@ Please assess:
         """
         Prepare briefing materials for an upcoming meeting.
 
+        Searches SharePoint/OneDrive for relevant files, extracts their content,
+        and uses that context (along with journal history) to generate a
+        comprehensive meeting brief.
+
         Args:
             event_id: The ID of the calendar event.
 
@@ -1869,20 +1873,59 @@ Please assess:
                 e.get("summary") for e in relevant
             ]
 
+        # Search SharePoint/OneDrive for relevant files
+        sharepoint_files: list[dict[str, Any]] = []
+        sharepoint_context = ""
+        if self.calendar and event_details:
+            try:
+                sharepoint_files = self.calendar.search_files_for_meeting(
+                    event_details, max_files=5, max_text_length=3000,
+                )
+                if sharepoint_files:
+                    sharepoint_context = self._format_sharepoint_context(sharepoint_files)
+                    logger.info(
+                        f"[FDA] Found {len(sharepoint_files)} relevant files "
+                        f"for meeting: {meeting_subject}"
+                    )
+            except Exception as e:
+                logger.warning(f"SharePoint search failed for meeting prep: {e}")
+
+        context["sharepoint_files"] = sharepoint_files
+
+        # Build the prompt with SharePoint file context
+        attendee_list = ", ".join(
+            a.get("name", a.get("email", ""))
+            for a in event_details.get("attendees", [])
+        )
+
         prompt = f"""Prepare a briefing for this upcoming meeting:
 
 Meeting: {event_details.get('subject', 'Unknown')}
 Time: {event_details.get('start', 'Unknown')}
-Attendees: {', '.join(a.get('name', a.get('email', '')) for a in event_details.get('attendees', []))}
+Attendees: {attendee_list}
 Location: {event_details.get('location', 'Unknown')}
+Description: {event_details.get('body_preview', event_details.get('body', 'N/A'))}
+"""
 
+        if sharepoint_context:
+            prompt += f"""
+## Relevant Files Found in SharePoint/OneDrive
+
+The following files were found that may be relevant to this meeting.
+Use their content to provide specific, data-informed preparation.
+
+{sharepoint_context}
+"""
+
+        prompt += """
 Please provide:
-1. **Meeting Brief**: Key context and background
+1. **Meeting Brief**: Key context and background (incorporate insights from any relevant files found)
 2. **Suggested Agenda**: Discussion topics in priority order
 3. **Key Points to Address**: Important items that must be covered
 4. **Potential Questions**: Questions that might come up
 5. **Recommended Actions**: Outcomes to aim for
-6. **Supporting Data**: Relevant metrics or status updates"""
+6. **Supporting Data**: Relevant metrics, status updates, or data from the files above
+7. **Referenced Files**: List any SharePoint/OneDrive files that attendees should review before the meeting"""
 
         response = self.chat_with_context(prompt, context)
 
@@ -1894,10 +1937,17 @@ Please provide:
         )
 
         # Log to journal
+        file_names = [f.get("name", "?") for f in sharepoint_files]
+        journal_content = f"## Meeting Preparation\n\n{response}"
+        if file_names:
+            journal_content += f"\n\n### Referenced Files\n" + "\n".join(
+                f"- {name}" for name in file_names
+            )
+
         self.log_to_journal(
             summary=f"Meeting prep: {event_details.get('subject', event_id)}",
-            content=f"## Meeting Preparation\n\n{response}",
-            tags=["meeting-prep", "briefing"],
+            content=journal_content,
+            tags=["meeting-prep", "briefing", "sharepoint"],
             relevance_decay="fast",
         )
 
@@ -1906,8 +1956,49 @@ Please provide:
             "prep_id": prep_id,
             "event_id": event_id,
             "brief": response,
+            "referenced_files": [
+                {"name": f.get("name"), "url": f.get("web_url")}
+                for f in sharepoint_files
+            ],
             "timestamp": datetime.now().isoformat(),
         }
+
+    @staticmethod
+    def _format_sharepoint_context(files: list[dict[str, Any]]) -> str:
+        """
+        Format SharePoint file search results into a readable context block
+        for the LLM prompt.
+
+        Args:
+            files: List of file dicts from search_files_for_meeting().
+
+        Returns:
+            Formatted string with file metadata and content excerpts.
+        """
+        sections = []
+        for i, f in enumerate(files, 1):
+            header = f"### File {i}: {f.get('name', 'Unknown')}"
+            meta_parts = []
+            if f.get("modified_by"):
+                meta_parts.append(f"Last modified by: {f['modified_by']}")
+            if f.get("last_modified"):
+                meta_parts.append(f"Modified: {f['last_modified'][:10]}")
+            if f.get("web_url"):
+                meta_parts.append(f"Link: {f['web_url']}")
+
+            meta = " | ".join(meta_parts) if meta_parts else ""
+
+            content = f.get("text_content")
+            if content:
+                content_section = f"**Content excerpt:**\n```\n{content}\n```"
+            elif f.get("hit_summary"):
+                content_section = f"**Search snippet:** {f['hit_summary']}"
+            else:
+                content_section = "*Could not extract text content*"
+
+            sections.append(f"{header}\n{meta}\n{content_section}")
+
+        return "\n\n".join(sections)
 
     def make_decision(
         self,
