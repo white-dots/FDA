@@ -122,14 +122,20 @@ class KakaoTalkReader:
             Path to the latest export file, or None.
         """
         # Look for files matching common KakaoTalk export naming patterns
+        # Support both .txt and .csv exports
         candidates = []
 
-        for pattern in [
-            f"*{room_name}*.txt",
-            f"KakaoTalk*{room_name}*.txt",
-            f"카카오톡*{room_name}*.txt",
-        ]:
-            candidates.extend(self.export_dir.glob(pattern))
+        for ext in ["txt", "csv"]:
+            for pattern in [
+                f"*{room_name}*.{ext}",
+                f"KakaoTalk*{room_name}*.{ext}",
+                f"카카오톡*{room_name}*.{ext}",
+                f"KakaoTalk_Chat_*.{ext}",  # Generic pattern for any export
+            ]:
+                candidates.extend(self.export_dir.glob(pattern))
+
+        # Deduplicate
+        candidates = list(set(candidates))
 
         if not candidates:
             return None

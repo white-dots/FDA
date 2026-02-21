@@ -5,10 +5,15 @@ Manages SSH connections to Azure VMs, executes commands remotely,
 and reads files from the remote filesystem.
 
 Uses subprocess + ssh CLI rather than paramiko for simplicity and
-because macOS ships with a good SSH client. Falls back to paramiko
-if installed.
+because macOS ships with a good SSH client.
+
+Connection pooling: Uses SSH ControlMaster to keep a persistent
+multiplexed connection. First command opens the master connection;
+subsequent commands reuse it (~50ms vs ~1.5s per command).
 """
 
+import atexit
+import hashlib
 import subprocess
 import logging
 from pathlib import Path
@@ -43,13 +48,36 @@ class SSHManager:
 
     Uses the system's SSH client for reliability on macOS.
     Connections use key-based auth (no passwords).
+
+    Connection pooling via ControlMaster:
+    - First SSH command opens a persistent master connection
+    - Subsequent commands multiplex over it (no new TCP/SSH handshake)
+    - Master auto-closes after 10 minutes of inactivity
+    - Reduces per-command latency from ~1.5s to ~50ms
     """
+
+    # Shared directory for all control sockets
+    _control_dir: Optional[Path] = None
+
+    @classmethod
+    def _get_control_dir(cls) -> Path:
+        """Get or create the shared control socket directory.
+
+        Uses /tmp/fda_ssh/ instead of tempfile.mkdtemp() because macOS
+        Unix domain sockets have a 104-char path limit, and the default
+        temp dir (/var/folders/…) is too long.
+        """
+        if cls._control_dir is None:
+            cls._control_dir = Path("/tmp/fda_ssh")
+            cls._control_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            logger.debug(f"SSH control socket dir: {cls._control_dir}")
+        return cls._control_dir
 
     def __init__(
         self,
         host: str,
         user: str,
-        ssh_key: str,
+        ssh_key: str = "",
         port: int = 22,
         connect_timeout: int = 10,
     ):
@@ -59,27 +87,69 @@ class SSHManager:
         Args:
             host: Remote hostname or IP.
             user: SSH username.
-            ssh_key: Path to SSH private key file.
+            ssh_key: Path to SSH private key file. Empty string for password auth.
             port: SSH port (default 22).
             connect_timeout: Connection timeout in seconds.
         """
         self.host = host
         self.user = user
-        self.ssh_key = Path(ssh_key).expanduser()
+        self.ssh_key = Path(ssh_key).expanduser() if ssh_key else None
         self.port = port
         self.connect_timeout = connect_timeout
 
+        # ControlMaster socket path — must be short for macOS 104-char limit
+        # Use a short hash of user@host:port to keep the path under ~30 chars
+        control_dir = self._get_control_dir()
+        sock_id = hashlib.md5(f"{user}@{host}:{port}".encode()).hexdigest()[:12]
+        self._control_path = control_dir / sock_id
+        self._master_started = False
+
     def _ssh_base_args(self) -> list[str]:
-        """Build base SSH command arguments."""
-        return [
+        """Build base SSH command arguments with ControlMaster support."""
+        args = [
             "ssh",
-            "-i", str(self.ssh_key),
             "-p", str(self.port),
             "-o", "StrictHostKeyChecking=accept-new",
             "-o", f"ConnectTimeout={self.connect_timeout}",
-            "-o", "BatchMode=yes",  # Never prompt for password
-            f"{self.user}@{self.host}",
+            # ControlMaster: reuse existing connection or start one
+            "-o", f"ControlPath={self._control_path}",
         ]
+
+        # If master is already running, just attach to it
+        if self._master_started and self._control_path.exists():
+            args.extend(["-o", "ControlMaster=no"])
+        else:
+            # Auto-start master if not running; persist for 10 min idle
+            args.extend(["-o", "ControlMaster=auto"])
+            args.extend(["-o", "ControlPersist=600"])
+
+        if self.ssh_key:
+            args.extend(["-i", str(self.ssh_key)])
+            args.extend(["-o", "BatchMode=yes"])
+        # When no key is provided, SSH will use the default agent/keychain
+        # or prompt for password (interactive). For automated use, ensure
+        # ssh-agent has the key loaded or use ~/.ssh/config PasswordAuthentication.
+        args.append(f"{self.user}@{self.host}")
+        return args
+
+    def close_master(self) -> None:
+        """Explicitly close the ControlMaster connection."""
+        if self._control_path.exists():
+            try:
+                subprocess.run(
+                    [
+                        "ssh",
+                        "-o", f"ControlPath={self._control_path}",
+                        "-O", "exit",
+                        f"{self.user}@{self.host}",
+                    ],
+                    capture_output=True,
+                    timeout=5,
+                )
+                logger.debug(f"Closed SSH master for {self.user}@{self.host}")
+            except Exception as e:
+                logger.debug(f"Error closing SSH master: {e}")
+            self._master_started = False
 
     def execute(
         self,
@@ -112,6 +182,11 @@ class SSHManager:
                 text=True,
                 timeout=timeout,
             )
+
+            # Track that master is now running (first successful command starts it)
+            if result.returncode == 0 and not self._master_started:
+                self._master_started = True
+                logger.debug(f"SSH ControlMaster established for {self.user}@{self.host}")
 
             ssh_result = SSHResult(
                 stdout=result.stdout,
@@ -278,9 +353,26 @@ class SSHManager:
 
         return info
 
+    def warmup(self) -> bool:
+        """Establish the ControlMaster connection proactively.
+
+        Call this at startup so the first real command doesn't pay the
+        ~1.5s TCP+SSH handshake cost. Subsequent commands via the same
+        SSHManager reuse the master connection (~50ms).
+
+        Returns:
+            True if the master connection was established.
+        """
+        if self._master_started and self._control_path.exists():
+            return True
+        result = self.execute("true", timeout=15)
+        return result.success
+
     def test_connection(self) -> bool:
         """
         Test SSH connectivity to the remote host.
+
+        Also warms up the ControlMaster connection.
 
         Returns:
             True if the connection succeeds.

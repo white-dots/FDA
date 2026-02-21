@@ -72,6 +72,8 @@ class VoiceStreamSink(_PycordSink):
             super().__init__(filters=None)
         self.agent = agent
         self.loop = loop
+        self._write_count = 0
+        self._last_log_count = 0
 
     def write(self, data: Any, user: Any) -> None:
         """Called by py-cord when audio data is received from a user.
@@ -89,9 +91,25 @@ class VoiceStreamSink(_PycordSink):
             # Convert PCM data to bytes
             pcm_data = data.pcm if hasattr(data, 'pcm') else bytes(data)
 
+            self._write_count += 1
+            # Log periodically to confirm audio is flowing
+            if self._write_count <= 3 or (self._write_count % 500 == 0):
+                session = self.agent._realtime_session
+                connected = session.connected if session else False
+                logger.info(
+                    f"[VoiceStreamSink] write #{self._write_count}: "
+                    f"{len(pcm_data)} bytes from {user}, "
+                    f"session={session is not None}, connected={connected}"
+                )
+
             # Stream to Realtime API (handles resampling internally)
             if self.agent._realtime_session and self.agent._realtime_session.connected:
                 self.agent._realtime_session.send_audio(pcm_data)
+            elif self._write_count <= 5:
+                logger.warning(
+                    f"[VoiceStreamSink] Audio received but no active session! "
+                    f"session={self.agent._realtime_session is not None}"
+                )
 
         except Exception as e:
             logger.error(f"[VoiceStreamSink] Error in write(): {e}", exc_info=True)
@@ -266,6 +284,7 @@ REALTIME_VOICE_INSTRUCTIONS = """You are FDA (Facilitating Director Agent), a pe
 - John works on SmartStore (Naver Commerce API integration), Wholesum, and other projects
 - He manages a team and is interested in cold outreach, B2C/B2B sales, ad analytics, LinkedIn
 - Technical terms he uses: Python, backend, frontend, deploy, production, Datacore, SmartStore, aonebnh, sofsys
+- You have SSH access to client VMs and can analyze their codebases on demand
 
 ## Language & Pronunciation
 - Always respond in English
@@ -277,8 +296,14 @@ REALTIME_VOICE_INSTRUCTIONS = """You are FDA (Facilitating Director Agent), a pe
 - Never produce background sounds, music, or sound effects
 - Never switch language unless explicitly asked
 - If unsure about what the user is asking, ask a brief clarifying question
-- For complex questions that require file search or command execution, acknowledge that you would need to check and provide what you know
 - When greeted (just "hey" or "hi"), respond warmly: "Hey John, how can I help?"
+
+## Code Analysis
+- When the user asks about code, codebases, DAGs, pipelines, scripts, inventory, or anything related to client systems, USE the analyze_code function
+- Examples that should trigger analyze_code: "what does the inventory DAG do?", "check the sell_in pipeline", "look at the airflow scripts", "are there any errors in the codebase?", "what brands are configured?"
+- IMPORTANT: ALWAYS speak a brief acknowledgment BEFORE calling the function. Say something like "Let me SSH in and check that for you" or "One sec, let me look at that on the VM" first, THEN call analyze_code. The function takes 15-30 seconds so the user needs to hear you're working on it.
+- After getting results, summarize the key findings in 2-3 spoken sentences
+- If the analysis is long, give a brief spoken summary and mention the full details are in the text channel
 
 ## Response Style
 - For quick questions: 1-2 sentences
@@ -286,6 +311,43 @@ REALTIME_VOICE_INSTRUCTIONS = """You are FDA (Facilitating Director Agent), a pe
 - Never give lists longer than 3 items in voice (suggest text for longer lists)
 - Use natural conversational fillers when needed ("Let me think about that...", "Good question...")
 """
+
+# Tool definitions for the OpenAI Realtime API function calling
+REALTIME_TOOLS = [
+    {
+        "type": "function",
+        "name": "analyze_code",
+        "description": (
+            "Analyze client code on a remote VM via SSH. Use this when the user asks about "
+            "codebases, DAGs, pipelines, scripts, database queries, inventory systems, "
+            "or any technical aspect of client systems. The function SSHs into the client VM, "
+            "reads relevant files, and returns an analysis."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "request": {
+                    "type": "string",
+                    "description": (
+                        "What to analyze or look for. Be specific. Examples: "
+                        "'what does the inventory DAG do?', "
+                        "'check sell_in pipeline for errors', "
+                        "'list all configured brands', "
+                        "'explain the edi directory structure'"
+                    ),
+                },
+                "client_id": {
+                    "type": "string",
+                    "description": (
+                        "Client ID to analyze. Defaults to 'aonebnh' if not specified. "
+                        "Only provide if the user mentions a specific client."
+                    ),
+                },
+            },
+            "required": ["request"],
+        },
+    },
+]
 
 
 class DiscordVoiceAgent(BaseAgent):
@@ -306,6 +368,10 @@ class DiscordVoiceAgent(BaseAgent):
         openai_api_key: Optional[str] = None,
         project_state_path: Optional[Path] = None,
         fda_agent: Optional[Any] = None,
+        worker: Optional[Any] = None,
+        local_task_dispatch: Optional[Any] = None,
+        remote_task_dispatch: Optional[Any] = None,
+        approval_manager: Optional[Any] = None,
     ):
         """
         Initialize the Discord Voice Agent.
@@ -318,6 +384,13 @@ class DiscordVoiceAgent(BaseAgent):
             project_state_path: Path to the project state database.
             fda_agent: Optional FDAAgent instance for full delegation support.
                       If not provided, one will be created automatically.
+            worker: Optional WorkerAgent instance for direct code analysis
+                   via SSH to client VMs.
+            local_task_dispatch: Optional callback(task_brief, project_path) -> result dict
+                               for dispatching tasks to the local worker agent.
+            remote_task_dispatch: Optional callback(task_brief, client_id, progress_callback) -> result dict
+                                for dispatching tasks to the remote worker agent (SSH into VMs).
+            approval_manager: Optional ApprovalManager for approve/reject commands.
         """
         super().__init__(
             name="DiscordBot",
@@ -368,6 +441,18 @@ class DiscordVoiceAgent(BaseAgent):
 
         # Voice listening state
         self._listening_enabled = True  # Enable voice listening by default
+
+        # Worker agent for direct code analysis via SSH
+        self._worker = worker
+
+        # Local worker dispatch callback (from orchestrator)
+        self._local_task_dispatch = local_task_dispatch
+
+        # Remote worker dispatch callback (from orchestrator — SSH into VMs)
+        self._remote_task_dispatch = remote_task_dispatch
+
+        # Approval manager for approve/reject commands
+        self._approval_manager = approval_manager
 
         # Use the state DB for conversation history (persists all day)
         # The FDA agent's state DB is preferred since it feeds into the journal
@@ -505,6 +590,41 @@ class DiscordVoiceAgent(BaseAgent):
         async def show_peers(ctx):
             """Show peer agent status."""
             await self._cmd_peers(ctx)
+
+        @self._bot.command(name="analyze")
+        async def analyze_code(ctx, *, request: str = None):
+            """Analyze client code via SSH to the VM. Usage: !analyze <what to look at>"""
+            await self._cmd_analyze(ctx, request)
+
+        @self._bot.command(name="local")
+        async def local_task(ctx, *, task: str = None):
+            """Run a task on the local codebase. Usage: !local <task description>"""
+            await self._cmd_local(ctx, task)
+
+        @self._bot.command(name="remote")
+        async def remote_task(ctx, *, task: str = None):
+            """Run a task on a remote VM via SSH. Usage: !remote <task description>"""
+            await self._cmd_remote(ctx, task)
+
+        @self._bot.command(name="approve")
+        async def approve_change(ctx, short_id: str = None):
+            """Approve a pending code change. Usage: !approve <id>"""
+            await self._cmd_approve(ctx, short_id)
+
+        @self._bot.command(name="reject")
+        async def reject_change(ctx, short_id: str = None, *, reason: str = "No reason given"):
+            """Reject a pending code change. Usage: !reject <id> [reason]"""
+            await self._cmd_reject(ctx, short_id, reason)
+
+        @self._bot.command(name="pending")
+        async def list_pending(ctx):
+            """List pending approvals. Usage: !pending"""
+            await self._cmd_pending(ctx)
+
+        @self._bot.command(name="details")
+        async def show_details(ctx, short_id: str = None):
+            """Show full diff for a pending approval. Usage: !details <id>"""
+            await self._cmd_details(ctx, short_id)
 
         @self._bot.command(name="listen")
         async def toggle_listen(ctx, action: str = None):
@@ -716,7 +836,7 @@ class DiscordVoiceAgent(BaseAgent):
             logger.info(f"[DiscordBot] Joined voice channel: {channel.name}")
 
         except Exception as e:
-            logger.error(f"[DiscordBot] Failed to join voice: {e}")
+            logger.error(f"[DiscordBot] Failed to join voice: {e}", exc_info=True)
             await ctx.send(f"Failed to join voice channel: {e}")
 
     async def _cmd_leave(self, ctx: Any) -> None:
@@ -862,6 +982,17 @@ No wake word needed — powered by OpenAI Realtime API for low-latency conversat
 **Meeting Mode:**
 `!meeting start` - Start meeting mode (transcribe everything)
 `!meeting end` - End meeting and get summary
+
+**Code Tasks:**
+`!analyze <request>` - Analyze client code on remote VM (via SSH)
+`!remote <task>` - Dispatch task to remote worker (SSH into VM) → approval flow
+`!local <task>` - Analyze & fix local codebase (FDA, etc.) → approval flow
+
+**Approvals:**
+`!approve <id>` - Approve a pending code change
+`!reject <id> [reason]` - Reject a pending code change
+`!pending` - List pending approvals
+`!details <id>` - Show full diff for a pending approval
 
 **Peer Agents:**
 `!search <query>` - Search files (via Librarian)
@@ -1059,6 +1190,315 @@ No wake word needed — powered by OpenAI Realtime API for low-latency conversat
 
         await ctx.send("\n".join(lines))
 
+    async def _cmd_analyze(self, ctx: Any, request: Optional[str]) -> None:
+        """Handle !analyze command — trigger Worker agent to SSH into VM and analyze code."""
+        if not request:
+            await ctx.send(
+                "Please describe what to analyze.\n"
+                "Example: `!analyze what does the inventory DAG do?`\n"
+                "Example: `!analyze check the sell_in pipeline for errors`"
+            )
+            return
+
+        if not self._worker:
+            await ctx.send("⚠️ Worker agent not available. Start FDA with `fda start`.")
+            return
+
+        # Get the first available client (for now, default to first configured)
+        clients = self._worker.client_manager.list_clients()
+        if not clients:
+            await ctx.send("⚠️ No clients configured. Add a YAML config in `fda/clients/configs/`.")
+            return
+
+        client = clients[0]
+        await ctx.send(
+            f"🔍 Analyzing **{client.name}** codebase on `{client.vm.host}`...\n"
+            f"Request: *{request}*\n"
+            f"This may take a moment (SSH + Claude analysis)."
+        )
+
+        try:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None,
+                self._worker.analyze_and_fix,
+                client.client_id,
+                request,
+                None,  # hint_files
+            )
+
+            if result.get("success"):
+                analysis = result.get("analysis", "No analysis available")
+                explanation = result.get("explanation", "")
+                diff = result.get("diff", "")
+
+                response = f"**Analysis for {client.name}**\n\n"
+                if explanation:
+                    response += f"{explanation}\n\n"
+                if analysis and analysis != explanation:
+                    response += f"**Details:**\n{analysis[:1000]}\n\n"
+                if diff:
+                    response += f"**Suggested changes:**\n```diff\n{diff[:800]}\n```"
+
+                # Split long responses
+                if len(response) > 2000:
+                    for i in range(0, len(response), 1900):
+                        await ctx.send(response[i:i+1900])
+                else:
+                    await ctx.send(response)
+            else:
+                error = result.get("error", "Unknown error")
+                analysis = result.get("analysis", "")
+                msg = f"⚠️ Analysis could not complete: {error}"
+                if analysis:
+                    msg += f"\n\n**Partial analysis:**\n{analysis[:1500]}"
+                await ctx.send(msg)
+
+        except Exception as e:
+            logger.error(f"[DiscordBot] Analyze command failed: {e}")
+            await ctx.send(f"❌ Error during analysis: {e}")
+
+    async def _cmd_local(self, ctx: Any, task: Optional[str]) -> None:
+        """Handle !local command — dispatch a task to the local worker agent."""
+        if not task:
+            await ctx.send(
+                "Please describe the task.\n"
+                "Example: `!local fix the health endpoint`\n"
+                "Example: `!local add logging to config.py`\n"
+                "Example: `!local refactor the journal writer`"
+            )
+            return
+
+        if not self._local_task_dispatch:
+            await ctx.send("⚠️ Local task dispatch not available. Start FDA with `fda start`.")
+            return
+
+        await ctx.send(
+            f"🏠 Analyzing local codebase...\n"
+            f"**Task:** {task}\n"
+            "This may take a moment (file scan + Claude analysis)."
+        )
+
+        try:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None, self._local_task_dispatch, task, None
+            )
+
+            if result.get("success"):
+                files = ", ".join(result.get("files", []))
+                response = (
+                    f"✅ Analysis complete! Approval queued.\n\n"
+                    f"**What changed:** {result.get('explanation', '')[:500]}\n"
+                    f"**Files:** {files}\n"
+                    f"**Approval ID:** `{result.get('approval_id', '?')}`\n\n"
+                    "Check Telegram for the approval request."
+                )
+                diff = result.get("diff", "")
+                if diff:
+                    diff_preview = diff[:800]
+                    response += f"\n```diff\n{diff_preview}\n```"
+
+                # Split long responses (Discord 2000 char limit)
+                if len(response) > 2000:
+                    for i in range(0, len(response), 1900):
+                        await ctx.send(response[i:i+1900])
+                else:
+                    await ctx.send(response)
+            else:
+                error = result.get("error", "Unknown error")
+                analysis = result.get("analysis", "")
+                msg = f"❌ Failed to generate fix: {error}"
+                if analysis:
+                    msg += f"\n\n**Partial analysis:**\n{analysis[:1000]}"
+                await ctx.send(msg[:2000])
+
+        except Exception as e:
+            logger.error(f"[DiscordBot] Local task command failed: {e}")
+            await ctx.send(f"❌ Error during local analysis: {e}")
+
+    async def _cmd_remote(self, ctx: Any, task: Optional[str]) -> None:
+        """Handle !remote command — dispatch a task to the remote worker agent (SSH into VMs)."""
+        if not task:
+            await ctx.send(
+                "Please describe the task.\n"
+                "Example: `!remote check if Amazon SES is configured`\n"
+                "Example: `!remote what services are running on the VM`\n"
+                "Example: `!remote fix the inventory DAG date filter`"
+            )
+            return
+
+        if not self._remote_task_dispatch:
+            await ctx.send("⚠️ Remote task dispatch not available. Start FDA with `fda start`.")
+            return
+
+        await ctx.send(
+            f"🌐 Dispatching to remote worker agent (SSH into VM)...\n"
+            f"**Task:** {task}\n"
+            "This may take a moment (SSH + file scan + Claude analysis)."
+        )
+
+        try:
+            loop = asyncio.get_event_loop()
+
+            # Progress callback: send intermediate status to Discord
+            async def _send_progress(msg: str):
+                try:
+                    await ctx.send(f"⚙️ {msg}")
+                except Exception:
+                    pass
+
+            def progress_callback(msg: str):
+                try:
+                    asyncio.run_coroutine_threadsafe(_send_progress(msg), loop)
+                except Exception:
+                    pass
+
+            result = await loop.run_in_executor(
+                None, self._remote_task_dispatch, task, None, progress_callback
+            )
+
+            if result.get("success"):
+                # Investigation result (no code changes)
+                if result.get("investigation"):
+                    analysis = result.get("analysis") or result.get("explanation", "")
+                    response = f"🔍 **Investigation Result:**\n\n{analysis[:1800]}"
+                    if len(response) > 2000:
+                        for i in range(0, len(response), 1900):
+                            await ctx.send(response[i:i+1900])
+                    else:
+                        await ctx.send(response)
+                    return
+
+                # Code change — approval queued
+                files = ", ".join(result.get("files", []))
+                response = (
+                    f"✅ Analysis complete! Approval queued.\n\n"
+                    f"**What changed:** {result.get('explanation', '')[:500]}\n"
+                    f"**Files:** {files}\n"
+                    f"**Approval ID:** `{result.get('approval_id', '?')}`\n\n"
+                    "Use `!approve <id>` or `!reject <id>` to decide."
+                )
+                diff = result.get("diff", "")
+                if diff:
+                    response += f"\n```diff\n{diff[:800]}\n```"
+
+                if len(response) > 2000:
+                    for i in range(0, len(response), 1900):
+                        await ctx.send(response[i:i+1900])
+                else:
+                    await ctx.send(response)
+            else:
+                error = result.get("error", "Unknown error")
+                analysis = result.get("analysis", "")
+                msg = f"❌ Remote task failed: {error}"
+                if analysis:
+                    msg += f"\n\n**Partial analysis:**\n{analysis[:1000]}"
+                await ctx.send(msg[:2000])
+
+        except Exception as e:
+            logger.error(f"[DiscordBot] Remote task command failed: {e}")
+            await ctx.send(f"❌ Error during remote analysis: {e}")
+
+    async def _cmd_approve(self, ctx: Any, short_id: Optional[str]) -> None:
+        """Handle !approve <short_id> command."""
+        if not self._approval_manager:
+            await ctx.send("⚠️ Approval system not available.")
+            return
+
+        if not short_id:
+            await ctx.send("Usage: `!approve <id>`\nUse `!pending` to see pending approvals.")
+            return
+
+        approval = await self._approval_manager.approve(short_id)
+
+        if approval:
+            files = ", ".join(approval.file_changes.keys())
+            await ctx.send(
+                f"✅ **Approved!** Deploying changes to {approval.client_name}...\n"
+                f"**Files:** {files}\n\n"
+                "I'll notify you when deployment is complete."
+            )
+        else:
+            await ctx.send(f"❌ No pending approval found with ID: `{short_id}`\nUse `!pending` to see current approvals.")
+
+    async def _cmd_reject(self, ctx: Any, short_id: Optional[str], reason: str = "No reason given") -> None:
+        """Handle !reject <short_id> [reason] command."""
+        if not self._approval_manager:
+            await ctx.send("⚠️ Approval system not available.")
+            return
+
+        if not short_id:
+            await ctx.send("Usage: `!reject <id> [reason]`")
+            return
+
+        approval = await self._approval_manager.reject(short_id, reason)
+
+        if approval:
+            await ctx.send(f"🚫 **Rejected** change for {approval.client_name}.\n**Reason:** {reason}")
+        else:
+            await ctx.send(f"❌ No pending approval found with ID: `{short_id}`")
+
+    async def _cmd_pending(self, ctx: Any) -> None:
+        """Handle !pending — list all pending approvals."""
+        if not self._approval_manager:
+            await ctx.send("⚠️ Approval system not available.")
+            return
+
+        pending = self._approval_manager.list_pending()
+
+        if not pending:
+            await ctx.send("No pending approvals.")
+            return
+
+        lines = [f"📋 **Pending approvals ({len(pending)}):**\n"]
+        for approval in pending:
+            lines.append(
+                f"  `{approval.short_id}` — {approval.client_name}: "
+                f"{approval.task_brief[:80]}..."
+            )
+        lines.append("\nUse `!approve <id>` or `!reject <id> [reason]`")
+
+        await ctx.send("\n".join(lines))
+
+    async def _cmd_details(self, ctx: Any, short_id: Optional[str]) -> None:
+        """Handle !details <short_id> — show full diff."""
+        if not self._approval_manager:
+            await ctx.send("⚠️ Approval system not available.")
+            return
+
+        if not short_id:
+            await ctx.send("Usage: `!details <id>`")
+            return
+
+        approval = self._approval_manager.get_pending(short_id)
+
+        if not approval:
+            await ctx.send(f"❌ No pending approval found with ID: `{short_id}`")
+            return
+
+        files_str = "\n".join(f"  - {f}" for f in approval.file_changes.keys())
+        response = (
+            f"📋 **Details for {approval.client_name}** (`{approval.short_id}`)\n\n"
+            f"**Task:** {approval.task_brief}\n\n"
+            f"**What changed:** {approval.explanation}\n\n"
+            f"**Files:**\n{files_str}\n"
+            f"**Confidence:** {approval.confidence}\n"
+        )
+
+        if approval.warnings:
+            response += "\n**Warnings:**\n" + "\n".join(f"  - {w}" for w in approval.warnings) + "\n"
+
+        if approval.diff:
+            diff_preview = approval.diff[:1200]
+            response += f"\n```diff\n{diff_preview}\n```"
+
+        if len(response) > 2000:
+            for i in range(0, len(response), 1900):
+                await ctx.send(response[i:i + 1900])
+        else:
+            await ctx.send(response)
+
     def _answer_question_voice(self, question: str, conversation_history: list[dict[str, str]] = None) -> str:
         """Fast voice-optimized answer — single LLM call, no delegation chain.
 
@@ -1105,19 +1545,360 @@ No wake word needed — powered by OpenAI Realtime API for low-latency conversat
             logger.error(f"[DiscordBot] Voice answer failed: {e}")
             return "Sorry, I had trouble with that. Could you try again?"
 
-    def _answer_question(self, question: str, conversation_history: list[dict[str, str]] = None) -> str:
-        """Answer a question using FDAAgent's full delegation pipeline.
+    # ------------------------------------------------------------------
+    # Agentic tool-use for text mode (same pattern as Telegram/Slack)
+    # ------------------------------------------------------------------
 
-        Delegates to FDAAgent.ask() which handles routing to:
-        - Librarian (file search, knowledge queries)
-        - Executor (command execution, Claude Code)
-        - Direct API response (simple questions)
+    _FDA_TOOLS: list[dict[str, Any]] = [
+        {
+            "name": "search_journal",
+            "description": "Search the user's journal and notes for relevant entries.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query text"},
+                    "top_n": {"type": "integer", "description": "Number of results (default 5)", "default": 5},
+                },
+                "required": ["query"],
+            },
+        },
+        {
+            "name": "read_kakao_chat",
+            "description": "Read KakaoTalk chat messages.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "date_hint": {"type": "string", "description": "Date reference like 'yesterday', 'today', 'last 3 days'."},
+                },
+                "required": [],
+            },
+        },
+        {
+            "name": "get_tasks",
+            "description": "Get the user's task list.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string", "description": "Filter by status: 'pending', 'in_progress', 'completed', 'blocked'."},
+                },
+                "required": [],
+            },
+        },
+        {
+            "name": "get_alerts",
+            "description": "Get unacknowledged alerts and reminders.",
+            "input_schema": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+        {
+            "name": "get_calendar_events",
+            "description": "Get calendar events for a date.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "date": {"type": "string", "description": "Date in YYYY-MM-DD or 'today'/'tomorrow'."},
+                },
+                "required": [],
+            },
+        },
+        {
+            "name": "run_remote_task",
+            "description": "Dispatch a task to the remote worker agent that SSHes into client VMs. Use when the user asks about their server, VM, deployed code, remote services, or wants to check/verify something on a client's remote machine.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "task": {"type": "string", "description": "Natural language description of the task to perform on the remote VM."},
+                    "client_id": {"type": "string", "description": "Optional client identifier (e.g., 'aonebnh')."},
+                },
+                "required": ["task"],
+            },
+        },
+        {
+            "name": "run_local_task",
+            "description": "Dispatch a task to the local worker agent that operates on the Mac Mini filesystem. Use for tasks on the local FDA codebase or other local projects.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "task": {"type": "string", "description": "Natural language description of the task to perform locally."},
+                    "project_path": {"type": "string", "description": "Optional local project directory path."},
+                },
+                "required": ["task"],
+            },
+        },
+    ]
+
+    _KAKAO_EXPORT_DIR = Path.home() / "Documents" / "fda-exports" / "kakaotalk"
+
+    def _get_kakao_messages(self, question: str) -> str:
+        """Read KakaoTalk export and return messages filtered by date."""
+        import re as _re
+        from fda.kakaotalk.parser import KakaoTalkParser
+        from datetime import timedelta
+
+        export_dir = self._KAKAO_EXPORT_DIR
+        if not export_dir.exists():
+            return "(No KakaoTalk exports found)"
+
+        candidates = list(export_dir.glob("*.csv")) + list(export_dir.glob("*.txt"))
+        if not candidates:
+            return "(No KakaoTalk export files found)"
+
+        latest = max(candidates, key=lambda p: p.stat().st_mtime)
+
+        # Parse date hint
+        q = question.lower()
+        now = datetime.now()
+        since = None
+
+        if "yesterday" in q or "어제" in q:
+            since = (now - timedelta(days=1)).replace(hour=0, minute=0, second=0)
+        elif "today" in q or "오늘" in q:
+            since = now.replace(hour=0, minute=0, second=0)
+        elif "this week" in q or "이번 주" in q or "이번주" in q:
+            since = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0)
+        elif "last week" in q or "지난 주" in q or "지난주" in q:
+            since = (now - timedelta(days=now.weekday() + 7)).replace(hour=0, minute=0, second=0)
+        else:
+            m = _re.search(r"last\s+(\d+)\s+days?", q)
+            if m:
+                since = (now - timedelta(days=int(m.group(1)))).replace(hour=0, minute=0, second=0)
+            else:
+                m = _re.search(r"(\d{4})-(\d{1,2})-(\d{1,2})", q)
+                if m:
+                    try:
+                        since = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+                    except ValueError:
+                        pass
+
+        if not since:
+            since = now - timedelta(days=1)
+
+        parser = KakaoTalkParser()
+        messages = parser.parse_and_diff(latest, since)
+
+        if not messages:
+            date_str = since.strftime("%Y-%m-%d")
+            return f"(No KakaoTalk messages found since {date_str})"
+
+        lines = []
+        for msg in messages[-50:]:
+            ts = msg.timestamp.strftime("%m/%d %H:%M")
+            lines.append(f"[{ts}] {msg.sender}: {msg.text}")
+
+        header = f"KakaoTalk messages ({len(messages)} total, showing last {len(lines)}):"
+        return header + "\n" + "\n".join(lines)
+
+    def _execute_tool(self, tool_name: str, tool_input: dict[str, Any]) -> str:
+        """Execute an FDA tool and return the result as a string."""
+        try:
+            if tool_name == "search_journal":
+                query = tool_input.get("query", "")
+                top_n = tool_input.get("top_n", 5)
+                entries = self.journal_retriever.retrieve_with_content(
+                    query_text=query, top_n=top_n
+                )
+                if not entries:
+                    return "No journal entries found."
+                results = [
+                    {
+                        "summary": e.get("summary", ""),
+                        "date": e.get("created_at", "")[:10],
+                        "tags": e.get("tags", []),
+                        "content": (e.get("content") or "")[:500],
+                    }
+                    for e in entries
+                ]
+                return json.dumps(results, ensure_ascii=False, default=str)
+
+            elif tool_name == "read_kakao_chat":
+                date_hint = tool_input.get("date_hint", "last 24 hours")
+                return self._get_kakao_messages(date_hint)
+
+            elif tool_name == "get_tasks":
+                status = tool_input.get("status")
+                tasks = self.state.get_tasks(status=status)
+                if not tasks:
+                    return "No tasks found." if not status else f"No tasks with status '{status}'."
+                results = [
+                    {
+                        "id": t.get("id"),
+                        "title": t.get("title"),
+                        "status": t.get("status"),
+                        "priority": t.get("priority"),
+                        "owner": t.get("owner"),
+                        "description": (t.get("description") or "")[:200],
+                    }
+                    for t in tasks[:15]
+                ]
+                return json.dumps(results, ensure_ascii=False, default=str)
+
+            elif tool_name == "get_alerts":
+                alerts = self.state.get_alerts(acknowledged=False)
+                if not alerts:
+                    return "No unacknowledged alerts."
+                results = [
+                    {
+                        "level": a.get("level"),
+                        "message": a.get("message"),
+                        "source": a.get("source"),
+                        "created_at": a.get("created_at", "")[:16],
+                    }
+                    for a in alerts
+                ]
+                return json.dumps(results, ensure_ascii=False, default=str)
+
+            elif tool_name == "get_calendar_events":
+                date_str = tool_input.get("date", "today")
+                try:
+                    from fda.outlook import OutlookCalendar
+                    from datetime import timedelta
+                    cal = OutlookCalendar()
+                    if not cal.access_token:
+                        return "Calendar not connected."
+                    if date_str == "today":
+                        target = datetime.now().date()
+                    elif date_str == "tomorrow":
+                        target = (datetime.now() + timedelta(days=1)).date()
+                    else:
+                        target = datetime.strptime(date_str, "%Y-%m-%d").date()
+                    start = datetime.combine(target, datetime.min.time())
+                    end = datetime.combine(target, datetime.max.time())
+                    events = cal.get_events_range(start=start, end=end)
+                    if not events:
+                        return f"No calendar events on {target.isoformat()}."
+                    results = [
+                        {
+                            "subject": ev.get("subject"),
+                            "start": ev.get("start", {}).get("dateTime", "")[:16],
+                            "end": ev.get("end", {}).get("dateTime", "")[:16],
+                            "location": ev.get("location", {}).get("displayName", ""),
+                        }
+                        for ev in events
+                    ]
+                    return json.dumps(results, ensure_ascii=False, default=str)
+                except ImportError:
+                    return "Calendar module not available."
+                except Exception as e:
+                    return f"Calendar error: {e}"
+
+            elif tool_name in ("run_remote_task", "run_local_task"):
+                task = tool_input.get("task", "")
+                is_remote = tool_name == "run_remote_task"
+
+                if is_remote:
+                    dispatch = self._remote_task_dispatch
+                    dispatch_label = "Remote worker"
+                else:
+                    dispatch = self._local_task_dispatch
+                    dispatch_label = "Local worker"
+
+                if not dispatch:
+                    return f"{dispatch_label} dispatch not available."
+                try:
+                    if is_remote:
+                        client_id = tool_input.get("client_id")
+                        result = dispatch(task, client_id)
+                    else:
+                        project_path = tool_input.get("project_path")
+                        result = dispatch(task, project_path)
+
+                    if result.get("success"):
+                        if result.get("investigation"):
+                            analysis = result.get("analysis") or result.get("explanation", "")
+                            return analysis[:3000] if analysis else "Investigation complete — no issues found."
+
+                        parts = []
+                        if result.get("explanation"):
+                            parts.append(f"Explanation: {result['explanation']}")
+                        if result.get("files"):
+                            parts.append(f"Files affected: {', '.join(result['files'])}")
+                        if result.get("diff"):
+                            parts.append(f"Diff:\n{result['diff'][:1500]}")
+                        if result.get("approval_id"):
+                            parts.append(f"Approval ID: {result['approval_id']} (use !approve or !reject)")
+                        return "\n\n".join(parts) if parts else "Task completed successfully."
+                    else:
+                        error = result.get("error", "Unknown error")
+                        analysis = result.get("analysis", "")
+                        msg = f"{dispatch_label} task failed: {error}"
+                        if analysis:
+                            msg += f"\n\nAnalysis:\n{analysis[:1000]}"
+                        return msg
+                except Exception as e:
+                    return f"Error dispatching {dispatch_label.lower()} task: {e}"
+
+            else:
+                return f"Unknown tool: {tool_name}"
+
+        except Exception as e:
+            logger.error(f"[DiscordBot] Tool {tool_name} error: {e}")
+            return f"Error executing {tool_name}: {e}"
+
+    def _answer_with_tools(self, question: str, conversation_history: list[dict[str, str]] = None) -> str:
+        """Answer using the API backend's agentic tool-use loop.
+
+        Sends the question with tool definitions and lets Claude decide
+        which data sources to consult (including worker agents).
+        """
+        user_name = self.state.get_context("user_name") or "the user"
+        today = datetime.now().strftime("%Y-%m-%d (%A)")
+
+        system = f"""You are FDA (Facilitating Director Agent), a personal AI assistant responding via Discord.
+
+Today is {today}. The user's name is {user_name}.
+
+You have tools to look up the user's data. Use them when you need information to answer the question — don't guess. If the user asks about chats, notes, tasks, calendar, alerts, remote VMs, or local code, call the appropriate tool first.
+
+Keep responses concise for Discord (under 1800 characters when possible).
+"""
+
+        messages: list[dict[str, Any]] = []
+        if conversation_history:
+            for msg in conversation_history[-5:]:
+                messages.append({
+                    "role": msg.get("role", "user"),
+                    "content": msg.get("content", "")[:300],
+                })
+
+        messages.append({"role": "user", "content": question})
+
+        return self.backend.complete_with_tools(
+            system=system,
+            messages=messages,
+            tools=self._FDA_TOOLS,
+            tool_executor=self._execute_tool,
+            model=self.model,
+            max_tokens=4096,
+            max_iterations=5,
+        )
+
+    def _answer_question(self, question: str, conversation_history: list[dict[str, str]] = None) -> str:
+        """Answer a question using the best available backend.
+
+        If the API backend is available (supports tool use), uses the
+        agentic approach where Claude calls tools as needed (including
+        worker agents for remote/local tasks).
+
+        Falls back to FDAAgent.ask() or direct chat_with_context.
 
         Args:
             question: The user's question.
             conversation_history: Recent conversation exchanges for context continuity.
         """
-        # Use FDAAgent for full peer delegation support
+        # Prefer agentic tool-use when Anthropic API backend is available
+        from fda.claude_backend import AnthropicAPIBackend
+
+        if isinstance(self.backend, AnthropicAPIBackend):
+            try:
+                return self._answer_with_tools(question, conversation_history)
+            except Exception as e:
+                logger.error(f"[DiscordBot] Tool-use answer failed: {e}")
+                # Fall through to FDAAgent
+
+        # Fallback: FDAAgent delegation pipeline
         if self._fda_agent is not None:
             try:
                 return self._fda_agent.ask(question, conversation_history=conversation_history)
@@ -1125,11 +1906,10 @@ No wake word needed — powered by OpenAI Realtime API for low-latency conversat
                 logger.error(f"[DiscordBot] FDAAgent.ask() failed: {e}")
                 # Fall through to local fallback
 
-        # Fallback: answer directly if FDAAgent is unavailable
+        # Final fallback: answer directly
         logger.warning("[DiscordBot] FDAAgent unavailable, answering directly")
         context = self.get_project_context()
 
-        # Search journal for relevant context
         relevant = self.search_journal(question, top_n=3)
         if relevant:
             context["relevant_history"] = [
@@ -1238,6 +2018,11 @@ Keep it concise but capture the important points."""
             if user_name:
                 instructions = instructions.replace("John", user_name)
 
+            # Build tool list — only include analyze_code if Worker is available
+            tools = []
+            if self._worker:
+                tools = REALTIME_TOOLS
+
             self._realtime_session = RealtimeVoiceSession(
                 api_key=self.openai_api_key,
                 on_audio_out=self._on_realtime_audio_out,
@@ -1245,11 +2030,19 @@ Keep it concise but capture the important points."""
                 on_transcript_out=self._on_realtime_transcript_out,
                 on_speech_started=self._on_realtime_speech_started,
                 on_response_done=self._on_realtime_response_done,
+                on_function_call=self._on_realtime_function_call,
                 on_error=self._on_realtime_error,
                 instructions=instructions,
+                tools=tools,
             )
 
+            logger.info("[DiscordBot] Connecting to OpenAI Realtime API...")
             await self._realtime_session.connect()
+            logger.info(
+                f"[DiscordBot] Realtime session connected: "
+                f"connected={self._realtime_session.connected}, "
+                f"tools={len(tools)}"
+            )
 
             # Inject recent conversation context so the AI knows what's been discussed
             channel_id = self._response_channel.id if self._response_channel else 0
@@ -1450,6 +2243,169 @@ Keep it concise but capture the important points."""
                 await self._response_channel.send(f"⚠️ Voice error: {error_msg[:200]}")
             except Exception:
                 pass
+
+    async def _on_realtime_function_call(self, call_id: str, fn_name: str, fn_args_json: str) -> None:
+        """Called when the Realtime API invokes a function (tool call).
+
+        Routes to the appropriate handler based on function name.
+        The result is submitted back to the Realtime session so it can
+        generate a spoken response incorporating the output.
+        """
+        import time as _time
+        t0 = _time.monotonic()
+
+        logger.info(f"[DiscordBot] Function call: {fn_name}({fn_args_json[:200]})")
+
+        # Post a status message to the text channel
+        if self._response_channel:
+            try:
+                await self._response_channel.send(f"🔧 *SSHing into VM — running {fn_name}...*")
+            except Exception:
+                pass
+
+        try:
+            args = json.loads(fn_args_json) if fn_args_json else {}
+        except json.JSONDecodeError:
+            args = {}
+
+        result = ""
+
+        if fn_name == "analyze_code":
+            result = await self._execute_analyze_code(args)
+        else:
+            result = f"Unknown function: {fn_name}"
+
+        elapsed = _time.monotonic() - t0
+        logger.info(f"[DiscordBot] Function {fn_name} completed in {elapsed:.1f}s")
+
+        # Submit result back to the Realtime API
+        if self._realtime_session and self._realtime_session.connected:
+            await self._realtime_session.submit_function_result(call_id, result)
+
+        # Also post the full result to the text channel
+        if self._response_channel and result:
+            try:
+                # Truncate for Discord message limit
+                text_result = f"**🔍 Analysis Result** ({elapsed:.0f}s):\n{result}"
+                if len(text_result) > 2000:
+                    for i in range(0, len(text_result), 1900):
+                        await self._response_channel.send(text_result[i:i+1900])
+                else:
+                    await self._response_channel.send(text_result)
+            except Exception as e:
+                logger.error(f"[DiscordBot] Failed to post function result: {e}")
+
+    async def _execute_analyze_code(self, args: dict) -> str:
+        """Execute the analyze_code function via the Worker agent.
+
+        SSHs into the client VM, reads relevant code, and returns analysis.
+        Streams live progress updates to the Discord text channel while running.
+
+        Args:
+            args: {"request": "...", "client_id": "..."}
+
+        Returns:
+            Analysis result as a string for the Realtime API to speak.
+        """
+        import queue as _queue
+
+        request = args.get("request", "")
+        client_id = args.get("client_id", "")
+
+        if not request:
+            return "No analysis request provided."
+
+        if not self._worker:
+            return "Worker agent is not available. Cannot SSH into the VM."
+
+        # Get client — default to first available if not specified
+        clients = self._worker.client_manager.list_clients()
+        if not clients:
+            return "No clients configured."
+
+        client = None
+        if client_id:
+            for c in clients:
+                if c.client_id == client_id:
+                    client = c
+                    break
+        if not client:
+            client = clients[0]
+
+        logger.info(f"[DiscordBot] analyze_code: '{request}' on {client.name} ({client.vm.host})")
+
+        # --- Thread-safe progress queue ---
+        progress_q: _queue.Queue[str | None] = _queue.Queue()
+
+        def progress_fn(msg: str) -> None:
+            """Called from Worker thread — puts progress into the queue."""
+            progress_q.put(msg)
+
+        async def _drain_progress() -> None:
+            """Async task that polls the queue and posts to Discord."""
+            while True:
+                try:
+                    msg = progress_q.get_nowait()
+                except _queue.Empty:
+                    await asyncio.sleep(0.3)
+                    continue
+
+                if msg is None:
+                    break  # Sentinel — worker is done
+
+                if self._response_channel:
+                    try:
+                        await self._response_channel.send(f"> {msg}")
+                    except Exception:
+                        pass
+
+        # --- Run Worker + progress drain concurrently ---
+        drain_task = asyncio.create_task(_drain_progress())
+
+        try:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None,
+                lambda: self._worker.analyze_and_fix(
+                    client_id=client.client_id,
+                    task_brief=request,
+                    hint_files=None,
+                    progress_callback=progress_fn,
+                ),
+            )
+        finally:
+            # Signal the drain task to stop and wait for it
+            progress_q.put(None)
+            await drain_task
+
+        # --- Format result ---
+        try:
+            if result.get("success"):
+                analysis = result.get("analysis", "")
+                explanation = result.get("explanation", "")
+                diff = result.get("diff", "")
+
+                # Build a concise result for the voice model to summarize
+                parts = []
+                if explanation:
+                    parts.append(explanation)
+                if analysis and analysis != explanation:
+                    # Trim analysis for token limits
+                    parts.append(analysis[:2000])
+                if diff:
+                    parts.append(f"Suggested changes:\n{diff[:500]}")
+
+                return "\n\n".join(parts) if parts else "Analysis completed but produced no output."
+            else:
+                error = result.get("error", "Unknown error")
+                analysis = result.get("analysis", "")
+                if analysis:
+                    return f"Partial analysis (encountered error: {error}):\n{analysis[:2000]}"
+                return f"Analysis failed: {error}"
+
+        except Exception as e:
+            logger.error(f"[DiscordBot] analyze_code failed: {e}", exc_info=True)
+            return f"Error during analysis: {str(e)}"
 
     async def _transcribe_audio_async(self, audio_data: bytes) -> str:
         """Transcribe audio using Whisper API (async wrapper)."""
@@ -1664,8 +2620,15 @@ Keep it concise but capture the important points."""
         Run the Discord bot event loop.
 
         This is the PRIMARY user interface for FDA.
+        Called from a daemon thread — must create its own asyncio event loop.
         """
         logger.info("[DiscordBot] Starting event loop (PRIMARY interface)...")
+
+        # Create an event loop for this thread (py-cord needs one to exist
+        # when instantiating commands.Bot — unlike discord.py which creates
+        # its own inside bot.run()).
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
 
         # Update agent status
         self.state.update_agent_status("discord", "running", "Discord bot starting")

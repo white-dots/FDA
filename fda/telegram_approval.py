@@ -33,6 +33,9 @@ class PendingApproval:
     confidence: str
     warnings: list[str]
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
+    # Local worker support (backward-compatible defaults)
+    project_path: Optional[str] = None
+    is_local: bool = False
 
     @property
     def short_id(self) -> str:
@@ -54,7 +57,15 @@ class PendingApproval:
 
         files_str = ", ".join(self.file_changes.keys())
 
-        return f"""🔧 *Code change for {self.client_name}*
+        # Distinguish local vs remote targets
+        if self.is_local:
+            from pathlib import Path
+            project_name = Path(self.project_path).name if self.project_path else "local"
+            target_label = f"🏠 LOCAL ({project_name})"
+        else:
+            target_label = self.client_name
+
+        return f"""🔧 *Code change for {target_label}*
 
 *Request:* {self.task_brief[:200]}
 
@@ -106,6 +117,8 @@ class ApprovalManager:
         file_changes: dict[str, str],
         confidence: str = "medium",
         warnings: Optional[list[str]] = None,
+        project_path: Optional[str] = None,
+        is_local: bool = False,
     ) -> PendingApproval:
         """
         Add a new pending approval.
@@ -119,6 +132,8 @@ class ApprovalManager:
             file_changes: Dict of filepath -> new content.
             confidence: Agent's confidence level.
             warnings: Any concerns.
+            project_path: Local project path (for local worker tasks).
+            is_local: Whether this is a local worker task.
 
         Returns:
             The created PendingApproval.
@@ -134,6 +149,8 @@ class ApprovalManager:
             file_changes=file_changes,
             confidence=confidence,
             warnings=warnings or [],
+            project_path=project_path,
+            is_local=is_local,
         )
 
         self._pending[approval_id] = approval
@@ -348,3 +365,67 @@ def register_approval_handlers(application: Any, approval_manager: ApprovalManag
     application.add_handler(CommandHandler("pause", handle_pause))
     application.add_handler(CommandHandler("resume", handle_resume))
     application.add_handler(CommandHandler("clients", handle_clients))
+
+
+def register_local_task_handler(
+    application: Any,
+    dispatch_fn: Callable[[str, Optional[str]], dict[str, Any]],
+) -> None:
+    """
+    Register /local command handler with the Telegram application.
+
+    Allows users to dispatch tasks to the local worker agent via Telegram.
+    Usage: /local <task description>
+
+    Args:
+        application: The python-telegram-bot Application instance.
+        dispatch_fn: Callable(task_brief, project_path) -> result dict.
+                     This is orchestrator._handle_local_task_request.
+    """
+    from telegram.ext import CommandHandler
+
+    async def handle_local(update: Any, context: Any) -> None:
+        """Handle /local <task description> command."""
+        if not context.args:
+            await update.message.reply_text(
+                "Usage: /local <task description>\n\n"
+                "Example:\n"
+                "/local fix the health endpoint\n"
+                "/local add logging to config.py\n"
+                "/local refactor the journal writer"
+            )
+            return
+
+        task_brief = " ".join(context.args)
+        await update.message.reply_text(
+            f"🏠 Analyzing local codebase...\n\n"
+            f"*Task:* {task_brief}\n\n"
+            "This may take a moment (file scan + Claude analysis).",
+            parse_mode="Markdown",
+        )
+
+        try:
+            import asyncio
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, dispatch_fn, task_brief, None)
+
+            if result.get("success"):
+                files = ", ".join(result.get("files", []))
+                await update.message.reply_text(
+                    f"✅ Analysis complete! Approval queued.\n\n"
+                    f"*Files:* {files}\n"
+                    f"*ID:* `{result.get('approval_id', '?')}`\n\n"
+                    "Check the approval message above, or use /pending.",
+                    parse_mode="Markdown",
+                )
+            else:
+                error = result.get("error", "Unknown error")
+                await update.message.reply_text(
+                    f"❌ Failed to generate fix.\n\n"
+                    f"Error: {error[:500]}"
+                )
+        except Exception as e:
+            logger.error(f"Error in /local command: {e}")
+            await update.message.reply_text(f"❌ Error: {e}")
+
+    application.add_handler(CommandHandler("local", handle_local))

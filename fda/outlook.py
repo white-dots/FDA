@@ -29,18 +29,22 @@ class OutlookCalendar:
     """
 
     GRAPH_API_BASE = "https://graph.microsoft.com/v1.0"
+    # Base scopes that work with both personal and work/school accounts
     SCOPES = [
         "Calendars.Read",
         "Calendars.ReadWrite",
         "User.Read",
+    ]
+    # Additional scopes only available for work/school (Azure AD) accounts
+    ORG_SCOPES = [
         "Sites.Read.All",
         "Files.Read.All",
     ]
 
-    # Pre-registered multi-tenant app for FDA system
-    # This allows any Office 365 user to log in without app registration
+    # Microsoft Graph PowerShell — well-known multi-tenant public client
+    # Supports device code flow with both personal and org accounts
     # To use your own app, set FDA_OUTLOOK_CLIENT_ID environment variable
-    DEFAULT_CLIENT_ID = "b745d468-7cbc-4442-96ce-ef75e8a421ff"
+    DEFAULT_CLIENT_ID = "14d82eec-204b-4c2f-b7e8-296a70dab67e"
     DEFAULT_TENANT = "common"  # "common" allows any Microsoft account
 
     def __init__(

@@ -35,10 +35,10 @@ def _get_default_project_root() -> Path:
 # (Max subscription). The CLI always uses your subscription's model.
 # Set FDA_CLAUDE_BACKEND=cli (or just install `claude`) to use Max subscription.
 # Set FDA_CLAUDE_BACKEND=api  to use the Anthropic API (pay-per-token).
-MODEL_FDA: Final[str] = "claude-3-5-haiku-20241022"  # Fast for routing/classification
-MODEL_EXECUTOR: Final[str] = "claude-3-5-haiku-20241022"  # Fast for command execution
-MODEL_LIBRARIAN: Final[str] = "claude-3-5-haiku-20241022"  # Fast for file indexing/search
-MODEL_WORKER: Final[str] = "claude-3-5-haiku-20241022"  # Fast for file identification
+MODEL_FDA: Final[str] = "claude-sonnet-4-5-20250929"  # Sonnet for quality responses
+MODEL_EXECUTOR: Final[str] = "claude-sonnet-4-5-20250929"  # Fast for command execution
+MODEL_LIBRARIAN: Final[str] = "claude-sonnet-4-5-20250929"  # Fast for file indexing/search
+MODEL_WORKER: Final[str] = "claude-sonnet-4-5-20250929"  # Fast for file identification
 
 # Use Sonnet for quality-critical tasks (code generation, meeting summaries)
 MODEL_MEETING_SUMMARY: Final[str] = "claude-sonnet-4-20250514"  # Quality for code gen + summaries
@@ -81,11 +81,16 @@ TELEGRAM_BOT_TOKEN_ENV: Final[str] = "TELEGRAM_BOT_TOKEN"
 DISCORD_BOT_TOKEN_ENV: Final[str] = "DISCORD_BOT_TOKEN"
 DISCORD_CLIENT_ID_ENV: Final[str] = "DISCORD_CLIENT_ID"
 
+# Slack configuration
+SLACK_BOT_TOKEN_ENV: Final[str] = "SLACK_BOT_TOKEN"
+SLACK_APP_TOKEN_ENV: Final[str] = "SLACK_APP_TOKEN"
+SLACK_CHANNEL_ID_ENV: Final[str] = "SLACK_CHANNEL_ID"
+
 # OpenAI configuration (for Whisper STT and TTS)
 OPENAI_API_KEY_ENV: Final[str] = "OPENAI_API_KEY"
 
 # OpenAI Realtime API configuration (voice)
-OPENAI_REALTIME_MODEL: Final[str] = "gpt-4o-realtime-preview-2025-06-03"
+OPENAI_REALTIME_MODEL: Final[str] = "gpt-realtime-mini"
 OPENAI_REALTIME_VOICE: Final[str] = "alloy"  # alloy, ash, ballad, coral, echo, sage, shimmer, verse
 OPENAI_REALTIME_URL: Final[str] = "wss://api.openai.com/v1/realtime"
 
@@ -98,6 +103,13 @@ KAKAOTALK_POLL_INTERVAL_SECONDS: Final[int] = 60  # Check for new messages every
 
 # Client configuration
 CLIENTS_CONFIG_DIR: Final[Path] = Path(__file__).parent / "clients" / "configs"
+
+# Local Worker configuration
+# List of local project directories the local worker can read/modify
+LOCAL_WORKER_PROJECTS: Final[list[str]] = [
+    str(Path(__file__).parent.parent),  # FDA project root
+]
+LOCAL_WORKER_BACKUP_DIR: Final[Path] = DATA_DIR / "local_backups"
 
 # Logging
 LOG_DIR: Final[Path] = PROJECT_ROOT / "logs"

@@ -1,18 +1,25 @@
 """
 KakaoTalk chat export parser.
 
-Parses the .txt files exported from KakaoTalk Desktop (PC/Mac) into
-structured message objects. The export format is:
+Parses KakaoTalk Desktop (PC/Mac) exports into structured message objects.
 
+Supports two export formats:
+
+1. .txt format:
     --------------- 2026년 2월 15일 토요일 ---------------
     [김대리] [오후 2:30] 재고 페이지에서 수량 필드가 안 보여요
-    [김대리] [오후 2:31] 스크린샷 첨부했습니다
     [박과장] [오후 3:00] 확인 부탁드립니다
 
+2. .csv format:
+    Date,User,Message
+    2025-11-21 10:53:27,"고재정","안녕하세요~"
+
 Note: The exact format may vary slightly between KakaoTalk versions.
-This parser handles the most common format used in 2025-2026.
+This parser handles the most common formats used in 2025-2026.
 """
 
+import csv
+import io
 import re
 from dataclasses import dataclass
 from datetime import datetime, date
@@ -74,8 +81,11 @@ class KakaoTalkParser:
         """
         Parse a KakaoTalk export file into messages.
 
+        Auto-detects format based on file extension (.csv or .txt).
+        CSV files use the Date,User,Message column format.
+
         Args:
-            file_path: Path to the .txt export file.
+            file_path: Path to the .txt or .csv export file.
 
         Returns:
             List of KakaoMessage objects, sorted chronologically.
@@ -83,10 +93,65 @@ class KakaoTalkParser:
         if not file_path.exists():
             return []
 
+        # Auto-detect format
+        if file_path.suffix.lower() == ".csv":
+            return self.parse_csv_file(file_path)
+
         with open(file_path, "r", encoding="utf-8") as f:
             lines = f.readlines()
 
         return self.parse_lines(lines)
+
+    def parse_csv_file(self, file_path: Path) -> list[KakaoMessage]:
+        """
+        Parse a KakaoTalk CSV export file.
+
+        CSV format has columns: Date, User, Message
+        Messages may contain newlines (quoted in CSV).
+
+        Args:
+            file_path: Path to the .csv export file.
+
+        Returns:
+            List of KakaoMessage objects, sorted chronologically.
+        """
+        messages: list[KakaoMessage] = []
+
+        with open(file_path, "r", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+
+            for row in reader:
+                try:
+                    date_str = row.get("Date", "").strip()
+                    sender = row.get("User", "").strip()
+                    text = row.get("Message", "").strip()
+
+                    if not date_str or not sender or not text:
+                        continue
+
+                    # Skip system messages
+                    if self._is_system_message(text):
+                        continue
+
+                    # Skip deleted messages
+                    if text == "This message was deleted.":
+                        continue
+
+                    # Parse timestamp: "2025-11-21 10:53:27"
+                    timestamp = datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
+
+                    messages.append(KakaoMessage(
+                        sender=sender,
+                        timestamp=timestamp,
+                        text=text,
+                        raw_line=f"{date_str},{sender},{text[:50]}",
+                    ))
+
+                except (ValueError, KeyError) as e:
+                    # Skip malformed rows
+                    continue
+
+        return messages
 
     def parse_lines(self, lines: list[str]) -> list[KakaoMessage]:
         """

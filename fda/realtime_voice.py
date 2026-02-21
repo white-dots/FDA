@@ -113,8 +113,10 @@ class RealtimeVoiceSession:
         on_speech_started: Optional[Callable[[], Coroutine]] = None,
         on_speech_stopped: Optional[Callable[[], Coroutine]] = None,
         on_response_done: Optional[Callable[[dict], Coroutine]] = None,
+        on_function_call: Optional[Callable[[str, str, str], Coroutine]] = None,
         on_error: Optional[Callable[[str], Coroutine]] = None,
         instructions: str = "",
+        tools: Optional[list[dict]] = None,
         voice: str = OPENAI_REALTIME_VOICE,
         model: str = OPENAI_REALTIME_MODEL,
     ):
@@ -127,8 +129,12 @@ class RealtimeVoiceSession:
             on_speech_started: Callback when user starts speaking (for interruptions).
             on_speech_stopped: Callback when user stops speaking.
             on_response_done: Callback when a full response is complete.
+            on_function_call: Callback for function/tool calls. Receives
+                (call_id, function_name, arguments_json). Must return the result string
+                via submit_function_result().
             on_error: Callback for errors.
             instructions: System instructions/personality for the assistant.
+            tools: List of tool definitions for function calling (OpenAI format).
             voice: Voice to use for audio output.
             model: Realtime model identifier.
         """
@@ -151,10 +157,12 @@ class RealtimeVoiceSession:
         self._on_speech_started = on_speech_started
         self._on_speech_stopped = on_speech_stopped
         self._on_response_done = on_response_done
+        self._on_function_call = on_function_call
         self._on_error = on_error
 
         # Session configuration
         self._instructions = instructions
+        self._tools = tools or []
         self._voice = voice
         self._model = model
 
@@ -170,6 +178,11 @@ class RealtimeVoiceSession:
 
         # Accumulated transcript parts
         self._current_out_transcript = ""
+
+        # Accumulated function call arguments (streamed in deltas)
+        self._current_fn_call_id: Optional[str] = None
+        self._current_fn_name: Optional[str] = None
+        self._current_fn_args: str = ""
 
     @property
     def connected(self) -> bool:
@@ -243,31 +256,38 @@ class RealtimeVoiceSession:
 
     async def _configure_session(self) -> None:
         """Send session.update to configure the Realtime session."""
+        session = {
+            "modalities": ["text", "audio"],
+            "instructions": self._instructions,
+            "voice": self._voice,
+            "input_audio_format": "pcm16",
+            "output_audio_format": "pcm16",
+            "input_audio_transcription": {
+                "model": "gpt-4o-mini-transcribe",
+            },
+            "turn_detection": {
+                "type": "server_vad",
+                "threshold": 0.5,
+                "prefix_padding_ms": 300,
+                "silence_duration_ms": 500,
+                "create_response": True,
+            },
+            "temperature": 0.8,
+            "max_response_output_tokens": 1024,
+        }
+
+        # Add tool definitions if provided
+        if self._tools:
+            session["tools"] = self._tools
+            session["tool_choice"] = "auto"
+
         session_config = {
             "type": "session.update",
-            "session": {
-                "modalities": ["text", "audio"],
-                "instructions": self._instructions,
-                "voice": self._voice,
-                "input_audio_format": "pcm16",
-                "output_audio_format": "pcm16",
-                "input_audio_transcription": {
-                    "model": "gpt-4o-mini-transcribe",
-                },
-                "turn_detection": {
-                    "type": "server_vad",
-                    "threshold": 0.5,
-                    "prefix_padding_ms": 300,
-                    "silence_duration_ms": 500,
-                    "create_response": True,
-                },
-                "temperature": 0.8,
-                "max_response_output_tokens": 512,
-            },
+            "session": session,
         }
 
         await self._send_event(session_config)
-        logger.info("[RealtimeVoice] Session configured")
+        logger.info(f"[RealtimeVoice] Session configured (tools: {len(self._tools)})")
 
     def send_audio(self, pcm_48k_stereo: bytes) -> None:
         """Send Discord audio to the Realtime API (thread-safe).
@@ -351,6 +371,34 @@ class RealtimeVoiceSession:
 
         self._is_playing = False
         self._audio_playback_ms = 0.0
+
+    async def submit_function_result(self, call_id: str, result: str) -> None:
+        """Submit the result of a function call back to the Realtime API.
+
+        After receiving an on_function_call callback and executing the function,
+        call this method with the result. The API will then generate a spoken
+        response incorporating the function output.
+
+        Args:
+            call_id: The call_id from the function call event.
+            result: The function result as a string.
+        """
+        # Create a function_call_output conversation item
+        await self._send_event({
+            "type": "conversation.item.create",
+            "item": {
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": result,
+            },
+        })
+
+        # Trigger a new response so the model speaks the result
+        await self._send_event({
+            "type": "response.create",
+        })
+
+        logger.info(f"[RealtimeVoice] Submitted function result for call {call_id[:20]}... ({len(result)} chars)")
 
     async def inject_context(self, text: str, role: str = "user") -> None:
         """Inject text context into the conversation (for pre-populating history).
@@ -474,6 +522,40 @@ class RealtimeVoiceSession:
         elif event_type == "response.output_item.added":
             item = event.get("item", {})
             self._current_item_id = item.get("id")
+            # Track function call metadata if this is a function_call item
+            if item.get("type") == "function_call":
+                self._current_fn_call_id = item.get("call_id")
+                self._current_fn_name = item.get("name")
+                self._current_fn_args = ""
+
+        # --- Function call events ---
+        elif event_type == "response.function_call_arguments.delta":
+            # Accumulate streamed function arguments
+            self._current_fn_args += event.get("delta", "")
+
+        elif event_type == "response.function_call_arguments.done":
+            # Function call complete — extract details and invoke callback
+            call_id = event.get("call_id", "")
+            fn_name = event.get("name", self._current_fn_name or "")
+            fn_args = event.get("arguments", self._current_fn_args)
+
+            logger.info(
+                f"[RealtimeVoice] Function call: {fn_name}({fn_args[:100]}...)"
+            )
+
+            # Reset accumulated state
+            self._current_fn_args = ""
+            self._current_fn_name = None
+            self._current_fn_call_id = None
+
+            if self._on_function_call:
+                await self._on_function_call(call_id, fn_name, fn_args)
+            else:
+                # No handler — submit empty result so the model can continue
+                logger.warning(f"[RealtimeVoice] No function call handler for {fn_name}")
+                await self.submit_function_result(
+                    call_id, f"Error: function '{fn_name}' is not implemented"
+                )
 
         elif event_type == "response.done":
             response = event.get("response", {})
@@ -504,6 +586,8 @@ class RealtimeVoiceSession:
             "response.content_part.added",
             "response.content_part.done",
             "response.output_item.done",
+            "response.text.delta",
+            "response.text.done",
         ):
             pass
         else:

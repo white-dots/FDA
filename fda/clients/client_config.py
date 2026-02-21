@@ -45,6 +45,7 @@ class ProjectConfig:
     pre_deploy_command: Optional[str] = None  # e.g. "pip install -r requirements.txt"
     health_check_command: Optional[str] = None  # e.g. "curl -s localhost:8000/health"
     backup_dir: Optional[str] = None  # where to backup files before deploy
+    extra_repo_paths: list[str] = field(default_factory=list)  # additional paths to scan (e.g. ["~/airflow"])
 
 
 @dataclass
@@ -131,6 +132,7 @@ class ClientConfig:
             pre_deploy_command=project.get("pre_deploy_command"),
             health_check_command=project.get("health_check_command"),
             backup_dir=project.get("backup_dir"),
+            extra_repo_paths=project.get("extra_repo_paths", []),
         )
 
         return cls(
@@ -177,7 +179,7 @@ Technical Setup:
   - VM: {self.vm.host} (user: {self.vm.ssh_user})
   - Database: {self.database.type} ({self.database.name})
   - Tech Stack: {self.project.tech_stack}
-  - Repo Path (on VM): {self.project.repo_path}
+  - Repo Path (on VM): {self.project.repo_path}{f"{chr(10)}  - Additional paths: {', '.join(self.project.extra_repo_paths)}" if self.project.extra_repo_paths else ""}
   - Deploy Command: {self.project.deploy_command}
 
 Notes:

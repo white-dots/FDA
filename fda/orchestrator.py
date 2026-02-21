@@ -33,6 +33,7 @@ from fda.config import (
     DEFAULT_CALENDAR_CHECK_INTERVAL_MINUTES,
     TELEGRAM_BOT_TOKEN_ENV,
     DISCORD_BOT_TOKEN_ENV,
+    SLACK_BOT_TOKEN_ENV,
 )
 from fda.state.project_state import ProjectState
 from fda.comms.message_bus import MessageBus
@@ -40,10 +41,12 @@ from fda.clients.client_config import ClientManager, ClientConfig
 from fda.kakaotalk.reader import KakaoTalkReader
 from fda.kakaotalk.parser import KakaoMessage
 from fda.worker_agent import WorkerAgent
+from fda.local_worker_agent import LocalWorkerAgent
 from fda.telegram_approval import (
     ApprovalManager,
     PendingApproval,
     register_approval_handlers,
+    register_local_task_handler,
 )
 from fda.fda_agent import FDAAgent
 from fda.outlook import OutlookCalendar
@@ -87,6 +90,7 @@ class FDAOrchestrator:
         poll_interval_seconds: int = 60,
         enable_telegram: bool = True,
         enable_discord: bool = True,
+        enable_slack: bool = True,
         enable_calendar: bool = True,
     ):
         """
@@ -99,6 +103,7 @@ class FDAOrchestrator:
             poll_interval_seconds: How often to check for new messages.
             enable_telegram: Start Telegram bot.
             enable_discord: Start Discord bot.
+            enable_slack: Start Slack bot.
             enable_calendar: Start Outlook calendar monitoring.
         """
         # Core components
@@ -115,9 +120,15 @@ class FDAOrchestrator:
             auto_export=auto_export,
         )
 
-        # Worker agent (merged Librarian + Executor)
+        # Worker agent (merged Librarian + Executor) — remote VMs via SSH
         self.worker = WorkerAgent(
             client_manager=self.client_manager,
+            message_bus=self.message_bus,
+            db_path=str(STATE_DB_PATH),
+        )
+
+        # Local worker agent — operates on local Mac Mini filesystem
+        self.worker_local = LocalWorkerAgent(
             message_bus=self.message_bus,
             db_path=str(STATE_DB_PATH),
         )
@@ -135,6 +146,7 @@ class FDAOrchestrator:
         # Feature flags
         self._enable_telegram = enable_telegram
         self._enable_discord = enable_discord
+        self._enable_slack = enable_slack
         self._enable_calendar = enable_calendar
 
         # Configuration
@@ -142,6 +154,10 @@ class FDAOrchestrator:
         self._running = False
         self._paused = False
         self._threads: list[threading.Thread] = []
+
+        # Bot instances — stored so orchestrator can broadcast notifications
+        self._slack_bot: Optional[Any] = None
+        self._discord_bot: Optional[Any] = None
 
         # Restore last-checked timestamps from state
         self._restore_checkpoints()
@@ -190,11 +206,18 @@ class FDAOrchestrator:
                 logger.info("Telegram bot not configured — skipping")
                 return None
 
-            bot = TelegramBotAgent(bot_token=bot_token)
+            bot = TelegramBotAgent(
+                bot_token=bot_token,
+                local_task_dispatch=self._handle_local_task_request,
+                remote_task_dispatch=self._handle_remote_task_request,
+            )
 
             # Register approval command handlers (/approve, /reject, etc.)
             app = bot._get_application()
             register_approval_handlers(app, self.approval_manager)
+
+            # Register /local command for local worker dispatch
+            register_local_task_handler(app, self._handle_local_task_request)
 
             thread = threading.Thread(
                 target=bot.run_event_loop,
@@ -224,7 +247,12 @@ class FDAOrchestrator:
             discord_bot = DiscordVoiceAgent(
                 bot_token=bot_token,
                 fda_agent=self.fda_agent,
+                worker=self.worker,
+                local_task_dispatch=self._handle_local_task_request,
+                remote_task_dispatch=self._handle_remote_task_request,
+                approval_manager=self.approval_manager,
             )
+            self._discord_bot = discord_bot
 
             thread = threading.Thread(
                 target=discord_bot.run_event_loop,
@@ -239,6 +267,40 @@ class FDAOrchestrator:
             logger.warning("py-cord not installed — skipping Discord")
         except Exception as e:
             logger.error(f"Failed to start Discord bot: {e}")
+        return None
+
+    def _start_slack_bot(self) -> Optional[threading.Thread]:
+        """Start the Slack bot in a daemon thread (Socket Mode)."""
+        try:
+            from fda.slack_bot import SlackBotAgent, get_bot_tokens
+
+            tokens = get_bot_tokens()
+            if not tokens:
+                logger.info("Slack bot not configured — skipping")
+                return None
+
+            bot = SlackBotAgent(
+                bot_token=tokens[0],
+                app_token=tokens[1],
+                local_task_dispatch=self._handle_local_task_request,
+                remote_task_dispatch=self._handle_remote_task_request,
+                approval_manager=self.approval_manager,
+            )
+            self._slack_bot = bot
+
+            thread = threading.Thread(
+                target=bot.run_event_loop,
+                daemon=True,
+                name="slack-bot",
+            )
+            thread.start()
+            logger.info("✓ Slack bot started")
+            return thread
+
+        except ImportError:
+            logger.warning("slack-bolt not installed — skipping Slack")
+        except Exception as e:
+            logger.error(f"Failed to start Slack bot: {e}")
         return None
 
     def _start_calendar_monitor(self) -> Optional[threading.Thread]:
@@ -277,6 +339,17 @@ class FDAOrchestrator:
         )
         thread.start()
         logger.info("✓ Worker agent started")
+        return thread
+
+    def _start_worker_local(self) -> threading.Thread:
+        """Start the Local Worker agent in a daemon thread."""
+        thread = threading.Thread(
+            target=self.worker_local.run_event_loop,
+            daemon=True,
+            name="worker-local-agent",
+        )
+        thread.start()
+        logger.info("✓ Local Worker agent started")
         return thread
 
     # ------------------------------------------------------------------
@@ -490,23 +563,333 @@ Be specific and actionable. The developer needs to know exactly what to change.
 
             self.state.update_task(task_id, status="blocked")
 
+    def _handle_local_task_request(
+        self,
+        task_brief: str,
+        project_path: Optional[str] = None,
+        progress_callback: Optional[Any] = None,
+    ) -> dict[str, Any]:
+        """
+        Handle a local task request (from Telegram /local or Discord !local).
+
+        1. Resolve project path (default to first configured project)
+        2. Call LocalWorkerAgent.analyze_and_fix()
+        3. On success, create PendingApproval with is_local=True
+        4. Send approval to Telegram
+        5. Return result dict for the calling bot to display
+
+        Args:
+            task_brief: Natural language task description.
+            project_path: Local project directory. Defaults to first project.
+            progress_callback: Optional callback(msg: str) for live progress updates.
+
+        Returns:
+            Dict with: success, approval_id, files, explanation, diff, error.
+        """
+        # Resolve project path
+        if not project_path:
+            project_path = str(self.worker_local.projects[0])
+
+        project_name = Path(project_path).name
+        logger.info(f"Local task request: {task_brief[:80]}... (project: {project_name})")
+
+        # Create task in state DB
+        task_id = self.state.add_task(
+            title=f"[LOCAL] {task_brief[:100]}",
+            description=task_brief,
+            owner="worker_local",
+            priority="medium",
+        )
+
+        # Call local worker
+        try:
+            fix_result = self.worker_local.analyze_and_fix(
+                project_path=project_path,
+                task_brief=task_brief,
+                progress_callback=progress_callback,
+            )
+        except Exception as e:
+            logger.error(f"Local worker error: {e}")
+            self.state.update_task(task_id, status="blocked")
+            return {"success": False, "error": str(e)}
+
+        if fix_result.get("success"):
+            changes = fix_result.get("changes", {})
+
+            # Investigation/query task — no code changes, just return the analysis
+            if not changes:
+                self.state.update_task(task_id, status="completed")
+                return {
+                    "success": True,
+                    "investigation": True,
+                    "explanation": fix_result.get("explanation", ""),
+                    "analysis": fix_result.get("analysis", ""),
+                    "diff": "",
+                    "files": [],
+                }
+
+            # Code change task — queue for approval
+            approval = self.approval_manager.add_approval(
+                client_id="local",
+                client_name=f"LOCAL ({project_name})",
+                task_brief=task_brief,
+                explanation=fix_result.get("explanation", ""),
+                diff=fix_result.get("diff", ""),
+                file_changes=changes,
+                confidence=fix_result.get("confidence", "unknown"),
+                warnings=fix_result.get("warnings", []),
+                project_path=project_path,
+                is_local=True,
+            )
+
+            self._send_approval_to_telegram(approval)
+            self.state.update_task(task_id, status="awaiting_approval")
+
+            return {
+                "success": True,
+                "approval_id": approval.short_id,
+                "explanation": fix_result.get("explanation", ""),
+                "diff": fix_result.get("diff", ""),
+                "files": list(changes.keys()),
+            }
+        else:
+            error = fix_result.get("error", "Unknown error")
+            logger.error(f"Local worker failed: {error}")
+
+            self._send_telegram_notification(
+                f"⚠️ Failed to generate local fix\n\n"
+                f"Request: {task_brief[:200]}\n"
+                f"Error: {error}\n\n"
+                "You may need to handle this one manually."
+            )
+
+            self.state.update_task(task_id, status="blocked")
+            return {
+                "success": False,
+                "error": error,
+                "analysis": fix_result.get("analysis", ""),
+            }
+
+    def _handle_remote_task_request(
+        self,
+        task_brief: str,
+        client_id: Optional[str] = None,
+        progress_callback: Optional[Any] = None,
+    ) -> dict[str, Any]:
+        """
+        Handle a remote task request — dispatches to the remote WorkerAgent.
+
+        The worker SSHes into the client's VM, scans the codebase, and
+        either answers an investigation question or generates a code fix.
+
+        Args:
+            task_brief: Natural language task description.
+            client_id: Client identifier. Defaults to first configured client.
+            progress_callback: Optional callback(msg: str) for live progress.
+
+        Returns:
+            Dict with: success, investigation, explanation, analysis,
+                        approval_id, files, diff, error.
+        """
+        # Resolve client
+        if not client_id:
+            clients = self.client_manager.list_clients()
+            if not clients:
+                return {"success": False, "error": "No clients configured"}
+            client_id = clients[0].client_id
+
+        client = self.client_manager.get_client(client_id)
+        if not client:
+            return {"success": False, "error": f"Unknown client: {client_id}"}
+
+        logger.info(
+            f"Remote task request for {client.name}: {task_brief[:80]}..."
+        )
+
+        # Create task in state DB
+        task_id = self.state.add_task(
+            title=f"[{client.name}] {task_brief[:100]}",
+            description=task_brief,
+            owner="worker",
+            priority="medium",
+        )
+
+        # Call remote worker
+        try:
+            fix_result = self.worker.analyze_and_fix(
+                client_id=client_id,
+                task_brief=task_brief,
+                progress_callback=progress_callback,
+            )
+        except Exception as e:
+            logger.error(f"Remote worker error: {e}")
+            self.state.update_task(task_id, status="blocked")
+            return {"success": False, "error": str(e)}
+
+        if fix_result.get("success"):
+            changes = fix_result.get("changes", {})
+
+            # Investigation/query task — no code changes
+            if not changes:
+                self.state.update_task(task_id, status="completed")
+                return {
+                    "success": True,
+                    "investigation": True,
+                    "explanation": fix_result.get("explanation", ""),
+                    "analysis": fix_result.get("analysis", ""),
+                    "diff": "",
+                    "files": [],
+                }
+
+            # Code change task — queue for approval
+            approval = self.approval_manager.add_approval(
+                client_id=client_id,
+                client_name=client.name,
+                task_brief=task_brief,
+                explanation=fix_result.get("explanation", ""),
+                diff=fix_result.get("diff", ""),
+                file_changes=changes,
+                confidence=fix_result.get("confidence", "unknown"),
+                warnings=fix_result.get("warnings", []),
+            )
+
+            self._send_approval_to_telegram(approval)
+            self.state.update_task(task_id, status="awaiting_approval")
+
+            return {
+                "success": True,
+                "approval_id": approval.short_id,
+                "explanation": fix_result.get("explanation", ""),
+                "diff": fix_result.get("diff", ""),
+                "files": list(changes.keys()),
+            }
+        else:
+            error = fix_result.get("error", "Unknown error")
+            logger.error(f"Remote worker failed for {client.name}: {error}")
+            self.state.update_task(task_id, status="blocked")
+            return {
+                "success": False,
+                "error": error,
+                "analysis": fix_result.get("analysis", ""),
+            }
+
     # ------------------------------------------------------------------
     # Telegram notification helpers
     # ------------------------------------------------------------------
 
     def _send_approval_to_telegram(self, approval: PendingApproval) -> None:
-        """Send an approval request to the user via Telegram."""
-        message = approval.format_telegram_message()
-        self._send_telegram_notification(message)
+        """Send an approval request to all active channels."""
+        # Telegram
+        telegram_msg = approval.format_telegram_message()
+        self._send_telegram_notification(telegram_msg)
+
+        # Slack
+        self._send_slack_notification(approval)
+
+        # Discord
+        self._send_discord_notification(approval)
+
+    def _send_slack_notification(self, approval: PendingApproval) -> None:
+        """Send an approval notification to the Slack channel."""
+        if not self._slack_bot:
+            return
+
+        try:
+            if approval.is_local:
+                from pathlib import Path
+                project_name = Path(approval.project_path).name if approval.project_path else "local"
+                target_label = f":house: LOCAL ({project_name})"
+            else:
+                target_label = approval.client_name
+
+            files_str = ", ".join(approval.file_changes.keys())
+            diff_preview = approval.diff[:1500] if approval.diff else ""
+
+            text = (
+                f":wrench: *Code change for {target_label}*\n\n"
+                f"*Request:* {approval.task_brief[:200]}\n\n"
+                f"*What changed:* {approval.explanation[:300]}\n\n"
+                f"*Files:* {files_str}\n"
+                f"*Confidence:* {approval.confidence}\n"
+            )
+
+            if approval.warnings:
+                text += "\n:warning: *Warnings:*\n" + "\n".join(f"  - {w}" for w in approval.warnings) + "\n"
+
+            if diff_preview:
+                text += f"\n```\n{diff_preview}\n```\n"
+
+            text += (
+                f"\nReply with:\n"
+                f"`!approve {approval.short_id}`\n"
+                f"`!reject {approval.short_id} [reason]`\n"
+                f"`!details {approval.short_id}`"
+            )
+
+            self._slack_bot.broadcast_to_channel(text)
+        except Exception as e:
+            logger.error(f"Failed to send Slack approval notification: {e}")
+
+    def _send_discord_notification(self, approval: PendingApproval) -> None:
+        """Send an approval notification to Discord."""
+        if not self._discord_bot or not self._discord_bot._response_channel:
+            return
+
+        try:
+            if approval.is_local:
+                from pathlib import Path
+                project_name = Path(approval.project_path).name if approval.project_path else "local"
+                target_label = f"🏠 LOCAL ({project_name})"
+            else:
+                target_label = approval.client_name
+
+            files_str = ", ".join(approval.file_changes.keys())
+            diff_preview = approval.diff[:1200] if approval.diff else ""
+
+            text = (
+                f"🔧 **Code change for {target_label}**\n\n"
+                f"**Request:** {approval.task_brief[:200]}\n\n"
+                f"**What changed:** {approval.explanation[:300]}\n\n"
+                f"**Files:** {files_str}\n"
+                f"**Confidence:** {approval.confidence}\n"
+            )
+
+            if approval.warnings:
+                text += "\n⚠️ **Warnings:**\n" + "\n".join(f"  - {w}" for w in approval.warnings) + "\n"
+
+            if diff_preview:
+                text += f"\n```diff\n{diff_preview}\n```\n"
+
+            text += (
+                f"\nReply with:\n"
+                f"`!approve {approval.short_id}`\n"
+                f"`!reject {approval.short_id} [reason]`\n"
+                f"`!details {approval.short_id}`"
+            )
+
+            # Discord bot runs in its own asyncio loop
+            import asyncio
+            channel = self._discord_bot._response_channel
+            loop = self._discord_bot._bot.loop if self._discord_bot._bot else None
+            if loop and loop.is_running():
+                asyncio.run_coroutine_threadsafe(channel.send(text[:2000]), loop)
+            else:
+                logger.debug("Discord bot event loop not running — skipping notification")
+        except Exception as e:
+            logger.error(f"Failed to send Discord approval notification: {e}")
 
     def _send_telegram_notification(self, text: str) -> None:
-        """Send a notification to the user via Telegram."""
+        """Send a notification to the user via Telegram.
+
+        Uses a fresh asyncio event loop to avoid conflicts with the
+        Telegram bot's own event loop running in its daemon thread.
+        """
         try:
             import telegram
 
-            bot_token = self.state.get_context("telegram_bot_token")
+            bot_token = os.environ.get(TELEGRAM_BOT_TOKEN_ENV)
             if not bot_token:
-                bot_token = os.environ.get(TELEGRAM_BOT_TOKEN_ENV)
+                bot_token = self.state.get_context("telegram_bot_token")
 
             if not bot_token:
                 logger.error("No Telegram bot token configured")
@@ -514,30 +897,34 @@ Be specific and actionable. The developer needs to know exactly what to change.
 
             users = self.state.get_telegram_users(active_only=True)
             if not users:
-                logger.warning("No active Telegram users to notify")
+                logger.warning(
+                    "No active Telegram users to notify. "
+                    "Send /start to the Telegram bot to register."
+                )
                 return
 
-            bot = telegram.Bot(token=bot_token)
+            async def _send() -> None:
+                bot = telegram.Bot(token=bot_token)
+                for user in users:
+                    try:
+                        await bot.send_message(
+                            chat_id=user["chat_id"],
+                            text=text,
+                            parse_mode="Markdown",
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"Failed to send Telegram message to "
+                            f"{user.get('chat_id')}: {e}"
+                        )
 
-            for user in users:
-                try:
-                    asyncio.get_event_loop().run_until_complete(
-                        bot.send_message(
-                            chat_id=user["chat_id"],
-                            text=text,
-                            parse_mode="Markdown",
-                        )
-                    )
-                except RuntimeError:
-                    loop = asyncio.new_event_loop()
-                    loop.run_until_complete(
-                        bot.send_message(
-                            chat_id=user["chat_id"],
-                            text=text,
-                            parse_mode="Markdown",
-                        )
-                    )
-                    loop.close()
+            # Always create a dedicated loop — avoids conflicts with
+            # the Telegram bot's event loop in another thread.
+            loop = asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(_send())
+            finally:
+                loop.close()
 
         except ImportError:
             logger.error("python-telegram-bot not installed")
@@ -549,30 +936,58 @@ Be specific and actionable. The developer needs to know exactly what to change.
     # ------------------------------------------------------------------
 
     async def _handle_approval(self, approval: PendingApproval) -> None:
-        """Called when user approves a code change."""
-        logger.info(f"Deploying approved changes for {approval.client_name}...")
+        """Called when user approves a code change.
 
-        result = self.worker.deploy_approved_changes(
-            client_id=approval.client_id,
-            file_changes=approval.file_changes,
-        )
+        Runs the blocking deployment in a thread executor so the
+        Telegram bot's event loop stays responsive.
+        """
+        target_name = approval.client_name or "local"
+        logger.info(f"Deploying approved changes for {target_name}...")
 
-        if result.success:
+        loop = asyncio.get_event_loop()
+
+        def _deploy() -> tuple[bool, str]:
+            if approval.is_local and approval.project_path:
+                result_dict = self.worker_local.deploy_approved_changes(
+                    project_path=approval.project_path,
+                    file_changes=approval.file_changes,
+                )
+                success = result_dict.get("success", False)
+                summary = (
+                    f"Files: {', '.join(result_dict.get('files_deployed', []))}"
+                    if success
+                    else result_dict.get("error", "Unknown error")
+                )
+            else:
+                result = self.worker.deploy_approved_changes(
+                    client_id=approval.client_id,
+                    file_changes=approval.file_changes,
+                )
+                success = result.success
+                summary = result.summary()
+            return success, summary
+
+        try:
+            success, summary = await loop.run_in_executor(None, _deploy)
+        except Exception as e:
+            logger.error(f"Deployment error for {target_name}: {e}")
+            success, summary = False, str(e)
+
+        if success:
             self._send_telegram_notification(
-                f"✅ Deployed to {approval.client_name}\n\n"
-                f"{result.summary()}"
+                f"✅ Deployed to {target_name}\n\n{summary}"
             )
 
             self.state.add_decision(
-                title=f"Deployed fix for {approval.client_name}",
+                title=f"Deployed fix for {target_name}",
                 rationale=approval.explanation,
                 decision_maker="user (approved via telegram)",
                 impact=f"Files changed: {', '.join(approval.file_changes.keys())}",
             )
         else:
             self._send_telegram_notification(
-                f"❌ Deployment FAILED for {approval.client_name}\n\n"
-                f"{result.summary()}\n\n"
+                f"❌ Deployment FAILED for {target_name}\n\n"
+                f"{summary}\n\n"
                 "You may need to fix this manually."
             )
 
@@ -637,8 +1052,11 @@ Be specific and actionable. The developer needs to know exactly what to change.
 
         # --- Start subsystem threads ---
 
-        # 1. Worker agent
+        # 1. Worker agent (remote VMs)
         self._threads.append(self._start_worker())
+
+        # 1b. Local Worker agent (local filesystem)
+        self._threads.append(self._start_worker_local())
 
         # 2. Telegram bot (with /approve, /reject, /pending commands)
         if self._enable_telegram:
@@ -646,13 +1064,19 @@ Be specific and actionable. The developer needs to know exactly what to change.
             if t:
                 self._threads.append(t)
 
-        # 3. Discord bot (voice meetings)
+        # 3. Slack bot (Socket Mode)
+        if self._enable_slack:
+            t = self._start_slack_bot()
+            if t:
+                self._threads.append(t)
+
+        # 4. Discord bot (voice meetings)
         if self._enable_discord:
             t = self._start_discord_bot()
             if t:
                 self._threads.append(t)
 
-        # 4. Calendar monitor
+        # 5. Calendar monitor
         if self._enable_calendar:
             t = self._start_calendar_monitor()
             if t:

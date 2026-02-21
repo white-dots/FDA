@@ -16,7 +16,9 @@ that reads the code is the same one that needs to change it.
 import json
 import logging
 import difflib
-from typing import Any, Optional
+import re
+import time
+from typing import Any, Callable, Optional
 from datetime import datetime
 
 from fda.base_agent import BaseAgent
@@ -28,6 +30,24 @@ from fda.remote.deploy import Deployer, DeployResult
 from fda.comms.message_bus import MessageBus
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Stopwords for keyword extraction (filtered out of task briefs)
+# ---------------------------------------------------------------------------
+_STOPWORDS = frozenset({
+    "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did", "will", "would", "could",
+    "should", "may", "might", "shall", "can", "need", "must",
+    "i", "me", "my", "we", "our", "you", "your", "he", "she", "it",
+    "they", "them", "their", "this", "that", "these", "those",
+    "what", "which", "who", "whom", "where", "when", "how", "why",
+    "and", "or", "but", "if", "then", "so", "because", "as", "of",
+    "at", "by", "for", "with", "about", "against", "between", "through",
+    "to", "from", "in", "on", "up", "out", "off", "over", "under",
+    "not", "no", "nor", "only", "very", "too", "also", "just",
+    "check", "look", "find", "show", "tell", "explain", "describe",
+    "works", "work", "working", "make", "run", "use", "used",
+})
 
 
 class WorkerAgent(BaseAgent):
@@ -86,6 +106,14 @@ Important rules:
         self._ssh_connections: dict[str, SSHManager] = {}
         self._deployers: dict[str, Deployer] = {}
 
+        # Cache for codebase file listings (avoids re-running `find` every call)
+        # Key: (client_id, repo_path), Value: (timestamp, file_list)
+        self._structure_cache: dict[tuple[str, str], tuple[float, list[str]]] = {}
+        self._structure_cache_ttl = 300.0  # 5 minutes
+
+        # Warm up SSH connections to all clients at init time
+        self._warmup_connections()
+
     def _get_ssh(self, client: ClientConfig) -> SSHManager:
         """Get or create SSH connection for a client."""
         if client.client_id not in self._ssh_connections:
@@ -103,11 +131,36 @@ Important rules:
             self._deployers[client.client_id] = Deployer(client)
         return self._deployers[client.client_id]
 
+    def _warmup_connections(self) -> None:
+        """Proactively establish SSH ControlMaster connections to all clients.
+
+        Called at init time so the first analyze_and_fix() call doesn't pay
+        the ~1.5s TCP+SSH handshake cost. The ControlMaster persists for
+        10 minutes of inactivity, and subsequent SSH commands multiplex
+        over it (~50ms instead of ~1.5s).
+        """
+        for client in self.client_manager.list_clients():
+            try:
+                ssh = self._get_ssh(client)
+                if ssh.warmup():
+                    logger.info(
+                        f"SSH connection warmed up for {client.name} "
+                        f"({client.vm.host})"
+                    )
+                else:
+                    logger.warning(
+                        f"Failed to warm up SSH for {client.name} "
+                        f"({client.vm.host})"
+                    )
+            except Exception as e:
+                logger.warning(f"SSH warmup error for {client.name}: {e}")
+
     def analyze_and_fix(
         self,
         client_id: str,
         task_brief: str,
         hint_files: Optional[list[str]] = None,
+        progress_callback: Optional[Callable[[str], None]] = None,
     ) -> dict[str, Any]:
         """
         Analyze a client request and generate a code fix.
@@ -118,6 +171,8 @@ Important rules:
             client_id: Client identifier.
             task_brief: Business-context task description from FDA.
             hint_files: Optional list of file paths to examine first.
+            progress_callback: Optional callback for live progress updates.
+                Called with a status string at each step. Thread-safe.
 
         Returns:
             Dict with:
@@ -128,6 +183,15 @@ Important rules:
               - explanation: str (human-readable explanation)
               - error: Optional[str]
         """
+        def _progress(msg: str) -> None:
+            """Send a progress update (to callback + logger)."""
+            logger.info(f"[Worker] {msg}")
+            if progress_callback:
+                try:
+                    progress_callback(msg)
+                except Exception:
+                    pass  # Never let callback errors break the pipeline
+
         client = self.client_manager.get_client(client_id)
         if not client:
             return {
@@ -139,24 +203,63 @@ Important rules:
         repo_path = client.project.repo_path
 
         # Step 1: Understand the codebase structure
-        logger.info(f"Analyzing codebase for {client.name}...")
+        _progress(f"📂 Scanning codebase on {client.name} VM...")
         structure = self._explore_codebase(ssh, repo_path, client)
+        cache_key = (client.client_id, repo_path)
+        was_cached = cache_key in self._structure_cache
+        if was_cached:
+            _progress(f"📂 Found {len(structure)} files (cached)")
+        else:
+            _progress(f"📂 Found {len(structure)} files")
 
         # Step 2: Identify relevant files
+        _progress("🔍 Identifying relevant files...")
         relevant_files = self._identify_relevant_files(
             task_brief, structure, hint_files, client
         )
 
         if not relevant_files:
+            _progress("❌ No relevant files found")
             return {
                 "success": False,
                 "error": "Could not identify relevant files for this task",
                 "analysis": f"Explored {len(structure)} files but none matched the request",
             }
 
+        # Show which files were selected
+        short_names = [f.rsplit("/", 1)[-1] for f in relevant_files[:5]]
+        extras = f" +{len(relevant_files) - 5} more" if len(relevant_files) > 5 else ""
+        _progress(f"🔍 Found {len(relevant_files)} relevant files: {', '.join(short_names)}{extras}")
+
         # Step 3: Read the relevant source files
-        logger.info(f"Reading {len(relevant_files)} relevant files...")
-        file_contents = ssh.read_files(relevant_files)
+        _progress(f"📖 Reading {len(relevant_files)} files from VM...")
+
+        # Resolve relative paths (from `find .`) to absolute paths
+        # so read_files() can cat them without needing cwd.
+        # Also expand ~ to $HOME since cat "~/..." won't expand tilde
+        # inside quotes on the remote shell.
+        def _resolve(f: str) -> str:
+            if f.startswith("./"):
+                return f"{repo_path}/{f[2:]}"
+            elif not f.startswith("/"):
+                return f"{repo_path}/{f}"
+            return f
+
+        abs_files = [_resolve(f) for f in relevant_files]
+
+        # Expand ~ → $HOME on the remote host (tilde doesn't expand inside quotes)
+        if any("~" in f for f in abs_files):
+            home_result = ssh.execute("echo $HOME")
+            remote_home = home_result.stdout.strip() if home_result.success else "/home"
+            abs_files = [f.replace("~", remote_home) for f in abs_files]
+
+        file_contents = ssh.read_files(abs_files)
+
+        # Re-map keys back to the original relative paths for downstream use
+        file_contents = {
+            rel: file_contents.get(absl)
+            for rel, absl in zip(relevant_files, abs_files)
+        }
 
         # Filter out files that couldn't be read
         readable_files = {
@@ -166,19 +269,28 @@ Important rules:
         }
 
         if not readable_files:
+            _progress("❌ Could not read any files")
             return {
                 "success": False,
                 "error": "Could not read any of the relevant files",
             }
 
+        total_chars = sum(len(c) for c in readable_files.values())
+        _progress(f"📖 Read {len(readable_files)} files ({total_chars:,} chars)")
+
         # Step 4: Generate the fix using Claude
-        logger.info("Generating code fix...")
+        _progress("🧠 Analyzing with Claude...")
         fix_result = self._generate_fix(
             task_brief=task_brief,
             client=client,
             file_contents=readable_files,
             repo_path=repo_path,
         )
+
+        if fix_result.get("success"):
+            _progress("✅ Analysis complete")
+        else:
+            _progress(f"⚠️ Analysis finished with errors: {fix_result.get('error', 'unknown')[:100]}")
 
         return fix_result
 
@@ -192,7 +304,23 @@ Important rules:
         Get an overview of the codebase structure.
 
         Returns a list of file paths in the repository.
+        Uses a TTL cache (default 5 min) to avoid re-running `find`
+        on every analyze_and_fix() call.
         """
+        cache_key = (client.client_id, repo_path)
+        now = time.monotonic()
+
+        # Check cache
+        if cache_key in self._structure_cache:
+            cached_time, cached_files = self._structure_cache[cache_key]
+            age = now - cached_time
+            if age < self._structure_cache_ttl:
+                logger.debug(
+                    f"Using cached file listing for {client.name} "
+                    f"({len(cached_files)} files, {age:.0f}s old)"
+                )
+                return cached_files
+
         # Get file list, excluding common non-code directories
         result = ssh.execute(
             "find . -type f "
@@ -206,18 +334,38 @@ Important rules:
             "! -path './dist/*' "
             "! -path './build/*' "
             "! -path './*.pyc' "
-            "| head -500",
+            "| head -2000",
             cwd=repo_path,
             timeout=15,
         )
 
         if result.success:
-            return [
+            files = [
                 line.strip()
                 for line in result.stdout.strip().split("\n")
                 if line.strip()
             ]
+            # Cache the result
+            self._structure_cache[cache_key] = (now, files)
+            logger.info(f"Cached file listing for {client.name}: {len(files)} files")
+            return files
         return []
+
+    def invalidate_structure_cache(self, client_id: Optional[str] = None) -> None:
+        """Clear the codebase structure cache.
+
+        Args:
+            client_id: If provided, only clear cache for this client.
+                       If None, clear all cached structures.
+        """
+        if client_id:
+            keys_to_remove = [k for k in self._structure_cache if k[0] == client_id]
+            for key in keys_to_remove:
+                del self._structure_cache[key]
+            logger.debug(f"Cleared structure cache for {client_id}")
+        else:
+            self._structure_cache.clear()
+            logger.debug("Cleared all structure caches")
 
     def _identify_relevant_files(
         self,
@@ -322,7 +470,7 @@ Return a JSON array of the most relevant file paths (max 15 files).
                 content = content[:10000] + "\n... [truncated] ..."
             source_context += f"\n=== {path} ===\n{content}\n"
 
-        prompt = f"""You are making a code change for a client.
+        prompt = f"""You are working on a client project.
 
 {client.get_context_for_prompt()}
 
@@ -333,15 +481,16 @@ SOURCE CODE:
 {source_context}
 
 INSTRUCTIONS:
-1. Identify what needs to change to fulfill the task
-2. Make the MINIMAL change needed — don't refactor unrelated code
-3. Preserve the existing code style
+1. Analyze the codebase in the context of the task
+2. If the task requires code changes, make the MINIMAL change needed -- don't refactor unrelated code
+3. If the task is an investigation or question (e.g. "check if X is configured", "does Y exist"), answer the question based on what you see in the code -- do NOT make any changes
+4. Preserve the existing code style
 
 RESPONSE FORMAT:
-Return a JSON object with:
+You MUST return a JSON object (no markdown, no extra text). Use this format:
 {{
   "analysis": "Brief analysis of what you found",
-  "explanation": "Plain-language explanation of what you changed and why",
+  "explanation": "Plain-language explanation of your findings or what you changed and why",
   "changes": {{
     "relative/path/to/file.py": "FULL new content of the file (not just the changed part)"
   }},
@@ -349,8 +498,11 @@ Return a JSON object with:
   "warnings": ["any concerns or things to check"]
 }}
 
-IMPORTANT: In "changes", include the COMPLETE file content, not just the diff.
-Only include files that actually changed.
+IMPORTANT:
+- If no code changes are needed (investigation/query tasks), set "changes" to an empty object {{}}.
+- If code changes are needed, include the COMPLETE file content in "changes", not just the diff.
+- Only include files that actually changed.
+- Your response must be valid JSON. Do not wrap it in markdown code blocks.
 """
 
         try:
@@ -392,11 +544,26 @@ Only include files that actually changed.
             }
 
         except json.JSONDecodeError as e:
+            raw = text if 'text' in dir() else ""
+            if raw:
+                logger.info(
+                    f"Claude returned non-JSON response ({len(raw)} chars) — "
+                    "treating as investigation result"
+                )
+                return {
+                    "success": True,
+                    "analysis": raw,
+                    "changes": {},
+                    "diff": "",
+                    "explanation": raw,
+                    "confidence": "medium",
+                    "warnings": [],
+                }
             logger.error(f"Failed to parse Claude's response as JSON: {e}")
             return {
                 "success": False,
                 "error": f"Failed to parse code fix response: {e}",
-                "raw_response": text if 'text' in dir() else "",
+                "raw_response": raw,
             }
         except Exception as e:
             logger.error(f"Error generating fix: {e}")
@@ -431,7 +598,13 @@ Only include files that actually changed.
             )
 
         deployer = self._get_deployer(client)
-        return deployer.deploy_files(file_changes)
+        result = deployer.deploy_files(file_changes)
+
+        # Invalidate structure cache after deploy (files may have changed)
+        if result.success:
+            self.invalidate_structure_cache(client_id)
+
+        return result
 
     def test_all_connections(self) -> dict[str, dict]:
         """

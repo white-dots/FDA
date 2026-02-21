@@ -267,6 +267,17 @@ class ProjectState:
             )
         """)
 
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS file_relevance (
+                id TEXT PRIMARY KEY,
+                client_id TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                access_count INTEGER DEFAULT 1,
+                last_accessed TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(client_id, file_path)
+            )
+        """)
+
         # Create indexes for common queries
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_tasks_owner ON tasks(owner)")
@@ -289,6 +300,8 @@ class ProjectState:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_project_keywords_keyword ON project_keywords(keyword)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_project_keywords_weight ON project_keywords(weight DESC)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_project_keywords_project ON project_keywords(project_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_file_relevance_client ON file_relevance(client_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_file_relevance_count ON file_relevance(access_count DESC)")
 
         conn.commit()
 
@@ -861,6 +874,7 @@ class ProjectState:
         content: str,
         source: str = "discord",
         username: Optional[str] = None,
+        created_at: Optional[datetime] = None,
     ) -> None:
         """
         Save a conversation message to the history.
@@ -871,7 +885,10 @@ class ProjectState:
             content: The message content.
             source: Interface source — 'discord', 'telegram', or 'cli'.
             username: The user's display name (for user messages).
+            created_at: Message timestamp. Defaults to now if not provided.
+                        Use this for importing historical messages.
         """
+        ts = (created_at or datetime.now()).isoformat()
         conn = self._get_connection()
         cursor = conn.cursor()
         cursor.execute(
@@ -879,7 +896,7 @@ class ProjectState:
             INSERT INTO conversation_messages (source, channel_id, role, content, username, created_at)
             VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (source, channel_id, role, content, username, datetime.now().isoformat()),
+            (source, channel_id, role, content, username, ts),
         )
         conn.commit()
 
@@ -1865,6 +1882,68 @@ class ProjectState:
             "domains": domains,
             "top_keywords": top_keywords,
         }
+
+    # ------------------------------------------------------------------
+    # File relevance tracking (worker agent query history)
+    # ------------------------------------------------------------------
+
+    def increment_file_relevance(
+        self, client_id: str, file_paths: list[str]
+    ) -> None:
+        """Record that files were selected as relevant for a task.
+
+        Increments the access counter for each file.  Used by the worker
+        agent to build a "most queried" signal for file ranking.
+
+        Args:
+            client_id: Client identifier (e.g. ``"aonebnh"``).
+            file_paths: List of file paths that were identified as relevant.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        now = datetime.now().isoformat()
+
+        for fp in file_paths:
+            rel_id = f"frel_{uuid.uuid4().hex[:8]}"
+            cursor.execute(
+                """
+                INSERT INTO file_relevance (id, client_id, file_path, access_count, last_accessed)
+                VALUES (?, ?, ?, 1, ?)
+                ON CONFLICT(client_id, file_path) DO UPDATE SET
+                    access_count = access_count + 1,
+                    last_accessed = excluded.last_accessed
+                """,
+                (rel_id, client_id, fp, now),
+            )
+
+        conn.commit()
+
+    def get_top_files_by_relevance(
+        self, client_id: str, limit: int = 50
+    ) -> list[tuple[str, int]]:
+        """Get the most-queried files for a client.
+
+        Args:
+            client_id: Client identifier.
+            limit: Maximum number of results.
+
+        Returns:
+            List of ``(file_path, access_count)`` tuples ordered by
+            access count descending.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT file_path, access_count
+            FROM file_relevance
+            WHERE client_id = ?
+            ORDER BY access_count DESC
+            LIMIT ?
+            """,
+            (client_id, limit),
+        )
+        return [(row["file_path"], row["access_count"]) for row in cursor.fetchall()]
 
     def close(self) -> None:
         """Close the database connection."""

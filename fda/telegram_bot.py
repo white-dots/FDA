@@ -6,11 +6,13 @@ proactive notifications about project status, alerts, and updates.
 """
 
 import asyncio
+import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from fda.base_agent import BaseAgent
 from fda.config import (
@@ -20,6 +22,33 @@ from fda.config import (
 from fda.state.project_state import ProjectState
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Intent detection — keyword-based routing for selective context loading
+# ---------------------------------------------------------------------------
+
+INTENT_PATTERNS: dict[str, list[str]] = {
+    "kakao": ["kakao", "카카오", "chat room", "client said", "client message", "채팅"],
+    "tasks": ["task", "to-do", "todo", "work on", "backlog", "blocked", "할일", "작업"],
+    "calendar": ["calendar", "meeting", "schedule", "agenda", "일정", "미팅", "회의"],
+    "journal": ["journal", "note", "wrote", "logged", "recorded", "일지", "노트"],
+    "alerts": ["alert", "critical", "warning", "urgent", "알림"],
+}
+
+
+def _detect_intents(question: str) -> list[str]:
+    """Detect which data sources a question needs, using keyword matching.
+
+    Returns a list of intent keys (e.g. ["kakao", "tasks"]).
+    Falls back to ["general"] when nothing specific matches.
+    """
+    q_lower = question.lower()
+    matched = [
+        intent
+        for intent, keywords in INTENT_PATTERNS.items()
+        if any(kw in q_lower for kw in keywords)
+    ]
+    return matched or ["general"]
 
 
 TELEGRAM_SYSTEM_PROMPT = """You are FDA (Facilitating Director Agent), a personal AI assistant running on the user's computer, responding via Telegram.
@@ -57,6 +86,8 @@ class TelegramBotAgent(BaseAgent):
         self,
         bot_token: Optional[str] = None,
         project_state_path: Optional[Path] = None,
+        local_task_dispatch: Optional[Any] = None,
+        remote_task_dispatch: Optional[Any] = None,
     ):
         """
         Initialize the Telegram Bot Agent.
@@ -65,6 +96,8 @@ class TelegramBotAgent(BaseAgent):
             bot_token: Telegram bot token. If not provided, reads from
                       TELEGRAM_BOT_TOKEN environment variable.
             project_state_path: Path to the project state database.
+            local_task_dispatch: Optional callback(task_brief, project_path, progress_callback) -> result dict.
+            remote_task_dispatch: Optional callback(task_brief, client_id, progress_callback) -> result dict.
         """
         print("[TelegramBot] Initializing...", flush=True)
         print("[TelegramBot] Calling super().__init__...", flush=True)
@@ -86,6 +119,8 @@ class TelegramBotAgent(BaseAgent):
 
         self._application = None
         self._loop = None
+        self._local_task_dispatch = local_task_dispatch
+        self._remote_task_dispatch = remote_task_dispatch
         print("[TelegramBot] Initialization complete", flush=True)
 
     def _get_application(self) -> Any:
@@ -208,6 +243,13 @@ First: What should I call you?
 /tasks - List your current tasks
 /alerts - Show pending reminders
 /stop - Pause notifications
+
+*Code Changes:*
+/local <task> - Analyze & fix local codebase (FDA, etc.)
+/pending - See pending approvals
+/approve <id> - Approve a code change
+/reject <id> - Reject a code change
+/details <id> - View full diff
 
 *Or just message me:*
 - Ask questions about anything
@@ -410,52 +452,463 @@ Keep it conversational and under 150 words. Don't use excessive formatting."""
 
             logger.info(f"[TelegramBot] Onboarding completed for {chat_id}: {user_name}")
 
-    def _answer_question(self, question: str, chat_id: str = "telegram") -> str:
-        """Answer a question using FDA agent capabilities.
+    # ------------------------------------------------------------------
+    # KakaoTalk export helpers
+    # ------------------------------------------------------------------
 
-        Args:
-            question: The user's question.
-            chat_id: Telegram chat ID for conversation history.
+    _KAKAO_EXPORT_DIR = Path.home() / "Documents" / "fda-exports" / "kakaotalk"
+
+    def _get_kakao_messages(self, question: str) -> str:
+        """Read KakaoTalk export and return messages filtered by date.
+
+        Parses date hints from the question (e.g. "yesterday", "last week",
+        a specific date) and returns matching messages formatted as text.
         """
-        # Build context with user info
-        context = {}
+        from fda.kakaotalk.parser import KakaoTalkParser
 
-        # Add user context from onboarding
+        # Find the latest export file
+        export_dir = self._KAKAO_EXPORT_DIR
+        if not export_dir.exists():
+            return "(No KakaoTalk exports found)"
+
+        candidates = list(export_dir.glob("*.csv")) + list(export_dir.glob("*.txt"))
+        if not candidates:
+            return "(No KakaoTalk export files found)"
+
+        latest = max(candidates, key=lambda p: p.stat().st_mtime)
+
+        # Determine date range from the question
+        since = self._parse_date_hint(question)
+
+        parser = KakaoTalkParser()
+        if since:
+            messages = parser.parse_and_diff(latest, since)
+        else:
+            # Default: last 24 hours
+            messages = parser.parse_and_diff(latest, datetime.now() - timedelta(days=1))
+
+        if not messages:
+            date_str = since.strftime("%Y-%m-%d") if since else "last 24 hours"
+            return f"(No KakaoTalk messages found since {date_str})"
+
+        # Format messages for context (cap at 50 to keep prompt reasonable)
+        lines = []
+        for msg in messages[-50:]:
+            ts = msg.timestamp.strftime("%m/%d %H:%M")
+            lines.append(f"[{ts}] {msg.sender}: {msg.text}")
+
+        header = f"KakaoTalk messages ({len(messages)} total, showing last {len(lines)}):"
+        return header + "\n" + "\n".join(lines)
+
+    @staticmethod
+    def _parse_date_hint(question: str) -> Optional[datetime]:
+        """Extract a date reference from a question.
+
+        Handles: "yesterday", "today", "last N days", "this week",
+        "YYYY-MM-DD", "MM/DD", Korean date references.
+        """
+        q = question.lower()
+        now = datetime.now()
+
+        if "yesterday" in q or "어제" in q:
+            return (now - timedelta(days=1)).replace(hour=0, minute=0, second=0)
+        if "today" in q or "오늘" in q:
+            return now.replace(hour=0, minute=0, second=0)
+        if "this week" in q or "이번 주" in q or "이번주" in q:
+            return (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0)
+        if "last week" in q or "지난 주" in q or "지난주" in q:
+            return (now - timedelta(days=now.weekday() + 7)).replace(hour=0, minute=0, second=0)
+
+        # "last N days"
+        m = re.search(r"last\s+(\d+)\s+days?", q)
+        if m:
+            return (now - timedelta(days=int(m.group(1)))).replace(hour=0, minute=0, second=0)
+
+        # Explicit date: YYYY-MM-DD
+        m = re.search(r"(\d{4})-(\d{1,2})-(\d{1,2})", q)
+        if m:
+            try:
+                return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            except ValueError:
+                pass
+
+        return None
+
+    # ------------------------------------------------------------------
+    # Agentic tool-use (API backend)
+    # ------------------------------------------------------------------
+
+    # Tool schemas for the Anthropic API tool-use loop
+    _FDA_TOOLS: list[dict[str, Any]] = [
+        {
+            "name": "search_journal",
+            "description": "Search the user's journal and notes for relevant entries. Use when the user asks about past notes, decisions, meetings, or anything previously recorded.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query text",
+                    },
+                    "top_n": {
+                        "type": "integer",
+                        "description": "Number of results to return (default 5)",
+                        "default": 5,
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+        {
+            "name": "read_kakao_chat",
+            "description": "Read KakaoTalk chat messages. Use when the user asks about client chats, KakaoTalk messages, or what was discussed in a chat room.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "date_hint": {
+                        "type": "string",
+                        "description": "Date reference like 'yesterday', 'today', 'last 3 days', '2026-02-20', or Korean equivalents like '어제', '오늘'. Defaults to last 24 hours.",
+                    },
+                },
+                "required": [],
+            },
+        },
+        {
+            "name": "get_tasks",
+            "description": "Get the user's task list. Use when the user asks about their tasks, to-dos, or what they need to work on.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "description": "Filter by status: 'pending', 'in_progress', 'completed', 'blocked'. Omit for all tasks.",
+                    },
+                },
+                "required": [],
+            },
+        },
+        {
+            "name": "get_alerts",
+            "description": "Get unacknowledged alerts and reminders. Use when the user asks about alerts, warnings, or urgent items.",
+            "input_schema": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+        {
+            "name": "get_calendar_events",
+            "description": "Get calendar events for a date. Use when the user asks about their schedule, meetings, or calendar.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "date": {
+                        "type": "string",
+                        "description": "Date in YYYY-MM-DD format or 'today'/'tomorrow'. Defaults to today.",
+                    },
+                },
+                "required": [],
+            },
+        },
+        {
+            "name": "run_remote_task",
+            "description": "Dispatch a task to the remote worker agent that SSHes into client VMs. Use when the user asks about their server, VM, deployed code, remote services, or wants to check/verify something on a client's remote machine (e.g., 'check if Amazon SES is configured', 'what services are running', 'check the email system').",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": "Natural language description of the task to perform on the remote VM.",
+                    },
+                    "client_id": {
+                        "type": "string",
+                        "description": "Optional client identifier (e.g., 'aonebnh'). If omitted, uses the default client.",
+                    },
+                },
+                "required": ["task"],
+            },
+        },
+        {
+            "name": "run_local_task",
+            "description": "Dispatch a task to the local worker agent that operates on the Mac Mini filesystem. Use for tasks on the local FDA codebase or other local projects.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": "Natural language description of the task to perform locally.",
+                    },
+                    "project_path": {
+                        "type": "string",
+                        "description": "Optional local project directory path. If omitted, uses the default project.",
+                    },
+                },
+                "required": ["task"],
+            },
+        },
+    ]
+
+    def _execute_tool(self, tool_name: str, tool_input: dict[str, Any]) -> str:
+        """Execute an FDA tool and return the result as a string."""
+        try:
+            if tool_name == "search_journal":
+                query = tool_input.get("query", "")
+                top_n = tool_input.get("top_n", 5)
+                entries = self.journal_retriever.retrieve_with_content(
+                    query_text=query, top_n=top_n
+                )
+                if not entries:
+                    return "No journal entries found."
+                results = []
+                for e in entries:
+                    results.append({
+                        "summary": e.get("summary", ""),
+                        "date": e.get("created_at", "")[:10],
+                        "tags": e.get("tags", []),
+                        "content": (e.get("content") or "")[:500],
+                    })
+                return json.dumps(results, ensure_ascii=False, default=str)
+
+            elif tool_name == "read_kakao_chat":
+                date_hint = tool_input.get("date_hint", "")
+                # Reuse existing helper — it parses date hints and reads exports
+                return self._get_kakao_messages(date_hint or "last 24 hours")
+
+            elif tool_name == "get_tasks":
+                status = tool_input.get("status")
+                tasks = self.state.get_tasks(status=status)
+                if not tasks:
+                    return "No tasks found." if not status else f"No tasks with status '{status}'."
+                results = [
+                    {
+                        "id": t.get("id"),
+                        "title": t.get("title"),
+                        "status": t.get("status"),
+                        "priority": t.get("priority"),
+                        "owner": t.get("owner"),
+                        "description": (t.get("description") or "")[:200],
+                    }
+                    for t in tasks[:15]
+                ]
+                return json.dumps(results, ensure_ascii=False, default=str)
+
+            elif tool_name == "get_alerts":
+                alerts = self.state.get_alerts(acknowledged=False)
+                if not alerts:
+                    return "No unacknowledged alerts."
+                results = [
+                    {
+                        "level": a.get("level"),
+                        "message": a.get("message"),
+                        "source": a.get("source"),
+                        "created_at": a.get("created_at", "")[:16],
+                    }
+                    for a in alerts
+                ]
+                return json.dumps(results, ensure_ascii=False, default=str)
+
+            elif tool_name == "get_calendar_events":
+                date_str = tool_input.get("date", "today")
+                try:
+                    from fda.outlook import OutlookCalendar
+                    cal = OutlookCalendar()
+                    if not cal.access_token:
+                        return "Calendar not connected. User needs to set up Outlook Calendar first."
+                    # Parse date
+                    if date_str == "today":
+                        target = datetime.now().date()
+                    elif date_str == "tomorrow":
+                        target = (datetime.now() + timedelta(days=1)).date()
+                    else:
+                        target = datetime.strptime(date_str, "%Y-%m-%d").date()
+                    start = datetime.combine(target, datetime.min.time())
+                    end = datetime.combine(target, datetime.max.time())
+                    events = cal.get_events_range(start=start, end=end)
+                    if not events:
+                        return f"No calendar events on {target.isoformat()}."
+                    results = [
+                        {
+                            "subject": ev.get("subject"),
+                            "start": ev.get("start", {}).get("dateTime", "")[:16],
+                            "end": ev.get("end", {}).get("dateTime", "")[:16],
+                            "location": ev.get("location", {}).get("displayName", ""),
+                        }
+                        for ev in events
+                    ]
+                    return json.dumps(results, ensure_ascii=False, default=str)
+                except ImportError:
+                    return "Calendar module not available."
+                except Exception as e:
+                    return f"Calendar error: {e}"
+
+            elif tool_name in ("run_remote_task", "run_local_task"):
+                task = tool_input.get("task", "")
+                is_remote = tool_name == "run_remote_task"
+
+                if is_remote:
+                    dispatch = self._remote_task_dispatch
+                    dispatch_label = "Remote worker"
+                else:
+                    dispatch = self._local_task_dispatch
+                    dispatch_label = "Local worker"
+
+                if not dispatch:
+                    return f"{dispatch_label} dispatch not available. The FDA system may not be fully started."
+                try:
+                    if is_remote:
+                        client_id = tool_input.get("client_id")
+                        result = dispatch(task, client_id)
+                    else:
+                        project_path = tool_input.get("project_path")
+                        result = dispatch(task, project_path)
+
+                    if result.get("success"):
+                        if result.get("investigation"):
+                            analysis = result.get("analysis") or result.get("explanation", "")
+                            return analysis[:3000] if analysis else "Investigation complete — no issues found."
+
+                        parts = []
+                        if result.get("explanation"):
+                            parts.append(f"Explanation: {result['explanation']}")
+                        if result.get("files"):
+                            parts.append(f"Files affected: {', '.join(result['files'])}")
+                        if result.get("diff"):
+                            parts.append(f"Diff:\n{result['diff'][:1500]}")
+                        if result.get("approval_id"):
+                            parts.append(f"Approval ID: {result['approval_id']} (use /approve or /reject)")
+                        return "\n\n".join(parts) if parts else "Task completed successfully."
+                    else:
+                        error = result.get("error", "Unknown error")
+                        analysis = result.get("analysis", "")
+                        msg = f"{dispatch_label} task failed: {error}"
+                        if analysis:
+                            msg += f"\n\nAnalysis:\n{analysis[:1000]}"
+                        return msg
+                except Exception as e:
+                    return f"Error dispatching {dispatch_label.lower()} task: {e}"
+
+            else:
+                return f"Unknown tool: {tool_name}"
+
+        except Exception as e:
+            logger.error(f"[TelegramBot] Tool {tool_name} error: {e}")
+            return f"Error executing {tool_name}: {e}"
+
+    def _answer_with_tools(self, question: str, chat_id: str) -> str:
+        """Answer using the API backend's agentic tool-use loop.
+
+        Sends the question with tool definitions and lets Claude decide
+        which data sources to consult.
+        """
+        # Build minimal context for the system prompt
+        user_name = self.state.get_context("user_name") or "the user"
+        today = datetime.now().strftime("%Y-%m-%d (%A)")
+
+        system = TELEGRAM_SYSTEM_PROMPT + f"""
+Today is {today}. The user's name is {user_name}.
+
+You have tools to look up the user's data. Use them when you need information to answer the question — don't guess. If the user asks about chats, notes, tasks, calendar, or alerts, call the appropriate tool first.
+"""
+
+        # Include recent conversation for continuity
+        messages: list[dict[str, Any]] = []
+        try:
+            recent = self.state.get_messages_recent(channel_id=str(chat_id), limit=5)
+            for msg in recent:
+                messages.append({
+                    "role": msg["role"],
+                    "content": msg["content"][:300],
+                })
+        except Exception:
+            pass
+
+        messages.append({"role": "user", "content": question})
+
+        return self.backend.complete_with_tools(
+            system=system,
+            messages=messages,
+            tools=self._FDA_TOOLS,
+            tool_executor=self._execute_tool,
+            model=self.model,
+            max_tokens=4096,
+            max_iterations=5,
+        )
+
+    # ------------------------------------------------------------------
+    # Answer question — dispatches to agentic or intent-based routing
+    # ------------------------------------------------------------------
+
+    def _answer_question(self, question: str, chat_id: str = "telegram") -> str:
+        """Answer a question using the best available backend.
+
+        If the API backend is available (supports tool use), uses the
+        agentic approach where Claude calls tools as needed.
+        Falls back to keyword-based intent routing for the CLI backend.
+        """
+        from fda.claude_backend import AnthropicAPIBackend
+
+        if isinstance(self.backend, AnthropicAPIBackend):
+            return self._answer_with_tools(question, chat_id)
+
+        return self._answer_with_intent_router(question, chat_id)
+
+    def _answer_with_intent_router(self, question: str, chat_id: str) -> str:
+        """Fallback: answer using keyword-based intent routing (CLI backend)."""
+        intents = _detect_intents(question)
+        context: dict[str, Any] = {"today": datetime.now().strftime("%Y-%m-%d %H:%M")}
+
         user_name = self.state.get_context("user_name")
         if user_name:
-            context["user"] = {
-                "name": user_name,
-                "role": self.state.get_context("user_role"),
-                "goals": self.state.get_context("user_goals"),
-                "challenges": self.state.get_context("user_challenges"),
-            }
+            context["user_name"] = user_name
 
-        # Add task/project context
-        project_context = self.get_project_context()
-        context.update(project_context)
-
-        # Search journal for relevant entries
-        relevant_entries = self.search_journal(question, top_n=3)
-        if relevant_entries:
-            context["relevant_notes"] = [
-                {
-                    "summary": e.get("summary"),
-                    "date": e.get("created_at", "")[:10],
-                }
-                for e in relevant_entries
-            ]
-
-        # Load recent conversation history from state DB
         try:
-            recent_msgs = self.state.get_messages_recent(channel_id=str(chat_id), limit=20)
+            recent_msgs = self.state.get_messages_recent(channel_id=str(chat_id), limit=5)
             if recent_msgs:
-                convo_lines = []
+                convo = []
                 for msg in recent_msgs:
                     role = "User" if msg["role"] == "user" else "FDA"
-                    convo_lines.append(f"{role}: {msg['content'][:300]}")
-                context["recent_conversation_for_context"] = "\n".join(convo_lines)
-        except Exception as e:
-            logger.debug(f"[TelegramBot] Could not load conversation history: {e}")
+                    convo.append(f"{role}: {msg['content'][:200]}")
+                context["recent_conversation"] = "\n".join(convo)
+        except Exception:
+            pass
+
+        if "kakao" in intents:
+            context["kakaotalk_messages"] = self._get_kakao_messages(question)
+
+        if "tasks" in intents:
+            tasks = self.state.get_tasks()
+            if tasks:
+                context["tasks"] = [
+                    {"title": t.get("title"), "status": t.get("status"), "priority": t.get("priority")}
+                    for t in tasks[:10]
+                ]
+
+        if "journal" in intents:
+            entries = self.search_journal(question, top_n=3)
+            if entries:
+                context["journal_entries"] = [
+                    {"summary": e.get("summary"), "date": e.get("created_at", "")[:10]}
+                    for e in entries
+                ]
+
+        if "calendar" in intents:
+            context["calendar_note"] = "Calendar integration not yet active"
+
+        if "alerts" in intents:
+            alerts = self.state.get_alerts(acknowledged=False)
+            if alerts:
+                context["alerts"] = [
+                    {"level": a.get("level"), "message": a.get("message"), "source": a.get("source")}
+                    for a in alerts
+                ]
+
+        if "general" in intents:
+            entries = self.search_journal(question, top_n=2)
+            if entries:
+                context["relevant_notes"] = [
+                    {"summary": e.get("summary"), "date": e.get("created_at", "")[:10]}
+                    for e in entries
+                ]
 
         return self.chat_with_context(question, context)
 
@@ -601,7 +1054,9 @@ Keep it conversational and under 150 words. Don't use excessive formatting."""
         """
         Run the Telegram bot event loop.
 
-        This starts the bot and processes incoming messages.
+        Uses the low-level async API so it can run in a daemon thread
+        (run_polling() calls signal.set_wakeup_fd which only works in
+        the main thread).
         """
         import sys
 
@@ -613,20 +1068,46 @@ Keep it conversational and under 150 words. Don't use excessive formatting."""
         print("[TelegramBot] Application built. Starting polling...", flush=True)
         print("[TelegramBot] Connecting to Telegram API...", flush=True)
 
-        # Run the bot with robust polling configuration
-        try:
-            app.run_polling(
+        # Use a dedicated event loop so we can run in a non-main thread.
+        # app.run_polling() is a convenience wrapper that installs signal
+        # handlers — those only work from the main thread.  Instead we
+        # drive initialize → start → updater.start_polling → idle manually.
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        async def _run():
+            await app.initialize()
+            await app.start()
+            await app.updater.start_polling(
                 allowed_updates=["message"],
-                drop_pending_updates=True,  # Ignore old messages on startup
-                poll_interval=1.0,  # Poll every second
-                timeout=30,  # Long polling timeout
+                drop_pending_updates=True,
+                poll_interval=1.0,
+                timeout=30,
             )
+            logger.info("[TelegramBot] Polling started ✓")
+            print("[TelegramBot] Polling started ✓", flush=True)
+
+            # Block until the thread is interrupted
+            try:
+                while True:
+                    await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                pass
+            finally:
+                await app.updater.stop()
+                await app.stop()
+                await app.shutdown()
+
+        try:
+            loop.run_until_complete(_run())
         except KeyboardInterrupt:
             logger.info("[TelegramBot] Received shutdown signal")
             print("\n[TelegramBot] Received shutdown signal", flush=True)
         except Exception as e:
             logger.error(f"[TelegramBot] Error in event loop: {e}")
             print(f"[TelegramBot] Error: {e}", file=sys.stderr, flush=True)
+        finally:
+            loop.close()
 
         logger.info("[TelegramBot] Event loop stopped")
         print("[TelegramBot] Event loop stopped", flush=True)

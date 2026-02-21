@@ -67,6 +67,22 @@ def handle_start(args: argparse.Namespace) -> int:
     - KakaoTalk polling (client message classification)
     """
     import logging
+    from pathlib import Path
+
+    # Load .env file if present (before any config reads)
+    env_file = Path(__file__).parent.parent / ".env"
+    if env_file.exists():
+        import os
+        with open(env_file) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    key, _, value = line.partition("=")
+                    key, value = key.strip(), value.strip()
+                    if key and key not in os.environ:
+                        os.environ[key] = value
 
     # Configure logging
     log_level = logging.DEBUG if getattr(args, "verbose", False) else logging.INFO
@@ -87,6 +103,7 @@ def handle_start(args: argparse.Namespace) -> int:
     print("Subsystems:")
     print("  • Worker agent (code analysis + SSH deploy)")
     print("  • Telegram bot (user Q&A + code approval)")
+    print("  • Slack bot (Socket Mode)")
     print("  • Discord bot (voice meetings + note-taking)")
     print("  • Outlook calendar (meeting prep)")
     print("  • KakaoTalk reader (client messages)")
@@ -95,11 +112,13 @@ def handle_start(args: argparse.Namespace) -> int:
     # Parse feature flags
     enable_telegram = not getattr(args, "no_telegram", False)
     enable_discord = not getattr(args, "no_discord", False)
+    enable_slack = not getattr(args, "no_slack", False)
     enable_calendar = not getattr(args, "no_calendar", False)
 
     orchestrator = FDAOrchestrator(
         enable_telegram=enable_telegram,
         enable_discord=enable_discord,
+        enable_slack=enable_slack,
         enable_calendar=enable_calendar,
     )
 
@@ -1396,6 +1415,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--no-discord",
         action="store_true",
         help="Disable Discord bot",
+    )
+    start_parser.add_argument(
+        "--no-slack",
+        action="store_true",
+        help="Disable Slack bot",
     )
     start_parser.add_argument(
         "--no-calendar",

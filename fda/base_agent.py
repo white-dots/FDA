@@ -347,12 +347,19 @@ class BaseAgent(ABC):
         alerts = self.state.get_alerts(acknowledged=False)
 
         # Group tasks by status
-        tasks_by_status = {}
+        tasks_by_status: dict[str, list] = {}
         for task in tasks:
             status = task.get("status", "unknown")
             if status not in tasks_by_status:
                 tasks_by_status[status] = []
-            tasks_by_status[status].append(task)
+            # Include only summary fields — full descriptions bloat the prompt
+            tasks_by_status[status].append({
+                "id": task.get("id"),
+                "title": task.get("title"),
+                "status": status,
+                "priority": task.get("priority"),
+                "description": (task.get("description") or "")[:200],
+            })
 
         return {
             "timestamp": datetime.now().isoformat(),

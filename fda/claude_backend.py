@@ -10,11 +10,12 @@ Set FDA_CLAUDE_BACKEND=api to force API mode, or FDA_CLAUDE_BACKEND=cli to force
 By default, the system auto-detects: if `claude` is on PATH, it uses CLI.
 """
 
+import json
 import logging
 import os
 import shutil
 import subprocess
-from typing import Optional
+from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,29 @@ class ClaudeBackend:
         """
         raise NotImplementedError
 
+    def complete_with_tools(
+        self,
+        *,
+        system: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        tool_executor: Callable[[str, dict[str, Any]], str],
+        model: str = "",
+        max_tokens: int = 4096,
+        max_iterations: int = 5,
+    ) -> str:
+        """Run an agentic tool-use loop.
+
+        Subclasses that support tool use (API backend) override this.
+        The default fallback ignores tools and calls ``complete()``.
+        """
+        return self.complete(
+            system=system,
+            messages=messages,
+            model=model,
+            max_tokens=max_tokens,
+        )
+
 
 # ---------------------------------------------------------------------------
 # CLI backend — uses `claude --print` (Max subscription)
@@ -64,7 +88,7 @@ class ClaudeCodeCLIBackend(ClaudeBackend):
     The CLI must be installed and authenticated (`claude` on PATH).
     """
 
-    def __init__(self, timeout: int = 120):
+    def __init__(self, timeout: int = 180):
         self._timeout = timeout
 
     def complete(
@@ -76,23 +100,22 @@ class ClaudeCodeCLIBackend(ClaudeBackend):
         max_tokens: int = 4096,
         temperature: float = 0.7,
     ) -> str:
-        # Build a single prompt from system + messages
-        prompt = self._build_prompt(system, messages)
+        # Build the user prompt from messages
+        prompt = self._build_prompt("", messages)
 
         cmd = ["claude", "--print"]
         # Pass the system prompt via --system-prompt if provided
         if system:
             cmd.extend(["--system-prompt", system])
-            # Only send the user messages as the prompt
-            prompt = self._build_prompt("", messages)
 
-        cmd.append(prompt)
+        # Prompt is passed via stdin to avoid OS argument length limits
 
-        logger.debug(f"[ClaudeCodeCLI] Running: claude --print ({len(prompt)} chars)")
+        logger.debug(f"[ClaudeCodeCLI] Running: claude --print ({len(prompt)} chars via stdin)")
 
         try:
             result = subprocess.run(
                 cmd,
+                input=prompt,
                 capture_output=True,
                 text=True,
                 timeout=self._timeout,
@@ -165,7 +188,7 @@ class AnthropicAPIBackend(ClaudeBackend):
         *,
         system: str,
         messages: list[dict[str, str]],
-        model: str = "claude-3-5-haiku-20241022",
+        model: str = "claude-sonnet-4-5-20250929",
         max_tokens: int = 4096,
         temperature: float = 0.7,
     ) -> str:
@@ -177,6 +200,66 @@ class AnthropicAPIBackend(ClaudeBackend):
             temperature=temperature,
         )
         return response.content[0].text
+
+    def complete_with_tools(
+        self,
+        *,
+        system: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        tool_executor: Callable[[str, dict[str, Any]], str],
+        model: str = "claude-sonnet-4-5-20250929",
+        max_tokens: int = 4096,
+        max_iterations: int = 5,
+    ) -> str:
+        """Run an agentic tool-use loop via the Anthropic API.
+
+        Sends the request with tool definitions. When Claude responds with
+        tool_use blocks, executes them via *tool_executor* and feeds the
+        results back.  Loops until Claude produces a final text response
+        or *max_iterations* is reached.
+        """
+        msgs = list(messages)
+
+        for _ in range(max_iterations):
+            response = self._client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                system=system,
+                messages=msgs,
+                tools=tools,
+            )
+
+            # Collect tool-use blocks
+            tool_blocks = [b for b in response.content if b.type == "tool_use"]
+
+            if not tool_blocks:
+                # Final answer — extract text
+                text_parts = [b.text for b in response.content if b.type == "text"]
+                return "\n".join(text_parts) or ""
+
+            # Build assistant message with all content blocks
+            msgs.append({"role": "assistant", "content": response.content})
+
+            # Execute each tool and collect results
+            tool_results = []
+            for block in tool_blocks:
+                try:
+                    result = tool_executor(block.name, block.input)
+                except Exception as e:
+                    logger.error(f"Tool {block.name} failed: {e}")
+                    result = f"Error: {e}"
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": str(result),
+                })
+
+            msgs.append({"role": "user", "content": tool_results})
+
+        # Max iterations reached — return whatever text we have
+        logger.warning("Tool-use loop hit max iterations")
+        return "(Reached maximum tool iterations — please try a simpler question)"
 
     @property
     def raw_client(self):

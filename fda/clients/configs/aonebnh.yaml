@@ -1,0 +1,56 @@
+client:
+  id: "aonebnh"
+  name: "AoneBnH"
+  company: "AoneBnH"
+  kakaotalk_room: "고재정, 예리누나, 이순철"
+
+infrastructure:
+  vm:
+    host: "20.200.144.181"
+    ssh_user: "datacore"
+    ssh_key: "~/.ssh/aonebnh_key"
+    port: 22
+  database:
+    type: "postgresql"
+    host: "sofsys.postgres.database.azure.com"
+    port: 5432
+    name: "aonebnh"
+    user: "sofsys"
+    password_env: "AONEBNH_DB_PASSWORD"
+
+project:
+  repo_path: "~/dev/main/manage"
+  extra_repo_paths:
+    - "~/airflow"
+  local_mirror: ""
+  tech_stack: "Python/Airflow/PostgreSQL"
+  deploy_command: ""  # live codebase, no restart needed
+  pre_deploy_command: ""
+  health_check_command: ""
+  backup_dir: ""
+
+business_context: |
+  AoneBnH is a reseller company that serves the Korean beauty platform Oliveyoung.
+  Main services provided by Datacore:
+  - Brand-level sales data connection (connecting brand sales data to AoneBnH systems)
+  - SKU-level inventory checking (monitoring stock levels per product)
+  - Masterfile management (product master data maintenance)
+  The codebase is primarily Airflow DAGs and Python scripts at ~/dev/main/manage and ~/airflow.
+  This is a live production codebase — changes take effect immediately.
+
+key_contacts:
+  "고재정": "primary contact"
+  "예리누나": "contact"
+  "이순철": "contact"
+
+common_requests:
+  - "Sales data pipeline fixes or updates"
+  - "Inventory check DAG modifications"
+  - "Masterfile sync issues"
+  - "New brand onboarding data connections"
+
+notes: |
+  Two repo paths on the VM: ~/dev/main/manage (main codebase) and ~/airflow (DAGs).
+  SSH uses key-based auth (~/.ssh/aonebnh_key).
+  Database is Azure PostgreSQL (sofsys.postgres.database.azure.com).
+  Changes are live — no deploy/restart step needed.
