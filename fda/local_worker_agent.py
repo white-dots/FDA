@@ -317,16 +317,16 @@ Important rules:
         """
         Use Claude to identify which files are relevant to the task.
 
-        Same logic as WorkerAgent._identify_relevant_files but uses
-        project path info instead of ClientConfig.
+        Sends ALL files (not just the first 300) so Claude sees the
+        full codebase.
         """
         if hint_files:
             return hint_files
 
-        # Auto-detect tech stack
         tech_stack = self._detect_tech_stack(project_path)
 
-        files_list = "\n".join(all_files[:300])
+        # Send all files, not just 300
+        files_list = "\n".join(all_files)
 
         text = self._backend.complete(
             system=(
@@ -337,20 +337,17 @@ Important rules:
             ),
             messages=[{
                 "role": "user",
-                "content": f"""Task: {task_brief}
-
-Tech stack: {tech_stack}
-Project: {project_path.name}
-
-Repository files:
-{files_list}
-
-Which files should I read to understand and fix this issue?
-Return a JSON array of the most relevant file paths (max 15 files).
-""",
+                "content": (
+                    f"Task: {task_brief}\n\n"
+                    f"Tech stack: {tech_stack}\n"
+                    f"Project: {project_path.name}\n\n"
+                    f"Repository files:\n{files_list}\n\n"
+                    "Which files should I read to understand and fix this issue?\n"
+                    "Return a JSON array of the most relevant file paths (max 20 files)."
+                ),
             }],
             model=MODEL_EXECUTOR,
-            max_tokens=1000,
+            max_tokens=2000,
         )
 
         try:
@@ -370,15 +367,23 @@ Return a JSON array of the most relevant file paths (max 15 files).
         task_brief: str,
         all_files: list[str],
     ) -> list[str]:
-        """Fallback file search using keyword matching."""
-        keywords = task_brief.lower().split()
-        scored: list[tuple[str, int]] = []
+        """Fallback file search with stopword filtering."""
+        from fda.worker_agent import _STOPWORDS
+
+        keywords = [
+            w for w in task_brief.lower().split()
+            if len(w) > 2 and w not in _STOPWORDS
+        ]
+        scored: list[tuple[str, float]] = []
         for filepath in all_files:
-            score = sum(1 for kw in keywords if kw in filepath.lower())
+            fp_lower = filepath.lower()
+            score = sum(2.0 for kw in keywords if kw in fp_lower)
+            if fp_lower.endswith((".py", ".sql")):
+                score += 1.0
             if score > 0:
                 scored.append((filepath, score))
         scored.sort(key=lambda x: x[1], reverse=True)
-        return [path for path, _ in scored[:10]]
+        return [path for path, _ in scored[:20]]
 
     def _detect_tech_stack(self, project_path: Path) -> str:
         """Auto-detect tech stack from project files."""

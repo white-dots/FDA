@@ -111,6 +111,11 @@ Important rules:
         self._structure_cache: dict[tuple[str, str], tuple[float, list[str]]] = {}
         self._structure_cache_ttl = 300.0  # 5 minutes
 
+        # Cache for file importance rankings (git-based, refreshed daily)
+        # Key: client_id, Value: (timestamp, {filepath: importance_score})
+        self._ranking_cache: dict[str, tuple[float, dict[str, float]]] = {}
+        self._ranking_cache_ttl = 86400.0  # 24 hours
+
         # Warm up SSH connections to all clients at init time
         self._warmup_connections()
 
@@ -203,14 +208,11 @@ Important rules:
         repo_path = client.project.repo_path
 
         # Step 1: Understand the codebase structure
+        all_paths = [repo_path] + (client.project.extra_repo_paths or [])
+        path_label = f" across {len(all_paths)} paths" if len(all_paths) > 1 else ""
         _progress(f"📂 Scanning codebase on {client.name} VM...")
         structure = self._explore_codebase(ssh, repo_path, client)
-        cache_key = (client.client_id, repo_path)
-        was_cached = cache_key in self._structure_cache
-        if was_cached:
-            _progress(f"📂 Found {len(structure)} files (cached)")
-        else:
-            _progress(f"📂 Found {len(structure)} files")
+        _progress(f"📂 Found {len(structure)} files{path_label}")
 
         # Step 2: Identify relevant files
         _progress("🔍 Identifying relevant files...")
@@ -241,9 +243,10 @@ Important rules:
         def _resolve(f: str) -> str:
             if f.startswith("./"):
                 return f"{repo_path}/{f[2:]}"
-            elif not f.startswith("/"):
+            elif f.startswith("~") or f.startswith("/"):
+                return f  # already absolute (from extra paths or hint_files)
+            else:
                 return f"{repo_path}/{f}"
-            return f
 
         abs_files = [_resolve(f) for f in relevant_files]
 
@@ -301,28 +304,20 @@ Important rules:
         client: ClientConfig,
     ) -> list[str]:
         """
-        Get an overview of the codebase structure.
+        Get an overview of the codebase structure across all repo paths.
 
-        Returns a list of file paths in the repository.
-        Uses a TTL cache (default 5 min) to avoid re-running `find`
-        on every analyze_and_fix() call.
+        Scans ``repo_path`` plus any ``extra_repo_paths`` from the client
+        config.  Each path is cached independently (5-min TTL).  After
+        collecting all files, they are sorted by importance score (most
+        important first) using git-based ranking (24h TTL cache).
+
+        Returns a list of file paths sorted by importance.
         """
-        cache_key = (client.client_id, repo_path)
+        all_paths = [repo_path] + (client.project.extra_repo_paths or [])
+        combined_files: list[str] = []
         now = time.monotonic()
 
-        # Check cache
-        if cache_key in self._structure_cache:
-            cached_time, cached_files = self._structure_cache[cache_key]
-            age = now - cached_time
-            if age < self._structure_cache_ttl:
-                logger.debug(
-                    f"Using cached file listing for {client.name} "
-                    f"({len(cached_files)} files, {age:.0f}s old)"
-                )
-                return cached_files
-
-        # Get file list, excluding common non-code directories
-        result = ssh.execute(
+        _find_cmd = (
             "find . -type f "
             "! -path './.git/*' "
             "! -path './node_modules/*' "
@@ -334,22 +329,44 @@ Important rules:
             "! -path './dist/*' "
             "! -path './build/*' "
             "! -path './*.pyc' "
-            "| head -2000",
-            cwd=repo_path,
-            timeout=15,
+            "| head -2000"
         )
 
-        if result.success:
-            files = [
-                line.strip()
-                for line in result.stdout.strip().split("\n")
-                if line.strip()
-            ]
-            # Cache the result
-            self._structure_cache[cache_key] = (now, files)
-            logger.info(f"Cached file listing for {client.name}: {len(files)} files")
-            return files
-        return []
+        for path in all_paths:
+            cache_key = (client.client_id, path)
+
+            # Check cache
+            if cache_key in self._structure_cache:
+                cached_time, cached_files = self._structure_cache[cache_key]
+                if (now - cached_time) < self._structure_cache_ttl:
+                    combined_files.extend(cached_files)
+                    continue
+
+            result = ssh.execute(_find_cmd, cwd=path, timeout=15)
+
+            if result.success and result.stdout.strip():
+                files = [
+                    line.strip()
+                    for line in result.stdout.strip().split("\n")
+                    if line.strip()
+                ]
+                # Prefix files from extra paths with their root so they
+                # can be resolved to absolute paths downstream.
+                if path != repo_path:
+                    files = [
+                        f"{path}/{f[2:]}" if f.startswith("./") else f"{path}/{f}"
+                        for f in files
+                    ]
+                self._structure_cache[cache_key] = (now, files)
+                logger.info(f"Cached file listing for {client.name} ({path}): {len(files)} files")
+                combined_files.extend(files)
+
+        # Rank files by importance (git signals + query history)
+        rankings = self._rank_files(ssh, client, all_paths)
+        if rankings:
+            combined_files.sort(key=lambda f: rankings.get(f, 0.0), reverse=True)
+
+        return combined_files
 
     def invalidate_structure_cache(self, client_id: Optional[str] = None) -> None:
         """Clear the codebase structure cache.
@@ -367,6 +384,258 @@ Important rules:
             self._structure_cache.clear()
             logger.debug("Cleared all structure caches")
 
+    # ------------------------------------------------------------------
+    # File ranking — git signals + query history
+    # ------------------------------------------------------------------
+
+    def _rank_files(
+        self,
+        ssh: SSHManager,
+        client: ClientConfig,
+        search_paths: Optional[list[str]] = None,
+    ) -> dict[str, float]:
+        """Compute importance scores for all files using git or filesystem signals.
+
+        When git is available:
+          - Recent edits in last 3 months via git log (0.30)
+          - All-time commit frequency via git log   (0.25)
+        When git is NOT available (fallback):
+          - Recently modified files via find -mtime  (0.30)
+          - File complexity via wc -l                (0.25)
+
+        Always:
+          - Python import hub score via grep         (0.15)
+          - Query history from state DB              (0.30)
+
+        Results are cached per client for 24 hours.
+        """
+        now = time.monotonic()
+        if client.client_id in self._ranking_cache:
+            cached_time, cached_ranks = self._ranking_cache[client.client_id]
+            if (now - cached_time) < self._ranking_cache_ttl:
+                return cached_ranks
+
+        if search_paths is None:
+            search_paths = [client.project.repo_path] + (client.project.extra_repo_paths or [])
+
+        # Collect raw counts per signal across all paths
+        recent: dict[str, int] = {}   # filepath → recency score
+        frequency: dict[str, int] = {}  # filepath → frequency/complexity score
+        imports: dict[str, int] = {}   # module name → import count
+
+        # Check if first path has git (use test -d to avoid SSH warning on non-git repos)
+        git_check = ssh.execute('test -d .git && echo yes || echo no',
+                                cwd=search_paths[0], timeout=5)
+        has_git = git_check.success and git_check.stdout.strip() == 'yes'
+
+        if has_git:
+            batch_cmd = (
+                '('
+                'echo "===RECENT==="; '
+                'git log --all --pretty=format: --name-only --since="3 months ago" 2>/dev/null '
+                '| grep -v "^$" | sort | uniq -c | sort -rn | head -200; '
+                'echo "===FREQUENCY==="; '
+                'git log --all --pretty=format: --name-only 2>/dev/null '
+                '| grep -v "^$" | sort | uniq -c | sort -rn | head -200; '
+                'echo "===IMPORTS==="; '
+                'grep -rh "^from \\|^import " --include="*.py" . 2>/dev/null '
+                "| sed 's/from \\([^ ]*\\).*/\\1/; s/import \\([^ ,]*\\).*/\\1/' "
+                '| sort | uniq -c | sort -rn | head -100'
+                ')'
+            )
+        else:
+            # Filesystem-based fallback: mtime for recency, line count for complexity
+            excl = (
+                '! -path "*/node_modules/*" ! -path "*/__pycache__/*" '
+                '! -path "*/.git/*" ! -path "*/.ipynb_checkpoints/*" '
+                '! -path "*/backup*/*"'
+            )
+            batch_cmd = (
+                '('
+                'echo "===RECENT==="; '
+                'find . -type f \\( -name "*.py" -o -name "*.sql" -o -name "*.yaml" -o -name "*.yml" '
+                '-o -name "*.sh" -o -name "*.cfg" -o -name "*.conf" \\) '
+                f'{excl} '
+                '-mtime -90 -printf "%T@ %p\\n" 2>/dev/null '
+                '| sort -rn | head -200 | awk \'{print NR, $2}\'; '
+                'echo "===FREQUENCY==="; '
+                f'find . -type f -name "*.py" {excl} -exec wc -l {{}} + 2>/dev/null '
+                '| grep -v " total$" | sort -rn | head -200; '
+                'echo "===IMPORTS==="; '
+                'grep -rh "^from \\|^import " --include="*.py" '
+                '--exclude-dir=node_modules --exclude-dir=__pycache__ . 2>/dev/null '
+                "| sed 's/from \\([^ ]*\\).*/\\1/; s/import \\([^ ,]*\\).*/\\1/' "
+                '| sort | uniq -c | sort -rn | head -100'
+                ')'
+            )
+
+        for path in search_paths:
+            result = ssh.execute(batch_cmd, cwd=path, timeout=30)
+            if not result.success:
+                continue
+
+            section = None
+            is_primary = (path == search_paths[0])
+
+            for line in result.stdout.split("\n"):
+                stripped = line.strip()
+                if stripped == "===RECENT===":
+                    section = "recent"
+                    continue
+                elif stripped == "===FREQUENCY===":
+                    section = "frequency"
+                    continue
+                elif stripped == "===IMPORTS===":
+                    section = "imports"
+                    continue
+
+                if not stripped or section is None:
+                    continue
+
+                # Lines look like: "  42 path/to/file.py"
+                parts = stripped.split(None, 1)
+                if len(parts) != 2:
+                    continue
+
+                try:
+                    count = int(parts[0])
+                except ValueError:
+                    continue
+
+                name = parts[1]
+                # Strip leading "./" from find output
+                if name.startswith("./"):
+                    name = name[2:]
+
+                # Prefix files from extra paths
+                if not is_primary and section in ("recent", "frequency"):
+                    name = f"{path}/{name}"
+
+                if section == "recent":
+                    recent[name] = recent.get(name, 0) + count
+                elif section == "frequency":
+                    frequency[name] = frequency.get(name, 0) + count
+                elif section == "imports":
+                    imports[name] = imports.get(name, 0) + count
+
+        # Query history from state DB
+        query_counts: dict[str, int] = {}
+        try:
+            from fda.state.project_state import ProjectState
+            state = ProjectState()
+            for fp, cnt in state.get_top_files_by_relevance(client.client_id, limit=100):
+                query_counts[fp] = cnt
+        except Exception:
+            pass  # state DB may not be available
+
+        # Normalize each signal and combine
+        def _max_or_1(d: dict) -> float:
+            return max(d.values()) if d else 1.0
+
+        max_recent = _max_or_1(recent)
+        max_freq = _max_or_1(frequency)
+        max_imports = _max_or_1(imports)
+        max_query = _max_or_1(query_counts)
+
+        all_files = set(recent) | set(frequency) | set(query_counts)
+        scores: dict[str, float] = {}
+
+        for f in all_files:
+            s = 0.0
+            s += (recent.get(f, 0) / max_recent) * 0.30
+            s += (frequency.get(f, 0) / max_freq) * 0.25
+            s += (query_counts.get(f, 0) / max_query) * 0.30
+            # Import score: match module names to file paths
+            # e.g. imports["utils.helpers"] matches file "./utils/helpers.py"
+            for mod, cnt in imports.items():
+                mod_path = mod.replace(".", "/")
+                if mod_path in f:
+                    s += (cnt / max_imports) * 0.15
+                    break
+            scores[f] = s
+
+        mode = "git" if has_git else "filesystem"
+        self._ranking_cache[client.client_id] = (now, scores)
+        logger.info(
+            f"Ranked {len(scores)} files for {client.name} ({mode} mode, "
+            f"recent={len(recent)}, freq={len(frequency)}, "
+            f"imports={len(imports)}, queries={len(query_counts)})"
+        )
+        return scores
+
+    # ------------------------------------------------------------------
+    # Keyword extraction + remote grep
+    # ------------------------------------------------------------------
+
+    def _extract_search_keywords(
+        self, task_brief: str, client: ClientConfig
+    ) -> list[str]:
+        """Extract meaningful search keywords from task brief."""
+        words = set()
+        for word in re.split(r"[\s,;:!?.\"'()\[\]{}/]+", task_brief.lower()):
+            if word and len(word) > 2 and word not in _STOPWORDS:
+                words.add(word)
+
+        # Add compound pairs for adjacent keywords (e.g. brand+sales)
+        word_list = [
+            w for w in re.split(r"[\s,;:!?.\"'()\[\]{}/]+", task_brief.lower())
+            if w and len(w) > 2 and w not in _STOPWORDS
+        ]
+        for i in range(len(word_list) - 1):
+            a, b = word_list[i], word_list[i + 1]
+            words.add(f"{a}_{b}")
+            words.add(f"{a}.*{b}")  # regex-friendly for grep
+
+        return list(words)
+
+    def _grep_remote_files(
+        self,
+        ssh: SSHManager,
+        keywords: list[str],
+        search_paths: list[str],
+    ) -> list[str]:
+        """Use remote ``grep -rl`` to find files containing keywords."""
+        if not keywords:
+            return []
+
+        # Pick the most specific keywords (longer = more specific)
+        sorted_kw = sorted(keywords, key=len, reverse=True)[:15]
+        pattern = "|".join(sorted_kw)
+
+        grep_files: list[str] = []
+        seen: set[str] = set()
+
+        for path in search_paths:
+            result = ssh.execute(
+                f'grep -rl -i --include="*.py" --include="*.sql" '
+                f'--include="*.yaml" --include="*.yml" --include="*.cfg" '
+                f'--include="*.conf" --include="*.sh" '
+                f'--exclude-dir=node_modules --exclude-dir=__pycache__ '
+                f'--exclude-dir=.git --exclude-dir=.ipynb_checkpoints '
+                f'-E "{pattern}" . 2>/dev/null | head -50',
+                cwd=path,
+                timeout=15,
+            )
+            if not result.success or not result.stdout.strip():
+                continue
+
+            is_primary = (path == search_paths[0])
+            for line in result.stdout.strip().split("\n"):
+                f = line.strip()
+                if not f:
+                    continue
+                if not is_primary:
+                    f = f"{path}/{f[2:]}" if f.startswith("./") else f"{path}/{f}"
+                if f not in seen:
+                    seen.add(f)
+                    grep_files.append(f)
+
+        return grep_files
+
+    # ------------------------------------------------------------------
+    # File identification — 3-tier strategy
+    # ------------------------------------------------------------------
+
     def _identify_relevant_files(
         self,
         task_brief: str,
@@ -375,73 +644,155 @@ Important rules:
         client: ClientConfig,
     ) -> list[str]:
         """
-        Use Claude to identify which files are relevant to the task.
+        Identify files relevant to the task using a three-tier strategy:
 
-        Args:
-            task_brief: The task description.
-            all_files: All files in the repo.
-            hint_files: Pre-identified files to include.
-            client: Client config for context.
+        1. If *hint_files* provided, use those directly.
+        2. Extract keywords → ``grep`` remote VM for content matches.
+        3. Send grep hits + **all** filenames to Claude for final selection.
+        4. Fallback to improved heuristic if Claude fails.
 
-        Returns:
-            List of file paths to read.
+        After selection, records query history in the state DB so the
+        "most queried" ranking signal improves over time.
         """
         if hint_files:
             return hint_files
 
-        # Use Claude to pick relevant files
-        files_list = "\n".join(all_files[:300])  # Limit to avoid token overflow
+        ssh = self._get_ssh(client)
+        search_paths = [client.project.repo_path] + (client.project.extra_repo_paths or [])
 
-        text = self._backend.complete(
-            system="You are a code analyst. Given a task description and a list of files in a repository, identify which files are most likely relevant to the task. Return ONLY a JSON array of file paths, nothing else.",
-            messages=[{
-                "role": "user",
-                "content": f"""Task: {task_brief}
+        # --- Stage 1: keyword extraction + remote grep ---
+        keywords = self._extract_search_keywords(task_brief, client)
+        grep_hits = self._grep_remote_files(ssh, keywords, search_paths)
+        if grep_hits:
+            logger.info(f"Grep found {len(grep_hits)} content-matching files")
 
-Tech stack: {client.project.tech_stack}
+        # --- Stage 2: Claude selection ---
+        grep_section = ""
+        if grep_hits:
+            grep_section = (
+                "FILES CONTAINING RELEVANT KEYWORDS (high priority — these "
+                "files actually contain terms from the task):\n"
+                + "\n".join(grep_hits[:50])
+                + "\n\n"
+            )
 
-Repository files:
-{files_list}
-
-Which files should I read to understand and fix this issue?
-Return a JSON array of the most relevant file paths (max 15 files).
-""",
-            }],
-            model=MODEL_EXECUTOR,
-            max_tokens=1000,
-        )
+        # Send top-ranked files + grep hits (not all 4000 — that exceeds token budget)
+        # Grep hits are highest priority, then ranked files fill the rest
+        file_set = set(grep_hits)
+        ordered = list(grep_hits)
+        for f in all_files:
+            if f not in file_set:
+                file_set.add(f)
+                ordered.append(f)
+            if len(ordered) >= 500:
+                break
+        files_list = "\n".join(ordered)
 
         try:
-            # Extract JSON from response
+            text = self._backend.complete(
+                system=(
+                    "You are a code analyst. Given a task description and "
+                    "file listings, identify which files are most likely "
+                    "relevant to the task. Return ONLY a JSON array of file "
+                    "paths, nothing else."
+                ),
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        f"Task: {task_brief}\n\n"
+                        f"Tech stack: {client.project.tech_stack}\n"
+                        f"Business context: {client.business_context[:300]}\n\n"
+                        f"{grep_section}"
+                        f"ALL REPOSITORY FILES:\n{files_list}\n\n"
+                        "Which files should I read to understand and address "
+                        "this task?\n"
+                        "Return a JSON array of the most relevant file paths "
+                        "(max 20 files).\n"
+                        "Prioritize files from the keyword-matching section "
+                        "if present."
+                    ),
+                }],
+                model=MODEL_EXECUTOR,
+                max_tokens=2000,
+            )
+
             text = text.strip()
-            # Handle markdown code blocks
             if text.startswith("```"):
                 text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
             files = json.loads(text)
             if isinstance(files, list):
-                return [f for f in files if f in all_files]
+                known = set(all_files) | set(grep_hits)
+                valid = [f for f in files if f in known]
+                if valid:
+                    self._record_file_access(client.client_id, valid)
+                    return valid
         except (json.JSONDecodeError, IndexError, KeyError):
             logger.warning("Failed to parse file identification response")
+        except Exception as e:
+            logger.warning(f"File identification Claude call failed: {e}")
 
-        # Fallback: look for common patterns based on task keywords
-        return self._heuristic_file_search(task_brief, all_files)
+        # --- Stage 3: improved heuristic fallback ---
+        fallback = self._heuristic_file_search(
+            task_brief, all_files, grep_hits=grep_hits, client=client
+        )
+        if fallback:
+            self._record_file_access(client.client_id, fallback)
+        return fallback
+
+    def _record_file_access(self, client_id: str, file_paths: list[str]) -> None:
+        """Record selected files in the state DB for query-history ranking."""
+        try:
+            from fda.state.project_state import ProjectState
+            state = ProjectState()
+            state.increment_file_relevance(client_id, file_paths)
+        except Exception:
+            pass  # non-critical
 
     def _heuristic_file_search(
         self,
         task_brief: str,
         all_files: list[str],
+        grep_hits: Optional[list[str]] = None,
+        client: Optional[ClientConfig] = None,
     ) -> list[str]:
-        """Fallback file search using keyword matching."""
-        keywords = task_brief.lower().split()
-        scored: list[tuple[str, int]] = []
+        """Improved fallback file search with stopword filtering and grep boost."""
+        keywords = (
+            self._extract_search_keywords(task_brief, client)
+            if client
+            else [w for w in task_brief.lower().split() if len(w) > 2 and w not in _STOPWORDS]
+        )
+        # Filter out regex-style compound keywords for filepath matching
+        path_keywords = [kw for kw in keywords if ".*" not in kw]
 
-        for filepath in all_files:
-            score = sum(1 for kw in keywords if kw in filepath.lower())
+        grep_set = set(grep_hits or [])
+        rankings = self._ranking_cache.get(
+            client.client_id, (0, {})
+        )[1] if client else {}
+
+        scored: list[tuple[str, float]] = []
+
+        for filepath in set(all_files) | grep_set:
+            score = 0.0
+            fp_lower = filepath.lower()
+
+            for kw in path_keywords:
+                if kw in fp_lower:
+                    score += 2.0
+
+            if filepath in grep_set:
+                score += 5.0
+
+            # Boost from git-based importance
+            score += rankings.get(filepath, 0.0) * 3.0
+
+            if fp_lower.endswith((".py", ".sql")):
+                score += 1.0
+
             if score > 0:
                 scored.append((filepath, score))
 
         scored.sort(key=lambda x: x[1], reverse=True)
-        return [path for path, _ in scored[:10]]
+        return [path for path, _ in scored[:20]]
 
     def _generate_fix(
         self,
