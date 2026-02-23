@@ -49,6 +49,7 @@ PROJECT_ROOT: Final[Path] = _get_default_project_root()
 JOURNAL_DIR: Final[Path] = PROJECT_ROOT / "journal"
 STATE_DB_PATH: Final[Path] = PROJECT_ROOT / "state.db"
 MESSAGE_BUS_PATH: Final[Path] = PROJECT_ROOT / "message_bus.json"
+RESTART_MARKER_PATH: Final[Path] = PROJECT_ROOT / ".restart_requested"
 INDEX_PATH: Final[Path] = JOURNAL_DIR / "index.json"
 
 # System defaults
@@ -107,7 +108,9 @@ CLIENTS_CONFIG_DIR: Final[Path] = Path(__file__).parent / "clients" / "configs"
 # Local Worker configuration
 # List of local project directories the local worker can read/modify
 LOCAL_WORKER_PROJECTS: Final[list[str]] = [
-    str(Path(__file__).parent.parent),  # FDA project root
+    str(Path.home() / "Documents"),
+    str(Path.home() / "Downloads"),
+    str(Path.home() / "Desktop"),
 ]
 LOCAL_WORKER_BACKUP_DIR: Final[Path] = DATA_DIR / "local_backups"
 

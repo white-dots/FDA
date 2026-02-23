@@ -575,6 +575,11 @@ Important rules:
         for word in re.split(r"[\s,;:!?.\"'()\[\]{}/]+", task_brief.lower()):
             if word and len(word) > 2 and word not in _STOPWORDS:
                 words.add(word)
+                # Add singular/plural variants so "dags" also matches "dag"
+                if word.endswith("s") and len(word) > 4:
+                    words.add(word[:-1])
+                elif not word.endswith("s"):
+                    words.add(word + "s")
 
         # Add compound pairs for adjacent keywords (e.g. brand+sales)
         word_list = [
@@ -612,7 +617,7 @@ Important rules:
                 f'--include="*.conf" --include="*.sh" '
                 f'--exclude-dir=node_modules --exclude-dir=__pycache__ '
                 f'--exclude-dir=.git --exclude-dir=.ipynb_checkpoints '
-                f'-E "{pattern}" . 2>/dev/null | head -50',
+                f'-E "{pattern}" . 2>/dev/null | head -100',
                 cwd=path,
                 timeout=15,
             )
@@ -684,7 +689,7 @@ Important rules:
             if f not in file_set:
                 file_set.add(f)
                 ordered.append(f)
-            if len(ordered) >= 500:
+            if len(ordered) >= 800:
                 break
         files_list = "\n".join(ordered)
 
@@ -692,9 +697,13 @@ Important rules:
             text = self._backend.complete(
                 system=(
                     "You are a code analyst. Given a task description and "
-                    "file listings, identify which files are most likely "
-                    "relevant to the task. Return ONLY a JSON array of file "
-                    "paths, nothing else."
+                    "file listings, identify which files are relevant to the "
+                    "task. Return ONLY a JSON array of file paths, nothing else.\n\n"
+                    "IMPORTANT: Be INCLUSIVE, not exclusive. When the task asks "
+                    "about a category (e.g. 'all DAGs', 'all scripts', 'all "
+                    "configs'), include ALL files that belong to that category. "
+                    "When in doubt, include the file — it's better to include "
+                    "a few extra files than to miss relevant ones."
                 ),
                 messages=[{
                     "role": "user",
@@ -706,14 +715,15 @@ Important rules:
                         f"ALL REPOSITORY FILES:\n{files_list}\n\n"
                         "Which files should I read to understand and address "
                         "this task?\n"
-                        "Return a JSON array of the most relevant file paths "
-                        "(max 20 files).\n"
+                        "Return a JSON array of ALL relevant file paths "
+                        "(up to 50 files). Include every file that could be "
+                        "relevant — err on the side of inclusion.\n"
                         "Prioritize files from the keyword-matching section "
                         "if present."
                     ),
                 }],
                 model=MODEL_EXECUTOR,
-                max_tokens=2000,
+                max_tokens=4000,
             )
 
             text = text.strip()
@@ -792,7 +802,7 @@ Important rules:
                 scored.append((filepath, score))
 
         scored.sort(key=lambda x: x[1], reverse=True)
-        return [path for path, _ in scored[:20]]
+        return [path for path, _ in scored[:50]]
 
     def _generate_fix(
         self,

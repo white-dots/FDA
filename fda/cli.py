@@ -81,7 +81,7 @@ def handle_start(args: argparse.Namespace) -> int:
                 if "=" in line:
                     key, _, value = line.partition("=")
                     key, value = key.strip(), value.strip()
-                    if key and key not in os.environ:
+                    if key and (key not in os.environ or not os.environ[key]):
                         os.environ[key] = value
 
     # Configure logging
@@ -115,6 +115,8 @@ def handle_start(args: argparse.Namespace) -> int:
     enable_slack = not getattr(args, "no_slack", False)
     enable_calendar = not getattr(args, "no_calendar", False)
 
+    from fda.config import RESTART_MARKER_PATH
+
     orchestrator = FDAOrchestrator(
         enable_telegram=enable_telegram,
         enable_discord=enable_discord,
@@ -123,6 +125,19 @@ def handle_start(args: argparse.Namespace) -> int:
     )
 
     orchestrator.run()
+
+    # Check if a restart was requested (via /restart, !restart commands)
+    if RESTART_MARKER_PATH.exists():
+        RESTART_MARKER_PATH.unlink()
+        print()
+        print("=" * 60)
+        print("RESTARTING FDA...")
+        print("=" * 60)
+        print()
+        # Re-exec the process so all code changes take effect
+        import os, sys
+        os.execv(sys.executable, [sys.executable, "-m", "fda"] + sys.argv[1:])
+
     return 0
 
 

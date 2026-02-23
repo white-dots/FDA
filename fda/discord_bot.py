@@ -372,6 +372,7 @@ class DiscordVoiceAgent(BaseAgent):
         local_task_dispatch: Optional[Any] = None,
         remote_task_dispatch: Optional[Any] = None,
         approval_manager: Optional[Any] = None,
+        restart_callback: Optional[Any] = None,
     ):
         """
         Initialize the Discord Voice Agent.
@@ -391,6 +392,7 @@ class DiscordVoiceAgent(BaseAgent):
             remote_task_dispatch: Optional callback(task_brief, client_id, progress_callback) -> result dict
                                 for dispatching tasks to the remote worker agent (SSH into VMs).
             approval_manager: Optional ApprovalManager for approve/reject commands.
+            restart_callback: Optional callback() to restart FDA.
         """
         super().__init__(
             name="DiscordBot",
@@ -453,6 +455,9 @@ class DiscordVoiceAgent(BaseAgent):
 
         # Approval manager for approve/reject commands
         self._approval_manager = approval_manager
+
+        # Restart callback (from orchestrator)
+        self._restart_callback = restart_callback
 
         # Use the state DB for conversation history (persists all day)
         # The FDA agent's state DB is preferred since it feeds into the journal
@@ -600,6 +605,11 @@ class DiscordVoiceAgent(BaseAgent):
         async def local_task(ctx, *, task: str = None):
             """Run a task on the local codebase. Usage: !local <task description>"""
             await self._cmd_local(ctx, task)
+
+        @self._bot.command(name="restart")
+        async def restart_fda(ctx):
+            """Restart the FDA system."""
+            await self._cmd_restart(ctx)
 
         @self._bot.command(name="remote")
         async def remote_task(ctx, *, task: str = None):
@@ -1316,6 +1326,15 @@ No wake word needed — powered by OpenAI Realtime API for low-latency conversat
         except Exception as e:
             logger.error(f"[DiscordBot] Local task command failed: {e}")
             await ctx.send(f"❌ Error during local analysis: {e}")
+
+    async def _cmd_restart(self, ctx: Any) -> None:
+        """Handle !restart command — restart the FDA system."""
+        if not self._restart_callback:
+            await ctx.send("Restart not available.")
+            return
+
+        await ctx.send("Restarting FDA... Back in a few seconds.")
+        self._restart_callback()
 
     async def _cmd_remote(self, ctx: Any, task: Optional[str]) -> None:
         """Handle !remote command — dispatch a task to the remote worker agent (SSH into VMs)."""

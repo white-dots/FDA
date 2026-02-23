@@ -331,9 +331,13 @@ Important rules:
         text = self._backend.complete(
             system=(
                 "You are a code analyst. Given a task description and a list of "
-                "files in a repository, identify which files are most likely "
-                "relevant to the task. Return ONLY a JSON array of file paths, "
-                "nothing else."
+                "files in a repository, identify which files are relevant to the "
+                "task. Return ONLY a JSON array of file paths, nothing else.\n\n"
+                "IMPORTANT: Be INCLUSIVE, not exclusive. When the task asks "
+                "about a category (e.g. 'all DAGs', 'all scripts', 'all "
+                "configs'), include ALL files that belong to that category. "
+                "When in doubt, include the file — it's better to include "
+                "a few extra files than to miss relevant ones."
             ),
             messages=[{
                 "role": "user",
@@ -342,12 +346,14 @@ Important rules:
                     f"Tech stack: {tech_stack}\n"
                     f"Project: {project_path.name}\n\n"
                     f"Repository files:\n{files_list}\n\n"
-                    "Which files should I read to understand and fix this issue?\n"
-                    "Return a JSON array of the most relevant file paths (max 20 files)."
+                    "Which files should I read to understand and address this task?\n"
+                    "Return a JSON array of ALL relevant file paths "
+                    "(up to 50 files). Include every file that could be "
+                    "relevant — err on the side of inclusion."
                 ),
             }],
             model=MODEL_EXECUTOR,
-            max_tokens=2000,
+            max_tokens=4000,
         )
 
         try:
@@ -383,7 +389,7 @@ Important rules:
             if score > 0:
                 scored.append((filepath, score))
         scored.sort(key=lambda x: x[1], reverse=True)
-        return [path for path, _ in scored[:20]]
+        return [path for path, _ in scored[:50]]
 
     def _detect_tech_stack(self, project_path: Path) -> str:
         """Auto-detect tech stack from project files."""

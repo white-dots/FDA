@@ -95,6 +95,7 @@ class SlackBotAgent(BaseAgent):
         local_task_dispatch: Optional[Any] = None,
         remote_task_dispatch: Optional[Any] = None,
         approval_manager: Optional[Any] = None,
+        restart_callback: Optional[Any] = None,
     ):
         """
         Initialize the Slack Bot Agent.
@@ -109,6 +110,7 @@ class SlackBotAgent(BaseAgent):
             remote_task_dispatch: Optional callback(task_brief, client_id) -> result dict.
                                   This is orchestrator._handle_remote_task_request.
             approval_manager: Optional ApprovalManager for approve/reject commands.
+            restart_callback: Optional callback() to restart FDA.
         """
         super().__init__(
             name="SlackBot",
@@ -123,6 +125,7 @@ class SlackBotAgent(BaseAgent):
         self._local_task_dispatch = local_task_dispatch
         self._remote_task_dispatch = remote_task_dispatch
         self._approval_manager = approval_manager
+        self._restart_callback = restart_callback
 
         if not self.bot_token:
             raise ValueError(
@@ -304,6 +307,9 @@ class SlackBotAgent(BaseAgent):
         if text.startswith("!details"):
             self._handle_details(text, say, thread_ts)
             return
+        if text == "!restart":
+            self._handle_restart(say, thread_ts)
+            return
 
         # Regular question — add thinking reaction
         try:
@@ -396,6 +402,7 @@ class SlackBotAgent(BaseAgent):
                 "`!approve <id>` — Approve a code change\n"
                 "`!reject <id> [reason]` — Reject a code change\n"
                 "`!details <id>` — Show full diff for an approval\n"
+                "`!restart` — Restart the FDA system\n"
                 "`!help` — This message"
             ),
             thread_ts=thread_ts,
@@ -694,6 +701,18 @@ class SlackBotAgent(BaseAgent):
 
         for chunk in self._split_message(response):
             say(text=chunk, thread_ts=thread_ts)
+
+    def _handle_restart(self, say: Any, thread_ts: str) -> None:
+        """Handle !restart — restart the FDA system."""
+        if not self._restart_callback:
+            say(text="Restart not available.", thread_ts=thread_ts)
+            return
+
+        say(
+            text=":arrows_counterclockwise: Restarting FDA... Back in a few seconds.",
+            thread_ts=thread_ts,
+        )
+        self._restart_callback()
 
     # ------------------------------------------------------------------
     # Progress callback for worker tasks

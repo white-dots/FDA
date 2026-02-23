@@ -429,3 +429,29 @@ def register_local_task_handler(
             await update.message.reply_text(f"❌ Error: {e}")
 
     application.add_handler(CommandHandler("local", handle_local))
+
+
+def register_restart_handler(
+    application: Any,
+    restart_fn: Callable[[], None],
+) -> None:
+    """
+    Register /restart command handler with the Telegram application.
+
+    Allows users to restart the FDA system remotely via Telegram.
+    Usage: /restart
+
+    Args:
+        application: The python-telegram-bot Application instance.
+        restart_fn: Callable that triggers FDA restart (orchestrator.restart).
+    """
+    from telegram.ext import CommandHandler
+
+    async def handle_restart(update: Any, context: Any) -> None:
+        """Handle /restart command."""
+        await update.message.reply_text(
+            "Restarting FDA... I'll be back in a few seconds."
+        )
+        restart_fn()
+
+    application.add_handler(CommandHandler("restart", handle_restart))

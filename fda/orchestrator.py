@@ -219,6 +219,10 @@ class FDAOrchestrator:
             # Register /local command for local worker dispatch
             register_local_task_handler(app, self._handle_local_task_request)
 
+            # Register /restart command
+            from fda.telegram_approval import register_restart_handler
+            register_restart_handler(app, self.restart)
+
             thread = threading.Thread(
                 target=bot.run_event_loop,
                 daemon=True,
@@ -251,6 +255,7 @@ class FDAOrchestrator:
                 local_task_dispatch=self._handle_local_task_request,
                 remote_task_dispatch=self._handle_remote_task_request,
                 approval_manager=self.approval_manager,
+                restart_callback=self.restart,
             )
             self._discord_bot = discord_bot
 
@@ -285,6 +290,7 @@ class FDAOrchestrator:
                 local_task_dispatch=self._handle_local_task_request,
                 remote_task_dispatch=self._handle_remote_task_request,
                 approval_manager=self.approval_manager,
+                restart_callback=self.restart,
             )
             self._slack_bot = bot
 
@@ -1109,6 +1115,18 @@ Be specific and actionable. The developer needs to know exactly what to change.
     def stop(self) -> None:
         """Stop the orchestrator."""
         self._running = False
+
+    def restart(self) -> None:
+        """Request a full process restart.
+
+        Writes a marker file and stops the orchestrator. The CLI
+        wrapper detects the marker and re-execs the process so all
+        code changes take effect.
+        """
+        from fda.config import RESTART_MARKER_PATH
+        RESTART_MARKER_PATH.write_text(str(datetime.now()))
+        logger.info("Restart requested — shutting down for restart...")
+        self.stop()
 
     def pause(self) -> None:
         """Pause KakaoTalk message processing."""
