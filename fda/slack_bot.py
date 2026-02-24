@@ -1214,7 +1214,7 @@ You have tools to look up the user's data. Use them when you need information to
             tool_executor=self._execute_tool,
             model=self.model,
             max_tokens=4096,
-            max_iterations=5,
+            max_iterations=10,
         )
 
     # ------------------------------------------------------------------

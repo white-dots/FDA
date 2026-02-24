@@ -257,8 +257,33 @@ class AnthropicAPIBackend(ClaudeBackend):
 
             msgs.append({"role": "user", "content": tool_results})
 
-        # Max iterations reached — return whatever text we have
-        logger.warning("Tool-use loop hit max iterations")
+        # Max iterations reached — do one final call WITHOUT tools to force
+        # Claude to summarize what it has so far instead of losing all the work
+        logger.warning("Tool-use loop hit max iterations — forcing final summary")
+        try:
+            msgs.append({
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": (
+                        "You've reached the maximum number of tool calls. "
+                        "Please summarize what you've found so far and give "
+                        "the user a complete answer based on the information "
+                        "you already gathered."
+                    ),
+                }],
+            })
+            final = self._client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                system=system,
+                messages=msgs,
+            )
+            text_parts = [b.text for b in final.content if b.type == "text"]
+            if text_parts:
+                return "\n".join(text_parts)
+        except Exception as e:
+            logger.error(f"Final summary call failed: {e}")
         return "(Reached maximum tool iterations — please try a simpler question)"
 
     @property
