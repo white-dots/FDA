@@ -874,7 +874,7 @@ class SlackBotAgent(BaseAgent):
     _FDA_TOOLS: list[dict[str, Any]] = [
         {
             "name": "search_journal",
-            "description": "Search the user's journal and notes for relevant entries. Use when the user asks about past notes, decisions, meetings, or anything previously recorded.",
+            "description": "Search the journal for past entries including: remote/local worker investigation results, code changes, deployments, errors, meetings, decisions, and notes. Use when the user asks about past work, previous findings, or anything previously recorded. Also check here before re-running expensive remote tasks — the answer may already be journaled.",
             "input_schema": {
                 "type": "object",
                 "properties": {
