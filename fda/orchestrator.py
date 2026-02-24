@@ -136,6 +136,10 @@ class FDAOrchestrator:
         # FDA agent (for calendar monitoring and meeting prep)
         self.fda_agent: Optional[FDAAgent] = None
 
+        # Journal writer for recording worker results
+        from fda.journal.writer import JournalWriter
+        self._journal = JournalWriter()
+
         # Telegram approval system
         self.approval_manager = ApprovalManager()
         self.approval_manager.set_handlers(
@@ -620,12 +624,21 @@ Be specific and actionable. The developer needs to know exactly what to change.
             self.state.update_task(task_id, status="blocked")
             return {"success": False, "error": str(e)}
 
+        target = f"LOCAL ({project_name})"
+
         if fix_result.get("success"):
             changes = fix_result.get("changes", {})
 
             # Investigation/query task — no code changes, just return the analysis
             if not changes:
                 self.state.update_task(task_id, status="completed")
+                self._log_worker_journal(
+                    task_brief=task_brief,
+                    target=target,
+                    result_type="investigation",
+                    explanation=fix_result.get("explanation", ""),
+                    analysis=fix_result.get("analysis", ""),
+                )
                 return {
                     "success": True,
                     "investigation": True,
@@ -638,7 +651,7 @@ Be specific and actionable. The developer needs to know exactly what to change.
             # Code change task — queue for approval
             approval = self.approval_manager.add_approval(
                 client_id="local",
-                client_name=f"LOCAL ({project_name})",
+                client_name=target,
                 task_brief=task_brief,
                 explanation=fix_result.get("explanation", ""),
                 diff=fix_result.get("diff", ""),
@@ -651,6 +664,15 @@ Be specific and actionable. The developer needs to know exactly what to change.
 
             self._send_approval_to_telegram(approval)
             self.state.update_task(task_id, status="awaiting_approval")
+
+            self._log_worker_journal(
+                task_brief=task_brief,
+                target=target,
+                result_type="code_change",
+                explanation=fix_result.get("explanation", ""),
+                files=list(changes.keys()),
+                diff=fix_result.get("diff", ""),
+            )
 
             return {
                 "success": True,
@@ -671,11 +693,100 @@ Be specific and actionable. The developer needs to know exactly what to change.
             )
 
             self.state.update_task(task_id, status="blocked")
+            self._log_worker_journal(
+                task_brief=task_brief,
+                target=target,
+                result_type="error",
+                analysis=fix_result.get("analysis", ""),
+                error=error,
+            )
             return {
                 "success": False,
                 "error": error,
                 "analysis": fix_result.get("analysis", ""),
             }
+
+    # ------------------------------------------------------------------
+    # Journal logging for worker results
+    # ------------------------------------------------------------------
+
+    def _log_worker_journal(
+        self,
+        *,
+        task_brief: str,
+        target: str,
+        result_type: str,
+        explanation: str = "",
+        analysis: str = "",
+        files: list[str] | None = None,
+        diff: str = "",
+        error: str = "",
+    ) -> None:
+        """Write a journal entry summarising a worker task result.
+
+        Args:
+            task_brief: The original user request.
+            target: Where the work happened (e.g. "AoneBnH VM", "LOCAL (FDA)").
+            result_type: One of "investigation", "code_change", "deployment", "error".
+            explanation: Human-readable explanation from the worker.
+            analysis: Detailed analysis text.
+            files: List of files touched / examined.
+            diff: Unified diff (truncated for journal).
+            error: Error message if the task failed.
+        """
+        try:
+            # Build tags
+            tags = ["worker", result_type]
+            if "local" in target.lower():
+                tags.append("local")
+            else:
+                tags.append("remote")
+
+            # Build summary line
+            brief_short = task_brief[:80].rstrip(".")
+            if result_type == "error":
+                summary = f"[{target}] FAILED: {brief_short}"
+            elif result_type == "deployment":
+                summary = f"[{target}] Deployed: {brief_short}"
+            else:
+                summary = f"[{target}] {brief_short}"
+
+            # Build content body
+            parts = [f"## Task\n{task_brief}"]
+
+            if explanation:
+                parts.append(f"## Explanation\n{explanation[:2000]}")
+
+            if analysis and analysis != explanation:
+                parts.append(f"## Analysis\n{analysis[:2000]}")
+
+            if files:
+                file_list = "\n".join(f"- `{f}`" for f in files[:30])
+                parts.append(f"## Files\n{file_list}")
+
+            if diff:
+                diff_preview = diff[:3000]
+                parts.append(f"## Diff\n```diff\n{diff_preview}\n```")
+
+            if error:
+                parts.append(f"## Error\n{error[:1000]}")
+
+            content = "\n\n".join(parts)
+
+            self._journal.write_entry(
+                author="orchestrator",
+                tags=tags,
+                summary=summary,
+                content=content,
+                relevance_decay="medium",
+            )
+            logger.debug(f"Journal entry written: {summary[:60]}")
+        except Exception as e:
+            logger.warning(f"Failed to write journal entry: {e}")
+
+    # ------------------------------------------------------------------
+    # Remote task dispatch
+    # ------------------------------------------------------------------
 
     def _handle_remote_task_request(
         self,
@@ -739,6 +850,13 @@ Be specific and actionable. The developer needs to know exactly what to change.
             # Investigation/query task — no code changes
             if not changes:
                 self.state.update_task(task_id, status="completed")
+                self._log_worker_journal(
+                    task_brief=task_brief,
+                    target=f"{client.name} VM",
+                    result_type="investigation",
+                    explanation=fix_result.get("explanation", ""),
+                    analysis=fix_result.get("analysis", ""),
+                )
                 return {
                     "success": True,
                     "investigation": True,
@@ -763,6 +881,15 @@ Be specific and actionable. The developer needs to know exactly what to change.
             self._send_approval_to_telegram(approval)
             self.state.update_task(task_id, status="awaiting_approval")
 
+            self._log_worker_journal(
+                task_brief=task_brief,
+                target=f"{client.name} VM",
+                result_type="code_change",
+                explanation=fix_result.get("explanation", ""),
+                files=list(changes.keys()),
+                diff=fix_result.get("diff", ""),
+            )
+
             return {
                 "success": True,
                 "approval_id": approval.short_id,
@@ -774,6 +901,13 @@ Be specific and actionable. The developer needs to know exactly what to change.
             error = fix_result.get("error", "Unknown error")
             logger.error(f"Remote worker failed for {client.name}: {error}")
             self.state.update_task(task_id, status="blocked")
+            self._log_worker_journal(
+                task_brief=task_brief,
+                target=f"{client.name} VM",
+                result_type="error",
+                analysis=fix_result.get("analysis", ""),
+                error=error,
+            )
             return {
                 "success": False,
                 "error": error,
@@ -1043,11 +1177,26 @@ Be specific and actionable. The developer needs to know exactly what to change.
                 decision_maker="user (approved via telegram)",
                 impact=f"Files changed: {', '.join(approval.file_changes.keys())}",
             )
+
+            self._log_worker_journal(
+                task_brief=approval.task_brief,
+                target=target_name,
+                result_type="deployment",
+                explanation=approval.explanation,
+                files=list(approval.file_changes.keys()),
+                diff=approval.diff,
+            )
         else:
             self._send_telegram_notification(
                 f"❌ Deployment FAILED for {target_name}\n\n"
                 f"{summary}\n\n"
                 "You may need to fix this manually."
+            )
+            self._log_worker_journal(
+                task_brief=approval.task_brief,
+                target=target_name,
+                result_type="error",
+                error=f"Deployment failed: {summary}",
             )
 
     async def _handle_rejection(self, approval: PendingApproval, reason: str) -> None:
