@@ -289,6 +289,7 @@ class FDAOrchestrator:
                 app_token=tokens[1],
                 local_task_dispatch=self._handle_local_task_request,
                 remote_task_dispatch=self._handle_remote_task_request,
+                remote_command_dispatch=self._handle_remote_command,
                 approval_manager=self.approval_manager,
                 restart_callback=self.restart,
             )
@@ -778,6 +779,58 @@ Be specific and actionable. The developer needs to know exactly what to change.
                 "error": error,
                 "analysis": fix_result.get("analysis", ""),
             }
+
+    def _handle_remote_command(
+        self,
+        command: str,
+        client_id: Optional[str] = None,
+        cwd: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        Execute a shell command on a client's remote VM via SSH.
+
+        This gives the Slack/Discord bot Claude direct shell access,
+        similar to how Claude Code can run commands locally.
+
+        Args:
+            command: Shell command to execute.
+            client_id: Client identifier. Defaults to first configured client.
+            cwd: Working directory. Defaults to client's repo_path.
+
+        Returns:
+            Dict with: success, stdout, stderr, error.
+        """
+        if not client_id:
+            clients = self.client_manager.list_clients()
+            if not clients:
+                return {"success": False, "error": "No clients configured"}
+            client_id = clients[0].client_id
+
+        client = self.client_manager.get_client(client_id)
+        if not client:
+            return {"success": False, "error": f"Unknown client: {client_id}"}
+
+        # Safety: block destructive commands
+        cmd_lower = command.strip().lower()
+        blocked = ["rm -rf /", "mkfs", "dd if=", "> /dev/sd", "shutdown", "reboot"]
+        if any(b in cmd_lower for b in blocked):
+            return {"success": False, "error": "Blocked: potentially destructive command"}
+
+        logger.info(f"Remote command on {client.name}: {command[:100]}")
+
+        try:
+            ssh = self.worker._get_ssh(client)
+            work_dir = cwd or client.project.repo_path
+            result = ssh.execute(command, cwd=work_dir, timeout=30)
+            return {
+                "success": result.success,
+                "stdout": result.stdout[:5000] if result.stdout else "",
+                "stderr": result.stderr[:2000] if result.stderr else "",
+                "error": "" if result.success else (result.stderr or "Command failed")[:500],
+            }
+        except Exception as e:
+            logger.error(f"Remote command error: {e}")
+            return {"success": False, "error": str(e)}
 
     # ------------------------------------------------------------------
     # Telegram notification helpers

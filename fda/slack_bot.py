@@ -94,6 +94,7 @@ class SlackBotAgent(BaseAgent):
         project_state_path: Optional[Path] = None,
         local_task_dispatch: Optional[Any] = None,
         remote_task_dispatch: Optional[Any] = None,
+        remote_command_dispatch: Optional[Any] = None,
         approval_manager: Optional[Any] = None,
         restart_callback: Optional[Any] = None,
     ):
@@ -109,6 +110,8 @@ class SlackBotAgent(BaseAgent):
                                  This is orchestrator._handle_local_task_request.
             remote_task_dispatch: Optional callback(task_brief, client_id) -> result dict.
                                   This is orchestrator._handle_remote_task_request.
+            remote_command_dispatch: Optional callback(command, client_id, cwd) -> result dict.
+                                     This is orchestrator._handle_remote_command.
             approval_manager: Optional ApprovalManager for approve/reject commands.
             restart_callback: Optional callback() to restart FDA.
         """
@@ -124,6 +127,7 @@ class SlackBotAgent(BaseAgent):
         self.channel_id = channel_id or os.environ.get(SLACK_CHANNEL_ID_ENV)
         self._local_task_dispatch = local_task_dispatch
         self._remote_task_dispatch = remote_task_dispatch
+        self._remote_command_dispatch = remote_command_dispatch
         self._approval_manager = approval_manager
         self._restart_callback = restart_callback
 
@@ -932,7 +936,7 @@ class SlackBotAgent(BaseAgent):
         },
         {
             "name": "run_remote_task",
-            "description": "Dispatch a task to the remote worker agent that SSHes into client VMs. Use when the user asks about their server, VM, deployed code, remote services, or wants to check/verify something on a client's remote machine (e.g., 'check if Amazon SES is configured on the VM', 'what services are running', 'check nginx config').",
+            "description": "Dispatch a complex code analysis task to the remote worker agent. Use ONLY for tasks that require reading and understanding multiple source files (e.g., 'why is the email failing', 'refactor the DAG'). For simple queries like listing files, checking status, or running commands, use run_remote_command instead — it's much faster.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -964,6 +968,35 @@ class SlackBotAgent(BaseAgent):
                     },
                 },
                 "required": ["task"],
+            },
+        },
+        {
+            "name": "run_remote_command",
+            "description": (
+                "Execute a shell command on a client's remote VM via SSH. "
+                "Use this for quick queries like listing files, checking service "
+                "status, running CLI commands (e.g. 'ls ~/airflow/dags', "
+                "'airflow dags list', 'systemctl status nginx', 'cat /etc/cron.d/airflow'). "
+                "Prefer this over run_remote_task when you just need command output, "
+                "not full code analysis. Returns stdout/stderr directly."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Shell command to execute on the remote VM.",
+                    },
+                    "cwd": {
+                        "type": "string",
+                        "description": "Working directory for the command. Defaults to the client's repo path.",
+                    },
+                    "client_id": {
+                        "type": "string",
+                        "description": "Optional client identifier (e.g., 'aonebnh'). If omitted, uses the default client.",
+                    },
+                },
+                "required": ["command"],
             },
         },
     ]
@@ -1117,6 +1150,31 @@ class SlackBotAgent(BaseAgent):
                         return msg
                 except Exception as e:
                     return f"Error dispatching {dispatch_label.lower()} task: {e}"
+
+            elif tool_name == "run_remote_command":
+                command = tool_input.get("command", "")
+                client_id = tool_input.get("client_id")
+                cwd = tool_input.get("cwd")
+
+                if not self._remote_command_dispatch:
+                    return "Remote command dispatch not available."
+                try:
+                    result = self._remote_command_dispatch(
+                        command, client_id=client_id, cwd=cwd
+                    )
+                    if result.get("success"):
+                        output = result.get("stdout", "")
+                        stderr = result.get("stderr", "")
+                        parts = []
+                        if output:
+                            parts.append(output[:3000])
+                        if stderr:
+                            parts.append(f"STDERR:\n{stderr[:1000]}")
+                        return "\n".join(parts) if parts else "(no output)"
+                    else:
+                        return f"Command failed: {result.get('error', 'unknown')}"
+                except Exception as e:
+                    return f"Error running remote command: {e}"
 
             else:
                 return f"Unknown tool: {tool_name}"

@@ -18,6 +18,7 @@ Pipeline:
 import json
 import logging
 import difflib
+import re
 import shutil
 import time
 from datetime import datetime
@@ -360,10 +361,21 @@ Important rules:
             text = text.strip()
             if text.startswith("```"):
                 text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-            files = json.loads(text)
-            if isinstance(files, list):
-                return [f for f in files if f in all_files]
-        except (json.JSONDecodeError, IndexError, KeyError):
+            files = None
+            try:
+                files = json.loads(text)
+            except json.JSONDecodeError:
+                match = re.search(r'\[.*\]', text, re.DOTALL)
+                if match:
+                    try:
+                        files = json.loads(match.group())
+                    except json.JSONDecodeError:
+                        pass
+            if isinstance(files, list) and files:
+                valid = [f for f in files if f in all_files]
+                if valid:
+                    return valid
+        except (IndexError, KeyError):
             logger.warning("Failed to parse file identification response")
 
         return self._heuristic_file_search(task_brief, all_files)

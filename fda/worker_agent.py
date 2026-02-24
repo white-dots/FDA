@@ -727,17 +727,33 @@ Important rules:
             )
 
             text = text.strip()
+            # Strip markdown code blocks if present
             if text.startswith("```"):
                 text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-            files = json.loads(text)
-            if isinstance(files, list):
+            # Try direct parse first, then extract JSON array from mixed text
+            files = None
+            try:
+                files = json.loads(text)
+            except json.JSONDecodeError:
+                # Claude often adds explanation text around the JSON array —
+                # extract the first [...] block from the response
+                match = re.search(r'\[.*\]', text, re.DOTALL)
+                if match:
+                    try:
+                        files = json.loads(match.group())
+                    except json.JSONDecodeError:
+                        pass
+            if isinstance(files, list) and files:
                 known = set(all_files) | set(grep_hits)
                 valid = [f for f in files if f in known]
                 if valid:
                     self._record_file_access(client.client_id, valid)
                     return valid
-        except (json.JSONDecodeError, IndexError, KeyError):
-            logger.warning("Failed to parse file identification response")
+                else:
+                    logger.warning(
+                        f"File identification returned {len(files)} files but "
+                        f"none matched known files (sample: {files[:3]})"
+                    )
         except Exception as e:
             logger.warning(f"File identification Claude call failed: {e}")
 
@@ -779,11 +795,25 @@ Important rules:
             client.client_id, (0, {})
         )[1] if client else {}
 
+        # File extensions to skip in heuristic (log files, data, images, etc.)
+        _JUNK_EXTENSIONS = frozenset({
+            ".log", ".bak", ".tmp", ".swp", ".pyc", ".pyo",
+            ".jpg", ".jpeg", ".png", ".gif", ".svg", ".ico",
+            ".zip", ".tar", ".gz", ".whl", ".egg",
+            ".csv", ".tsv", ".parquet", ".pkl",
+        })
+
         scored: list[tuple[str, float]] = []
 
         for filepath in set(all_files) | grep_set:
-            score = 0.0
             fp_lower = filepath.lower()
+
+            # Skip junk files
+            ext = "." + fp_lower.rsplit(".", 1)[-1] if "." in fp_lower else ""
+            if ext in _JUNK_EXTENSIONS:
+                continue
+
+            score = 0.0
 
             for kw in path_keywords:
                 if kw in fp_lower:
@@ -894,8 +924,10 @@ IMPORTANT:
                 )
                 diff_parts.append("".join(diff))
 
+            is_investigation = not changes
             return {
                 "success": True,
+                "investigation": is_investigation,
                 "analysis": result.get("analysis", ""),
                 "changes": changes,
                 "diff": "\n".join(diff_parts),
@@ -913,6 +945,7 @@ IMPORTANT:
                 )
                 return {
                     "success": True,
+                    "investigation": True,
                     "analysis": raw,
                     "changes": {},
                     "diff": "",
