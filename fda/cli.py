@@ -134,9 +134,12 @@ def handle_start(args: argparse.Namespace) -> int:
         print("RESTARTING FDA...")
         print("=" * 60)
         print()
-        # Re-exec the process so all code changes take effect
+        # Re-exec the process so all code changes take effect.
+        # Use the original script (e.g. .venv/bin/fda) not `python -m fda`
+        # since the package has no __main__.py.
         import os, sys
-        os.execv(sys.executable, [sys.executable, "-m", "fda"] + sys.argv[1:])
+        script = sys.argv[0]  # e.g. "/Users/.../FDA/.venv/bin/fda"
+        os.execv(script, sys.argv)
 
     return 0
 
