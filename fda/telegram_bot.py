@@ -70,7 +70,18 @@ Your scope is the user's entire work environment:
 - Their calendar and meetings
 - Their tasks and to-do items
 - Their notes and journal entries
+- Client VMs and deployed services (via SSH)
+- Local projects on the Mac Mini filesystem
 - Anything they need help tracking or remembering
+
+TOOL STRATEGY — choose the right tool for the job:
+- *run_local_command*: For quick shell commands on this Mac Mini (ls, cat, grep, find, ps, etc.). Fast and direct. Use this FIRST for most local queries — listing directories, reading files, searching code, checking processes. ALWAYS prefer this over run_local_task for simple questions.
+- *run_local_task*: For complex local code changes requiring full analysis pipeline. ONLY use when you need to modify code, not just read or query.
+- *run_remote_command*: For quick shell commands on client VMs (ls, cat, grep, airflow CLI, systemctl, etc.). Fast and direct. Use this FIRST for most VM queries.
+- *run_remote_task*: For complex code analysis on remote VMs requiring reading + understanding multiple source files. Only use when you need to analyze/modify code, not just check status.
+- *search_journal*: For recalling past work. All remote/local worker results are journaled — investigations, code changes, deployments, errors. Ask the journal before re-running expensive tasks.
+
+When investigating a problem, prefer multiple small command calls (local or remote) over the heavy task pipeline. You can run ls, cat, grep, tail logs, check service status — just like working in a terminal. Only escalate to run_*_task when you actually need code analysis or modifications.
 
 Keep responses concise for mobile reading:
 - Short paragraphs
@@ -99,6 +110,8 @@ class TelegramBotAgent(BaseAgent):
         project_state_path: Optional[Path] = None,
         local_task_dispatch: Optional[Any] = None,
         remote_task_dispatch: Optional[Any] = None,
+        local_command_dispatch: Optional[Any] = None,
+        remote_command_dispatch: Optional[Any] = None,
         local_organize_dispatch: Optional[Any] = None,
     ):
         """
@@ -110,6 +123,8 @@ class TelegramBotAgent(BaseAgent):
             project_state_path: Path to the project state database.
             local_task_dispatch: Optional callback(task_brief, project_path, progress_callback) -> result dict.
             remote_task_dispatch: Optional callback(task_brief, client_id, progress_callback) -> result dict.
+            local_command_dispatch: Optional callback(command, cwd) -> result dict.
+            remote_command_dispatch: Optional callback(command, client_id, cwd) -> result dict.
             local_organize_dispatch: Optional callback(target_path, instructions, progress_callback) -> result dict.
         """
         print("[TelegramBot] Initializing...", flush=True)
@@ -134,6 +149,8 @@ class TelegramBotAgent(BaseAgent):
         self._loop = None
         self._local_task_dispatch = local_task_dispatch
         self._remote_task_dispatch = remote_task_dispatch
+        self._local_command_dispatch = local_command_dispatch
+        self._remote_command_dispatch = remote_command_dispatch
         self._local_organize_dispatch = local_organize_dispatch
         print("[TelegramBot] Initialization complete", flush=True)
 
@@ -713,26 +730,39 @@ Keep it conversational and under 150 words. Don't use excessive formatting."""
             },
         },
         {
-            "name": "run_remote_task",
-            "description": "Dispatch a task to the remote worker agent that SSHes into client VMs. Use when the user asks about their server, VM, deployed code, remote services, or wants to check/verify something on a client's remote machine (e.g., 'check if Amazon SES is configured', 'what services are running', 'check the email system').",
+            "name": "run_local_command",
+            "description": (
+                "Execute a shell command on the local Mac Mini. "
+                "Use this for quick queries like listing files/directories, "
+                "searching code, checking processes, reading files, etc. "
+                "(e.g. 'ls ~/Documents', 'grep -r pattern dir/', "
+                "'cat file.py', 'find . -name \"*.py\"', 'ps aux | grep fda'). "
+                "PREFER THIS over run_local_task when you just need command "
+                "output — not full code analysis/changes. Returns stdout/stderr directly."
+            ),
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "task": {
+                    "command": {
                         "type": "string",
-                        "description": "Natural language description of the task to perform on the remote VM.",
+                        "description": "Shell command to execute locally.",
                     },
-                    "client_id": {
+                    "cwd": {
                         "type": "string",
-                        "description": "Optional client identifier (e.g., 'aonebnh'). If omitted, uses the default client.",
+                        "description": "Working directory. Defaults to ~/Documents.",
                     },
                 },
-                "required": ["task"],
+                "required": ["command"],
             },
         },
         {
             "name": "run_local_task",
-            "description": "Dispatch a task to the local worker agent that operates on the Mac Mini filesystem. Use for tasks on the local FDA codebase or other local projects.",
+            "description": (
+                "Dispatch a complex task to the local worker agent for full "
+                "code analysis and changes on the Mac Mini filesystem. "
+                "Use ONLY when you need code modifications, not for simple "
+                "queries — use run_local_command for those instead."
+            ),
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -743,6 +773,58 @@ Keep it conversational and under 150 words. Don't use excessive formatting."""
                     "project_path": {
                         "type": "string",
                         "description": "Optional local project directory path. If omitted, uses the default project.",
+                    },
+                },
+                "required": ["task"],
+            },
+        },
+        {
+            "name": "run_remote_command",
+            "description": (
+                "Execute a shell command on a client's remote VM via SSH. "
+                "Use this for quick queries like listing files, checking service "
+                "status, running CLI commands (e.g. 'ls ~/airflow/dags', "
+                "'airflow dags list', 'systemctl status nginx', 'cat /etc/cron.d/airflow'). "
+                "Prefer this over run_remote_task when you just need command output, "
+                "not full code analysis. Returns stdout/stderr directly."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Shell command to execute on the remote VM.",
+                    },
+                    "cwd": {
+                        "type": "string",
+                        "description": "Working directory for the command. Defaults to the client's repo path.",
+                    },
+                    "client_id": {
+                        "type": "string",
+                        "description": "Optional client identifier (e.g., 'aonebnh'). If omitted, uses the default client.",
+                    },
+                },
+                "required": ["command"],
+            },
+        },
+        {
+            "name": "run_remote_task",
+            "description": (
+                "Dispatch a complex task to the remote worker agent that SSHes into "
+                "client VMs for full code analysis and changes. Use ONLY when you "
+                "need code modifications or deep multi-file analysis, not for simple "
+                "queries — use run_remote_command for those instead."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": "Natural language description of the task to perform on the remote VM.",
+                    },
+                    "client_id": {
+                        "type": "string",
+                        "description": "Optional client identifier (e.g., 'aonebnh'). If omitted, uses the default client.",
                     },
                 },
                 "required": ["task"],
@@ -842,6 +924,53 @@ Keep it conversational and under 150 words. Don't use excessive formatting."""
                     return "Calendar module not available."
                 except Exception as e:
                     return f"Calendar error: {e}"
+
+            elif tool_name == "run_local_command":
+                command = tool_input.get("command", "")
+                cwd = tool_input.get("cwd")
+
+                if not self._local_command_dispatch:
+                    return "Local command dispatch not available."
+                try:
+                    result = self._local_command_dispatch(command, cwd=cwd)
+                    if result.get("success"):
+                        output = result.get("stdout", "")
+                        stderr = result.get("stderr", "")
+                        parts = []
+                        if output:
+                            parts.append(output[:3000])
+                        if stderr:
+                            parts.append(f"STDERR:\n{stderr[:1000]}")
+                        return "\n".join(parts) if parts else "(no output)"
+                    else:
+                        return f"Command failed: {result.get('error', 'unknown')}"
+                except Exception as e:
+                    return f"Error running local command: {e}"
+
+            elif tool_name == "run_remote_command":
+                command = tool_input.get("command", "")
+                client_id = tool_input.get("client_id")
+                cwd = tool_input.get("cwd")
+
+                if not self._remote_command_dispatch:
+                    return "Remote command dispatch not available."
+                try:
+                    result = self._remote_command_dispatch(
+                        command, client_id=client_id, cwd=cwd,
+                    )
+                    if result.get("success"):
+                        output = result.get("stdout", "")
+                        stderr = result.get("stderr", "")
+                        parts = []
+                        if output:
+                            parts.append(output[:3000])
+                        if stderr:
+                            parts.append(f"STDERR:\n{stderr[:1000]}")
+                        return "\n".join(parts) if parts else "(no output)"
+                    else:
+                        return f"Command failed: {result.get('error', 'unknown')}"
+                except Exception as e:
+                    return f"Error running remote command: {e}"
 
             elif tool_name in ("run_remote_task", "run_local_task"):
                 task = tool_input.get("task", "")

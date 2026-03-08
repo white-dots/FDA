@@ -229,6 +229,8 @@ class FDAOrchestrator:
                 bot_token=bot_token,
                 local_task_dispatch=self._handle_local_task_request,
                 remote_task_dispatch=self._handle_remote_task_request,
+                local_command_dispatch=self._handle_local_command,
+                remote_command_dispatch=self._handle_remote_command,
                 local_organize_dispatch=self._handle_local_organize_request,
             )
 
