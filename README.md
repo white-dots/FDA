@@ -1,432 +1,217 @@
-# FDA System - Multi-Agent Project Coordination Platform
+# FDA — Your Always-On AI Team Member
 
-A sophisticated Python package implementing a distributed multi-agent system for project delivery and coordination using Claude AI models.
+FDA (Facilitating Director Agent) is a persistent multi-agent system built on Claude that runs as a background service. Unlike chat-based AI tools you open and close, FDA runs 24/7 — monitoring your projects, remembering past work, posting daily briefings, and meeting you across every chat platform you use.
 
-## Overview
+Built for software teams and consultancies managing multiple client codebases.
 
-The FDA System consists of three specialized AI agents:
+## Why Not Just Use Claude?
 
-1. **FDA (Facilitating Director Agent)** - Strategic oversight, KPI monitoring, and decision-making
-2. **Executor Agent** - Task execution, delivery tracking, and blocker management
-3. **Librarian Agent** - Knowledge management, reporting, and organizational memory
+| Vanilla Claude / ChatGPT | FDA |
+|---|---|
+| Forgets everything between sessions | Persistent journal with relevance-ranked memory |
+| You go to it | It comes to you — same brain across Telegram, Discord, Slack, KakaoTalk |
+| Only works when you're chatting | Runs 24/7 — morning briefings, daily notetaking, health monitoring |
+| Can't touch your infrastructure | SSHs into VMs, explores codebases, proposes changes with approval workflow |
+| Single conversation context | Manages multiple client projects with separate configs |
 
-Plus integrations for:
-- **Telegram** - Bot for queries and proactive notifications
-- **Discord** - Voice channel participation with speech-to-text and text-to-speech
-- **Office 365** - Calendar integration via device code login
+## Key Features
+
+### Multi-Channel Presence
+One AI brain across all your chat platforms. Ask a question on Telegram, get a code fix approved on Discord, review daily notes on Slack — FDA keeps context across all of them.
+
+- **Telegram** — mobile-friendly queries and notifications
+- **Discord** — team collaboration with voice support
+- **Slack** — workspace integration with threading
+- **KakaoTalk** — automated client chat monitoring
+
+### Persistent Memory
+A journal system that never forgets. Every investigation, code change, deployment, and decision is logged with tags and relevance decay. FDA searches its own memory before re-running expensive tasks.
+
+### Autonomous Daily Operations
+- **9 AM Morning Briefing** — summarizes yesterday's journal entries and posts to Discord/Slack
+- **9 PM Daily Notetaking** — auto-summarizes conversations from designated chat channels into journal entries
+- **Health Monitoring** — checks bot threads every hour, auto-restarts crashed services
+
+### Agentic Code Workers
+Two worker agents that autonomously explore and modify codebases using Claude's tool-use API:
+
+- **Remote Worker** — SSHs into client Azure VMs, uses tools (`list_directory`, `read_file`, `search_files`, `write_file`, `run_command`) to explore and generate fixes
+- **Local Worker** — same agentic pattern on the local filesystem
+
+Both workers let Claude decide what to explore (like a developer would) instead of dumping all files upfront. Changes go through an approval workflow before deployment.
+
+### Guided Setup
+A 7-step onboarding wizard (`fda onboard`) that walks through:
+1. System check
+2. API key validation
+3. Chat channel setup (Telegram, Discord, Slack)
+4. Daily notetaking channel selection
+5. User profile
+6. Daemon installation (launchd on macOS, systemd on Linux)
+7. Completion summary
 
 ## Quick Start
 
-### One-Line Installation
-
-**macOS / Linux:**
 ```bash
-curl -sSL https://raw.githubusercontent.com/white-dots/FDA/main/install.sh | bash
-```
-
-**Windows (PowerShell):**
-```powershell
-irm https://raw.githubusercontent.com/white-dots/FDA/main/install.ps1 | iex
-```
-
-### Manual Installation
-
-<details>
-<summary><b>macOS</b></summary>
-
-```bash
-# Install Python 3.12 (if not installed)
-brew install python@3.12
-
 # Clone and install
 git clone https://github.com/white-dots/FDA.git
 cd FDA
-python3.12 -m venv venv
-source venv/bin/activate
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -e ".[all]"
 
-# Start setup
-fda setup
+# Run the guided setup
+fda onboard
+
+# Or start directly
+fda start
 ```
-</details>
 
-<details>
-<summary><b>Windows</b></summary>
-
-1. Install Python 3.12 from [python.org](https://www.python.org/downloads/)
-   - **Important:** Check "Add Python to PATH" during installation
-
-2. Install Git from [git-scm.com](https://git-scm.com/download/win)
-
-3. Open PowerShell and run:
-```powershell
-git clone https://github.com/white-dots/FDA.git
-cd FDA
-python -m venv venv
-.\venv\Scripts\Activate.ps1
-pip install -e ".[all]"
-
-# Start setup
-fda setup
-```
-</details>
-
-<details>
-<summary><b>Linux (Ubuntu/Debian)</b></summary>
+### Install Options
 
 ```bash
-# Install Python 3.12
-sudo apt update
-sudo apt install software-properties-common
-sudo add-apt-repository ppa:deadsnakes/ppa
-sudo apt install python3.12 python3.12-venv python3.12-dev
-
-# Clone and install
-git clone https://github.com/white-dots/FDA.git
-cd FDA
-python3.12 -m venv venv
-source venv/bin/activate
-pip install -e ".[all]"
-
-# Start setup
-fda setup
-```
-</details>
-
-### Install Optional Features
-
-```bash
-pip install -e ".[all]"       # Everything
-pip install -e ".[telegram]"  # Telegram bot only
-pip install -e ".[discord]"   # Discord voice bot only
-pip install -e ".[web]"       # Web setup UI only
+pip install -e ".[all]"        # Everything
+pip install -e ".[telegram]"   # Telegram bot only
+pip install -e ".[discord]"    # Discord bot only
+pip install -e ".[slack]"      # Slack bot only
+pip install -e ".[web]"        # Web setup UI only
 ```
 
-### Web-Based Setup (Recommended)
-
-The easiest way to configure FDA is through the web interface:
+## Usage
 
 ```bash
-# Start the setup server
-fda setup
+# Start the system (runs all agents + bots)
+fda start
 
-# Then open http://localhost:9999 in your browser
-```
+# Interactive setup
+fda onboard
 
-The web UI lets you:
-- Configure all API tokens (Anthropic, Telegram, Discord, OpenAI)
-- Test connections
-- Generate Discord bot invite links
-- View system health status
-
-### CLI Setup (Alternative)
-
-```bash
-# Set your Anthropic API key
-export ANTHROPIC_API_KEY=sk-ant-...
-
-# Initialize a new project
-fda init /path/to/project
-
-# Configure Telegram (interactive)
-fda telegram setup
-
-# Configure Discord (interactive)
-fda discord setup
-
-# Connect Office 365 calendar
-fda calendar login
-```
-
-### Basic Usage
-
-```bash
-# Start the system
-fda start --daemon
-
-# Ask the FDA agent
+# Ask FDA a question
 fda ask "What are our current blockers?"
 
-# Show project status
+# Check system status
 fda status
 
-# Prepare for a meeting
-fda meeting-prep --id event_12345
+# Journal
+fda journal search "deployment issue"
 
-# Generate reports
-fda report daily
+# Notetaking channels
+fda config notetaking list
+fda config notetaking add telegram <channel_id> --label "Client Chat"
+fda config notetaking remove telegram <channel_id>
 
-# Search the project journal
-fda journal search "kubernetes deployment"
+# Web-based setup UI
+fda setup
 ```
 
-### Start Communication Bots
+### Bot Commands
 
-```bash
-# Start Telegram bot (run in separate terminal)
-fda telegram start
-
-# Start Discord bot (run in separate terminal)
-fda discord start
-
-# Get Discord bot invite link
-fda discord invite
-```
-
-## VM Deployment
-
-For deploying FDA on a virtual machine:
-
-```bash
-# 1. SSH into your VM
-ssh user@your-vm-ip
-
-# 2. Install Python 3.9+
-sudo apt update && sudo apt install python3.9 python3.9-venv python3-pip
-
-# 3. Clone and install
-git clone https://github.com/white-dots/FDA.git
-cd FDA
-python3.9 -m venv venv
-source venv/bin/activate
-pip install -e ".[all]"
-
-# 4. Start the web setup (accessible from your browser)
-fda setup --host 0.0.0.0 --port 9999
-
-# 5. Open http://your-vm-ip:9999 to configure
-
-# 6. Start the bots (use screen/tmux for persistence)
-screen -S telegram
-fda telegram start
-# Ctrl+A, D to detach
-
-screen -S discord
-fda discord start
-# Ctrl+A, D to detach
-```
+**Telegram / Discord / Slack:**
+- Ask any question in natural language — FDA uses tools to search journal, read chats, check tasks, run commands on local/remote machines
+- `!approve <id>` / `!reject <id>` — approve or reject code changes
+- `!details <id>` — view full diff of proposed changes
 
 ## Architecture
 
-### Package Structure
-
 ```
 fda/
-├── __init__.py              # Package exports
-├── config.py                # Global configuration and constants
-├── cli.py                   # Command-line interface
-├── setup_server.py          # Web-based setup UI (port 9999)
-├── base_agent.py            # Base class for all agents
-├── fda_agent.py             # FDA agent implementation
-├── executor_agent.py        # Executor agent implementation
-├── librarian_agent.py       # Librarian agent implementation
-├── telegram_bot.py          # Telegram bot integration
-├── discord_bot.py           # Discord voice bot integration
-├── scheduler.py             # Event and task scheduling
-├── outlook.py               # Microsoft Outlook calendar integration
-├── comms/                   # Inter-agent communication
-│   └── message_bus.py       # File-based message bus with locking
-├── data/                    # Data source adapters
-│   ├── api_adapter.py       # REST API adapter
-│   ├── excel_adapter.py     # Excel/CSV file adapter
-│   └── db_adapter.py        # Database adapter
-├── journal/                 # Project knowledge management
-│   ├── writer.py            # Markdown entry writing
-│   ├── index.py             # Entry indexing and search
-│   └── retriever.py         # Two-pass retrieval with decay
-└── state/                   # Project state management
-    └── project_state.py     # SQLite state persistence
+├── orchestrator.py          # Central coordinator — starts all agents + bots,
+│                            #   schedules daily operations, routes messages
+├── fda_agent.py             # Core FDA agent — onboarding, check-ins, Q&A
+├── worker_agent.py          # Remote worker — agentic code ops via SSH
+├── local_worker_agent.py    # Local worker — agentic code ops on local filesystem
+├── claude_backend.py        # Claude abstraction — CLI (Max sub) or API backend
+├── daemon.py                # Daemon installer — launchd (macOS) / systemd (Linux)
+│
+├── telegram_bot.py          # Telegram bot with tool-use
+├── discord_bot.py           # Discord bot with voice + tool-use
+├── slack_bot.py             # Slack bot with tool-use
+│
+├── journal/                 # Persistent memory system
+│   ├── writer.py            #   Markdown entries with YAML frontmatter
+│   ├── index.py             #   Tag-based indexing and search
+│   └── retriever.py         #   Two-pass retrieval with relevance decay
+│
+├── state/                   # SQLite state persistence
+│   └── project_state.py     #   Tasks, alerts, context, chat history
+│
+├── clients/                 # Multi-client project management
+│   └── client_config.py     #   Per-client VM, repo, and context configs
+│
+├── remote/                  # Remote VM operations
+│   ├── ssh_manager.py       #   SSH with ControlMaster multiplexing
+│   └── deploy.py            #   File deployment with backup + rollback
+│
+└── comms/                   # Inter-agent communication
+    └── message_bus.py       #   SQLite message bus with locking
 ```
 
-## Core Components
+### How It Works
 
-### Agents
+1. **Orchestrator** starts all agent threads and bot threads, then enters its main polling loop
+2. **Chat bots** (Telegram/Discord/Slack) receive user messages and use Claude's tool-use API to autonomously call tools: search journal, read chats, check tasks, run local/remote commands, dispatch worker tasks
+3. **Worker agents** receive task briefs and use tools (`list_directory`, `read_file`, `search_files`, `write_file`, `run_command`) to explore codebases and generate fixes
+4. **Approval workflow** — code changes require explicit user approval before deployment
+5. **Journal** — all investigations, changes, and deployments are automatically logged
+6. **Scheduled tasks** — morning briefings (9 AM) and daily notetaking (9 PM) run automatically
 
-#### FDAAgent
-Strategic oversight and decision making.
-- `onboard()` - Initialize new projects
-- `daily_checkin()` - Health check and alert generation
-- `ask(question)` - Interactive question answering
-- `review_task(task_id)` - Task feedback and coaching
-- `check_kpis()` - Monitor key performance indicators
-- `prepare_meeting(event_id)` - Generate meeting briefs
+### Claude Backend
 
-#### ExecutorAgent
-Task delivery and execution.
-- `run_event_loop()` - Main execution loop
-- `pick_up_task()` - Get next task from queue
-- `execute_task(task)` - Execute task with tracking
-- `request_review(task_id)` - Request FDA feedback
-- `report_blocker(task_id, reason)` - Alert on blockers
+FDA supports two Claude backends:
 
-#### LibrarianAgent
-Knowledge organization and reporting.
-- `run_event_loop()` - Main processing loop
-- `generate_report(type)` - Create reports (daily/weekly/monthly/project)
-- `generate_meeting_brief(event)` - Generate meeting materials
-- `write_journal_entry(entry)` - Write markdown with frontmatter
-- `update_index()` - Maintain searchable index
+- **Claude Code CLI** (`claude --print`) — uses your Max/Pro subscription, no API cost
+- **Anthropic API** — pay-per-token, supports tool-use and streaming
 
-### Communication Integrations
-
-#### Telegram Bot
-- `/start` - Register for notifications
-- `/ask <question>` - Ask FDA about the project
-- `/status` - Get project status
-- `/tasks` - List current tasks
-- `/alerts` - Show unacknowledged alerts
-- Proactive alert notifications to registered users
-
-#### Discord Voice Bot
-- `!join` - Join your voice channel
-- `!leave` - Leave voice channel
-- `!ask <question>` - Ask FDA (responds in voice)
-- `!status` - Show project status
-- `!say <text>` - Speak text in voice channel
-- Automatic session transcripts logged to journal
-
-### Data Adapters
-
-Pluggable adapters for data sources:
-
-- **APIAdapter** - REST API integration with configurable endpoints
-- **ExcelAdapter** - Excel/CSV file watching and reading with pandas
-- **DBAdapter** - Database connectivity
-
-### State Management
-
-SQLite-based persistent state with tables for:
-- **context** - Key-value project configuration
-- **tasks** - Task tracking with status and ownership
-- **kpi_snapshots** - Historical metric values
-- **alerts** - System alerts and notifications
-- **decisions** - Recorded decisions with rationale
-- **meeting_prep** - Meeting preparation records
-- **telegram_users** - Registered Telegram users
-- **discord_sessions** - Voice session history
-
-### Journal System
-
-Markdown-based project knowledge repository with:
-- Automatic YAML frontmatter generation
-- Tag-based organization
-- Two-pass ranked retrieval (relevance + recency scoring)
-- Exponential decay for aging entries
-
-## Command-Line Interface
-
-```bash
-# Project management
-fda init <path>              # Initialize project
-fda start [--daemon]         # Start system
-fda status                   # Show status
-fda config                   # Show configuration
-
-# Interaction
-fda ask <question>           # Ask FDA
-fda meeting-prep --id <id>   # Prepare for meeting
-fda report {daily|weekly|monthly|project}
-
-# Task management
-fda task add <title> --owner <name>
-fda task list [--status pending|in_progress|completed|blocked]
-fda task update <id> --status <status>
-
-# Journal
-fda journal search <query>
-fda journal write --author <name> --tags <tags> --summary <text> --content <text>
-
-# Telegram
-fda telegram setup           # Configure bot token
-fda telegram status          # Show bot status
-fda telegram start           # Start bot
-fda telegram test            # Send test message
-
-# Discord
-fda discord setup            # Configure bot token
-fda discord status           # Show bot status
-fda discord start            # Start bot
-fda discord invite           # Get invite link
-
-# Calendar
-fda calendar login           # Log in to Office 365
-fda calendar logout          # Log out
-fda calendar status          # Check connection
-fda calendar today           # Show today's events
-fda calendar upcoming        # Show upcoming events
-
-# Setup
-fda setup [--port 9999]      # Start web setup UI
-```
-
-## Dependencies
-
-### Core
-- **anthropic** - Claude API client
-- **pandas** - Data manipulation
-- **openpyxl** - Excel file handling
-- **msal** - Microsoft authentication
-- **requests** - HTTP library
-
-### Optional
-- **python-telegram-bot** - Telegram integration
-- **discord.py[voice]** - Discord integration
-- **openai** - Whisper STT and TTS for voice
-- **pynacl** - Voice encryption for Discord
-- **flask** - Web setup UI
-
-Install with:
-```bash
-pip install -e ".[all]"  # Everything
-pip install -e ".[telegram]"  # Just Telegram
-pip install -e ".[discord]"  # Just Discord
-pip install -e ".[web]"  # Just web UI
-```
+Auto-detected at startup. Set `FDA_CLAUDE_BACKEND=api` or `FDA_CLAUDE_BACKEND=cli` to force.
 
 ## Configuration
 
 ### Environment Variables
 
 ```bash
-# Required
-ANTHROPIC_API_KEY=sk-ant-...
+# Claude (one of these)
+ANTHROPIC_API_KEY=sk-ant-...          # For API backend
+# or just have `claude` CLI on PATH   # For CLI backend (Max subscription)
 
-# Telegram (optional - can use fda telegram setup instead)
-TELEGRAM_BOT_TOKEN=123456789:ABCDefGHI...
-
-# Discord (optional - can use fda discord setup instead)
-DISCORD_BOT_TOKEN=your_discord_bot_token
+# Chat bots (or configure via fda onboard)
+TELEGRAM_BOT_TOKEN=123456789:ABC...
+DISCORD_BOT_TOKEN=your_token
 DISCORD_CLIENT_ID=your_client_id
+SLACK_BOT_TOKEN=xoxb-...
+SLACK_APP_TOKEN=xapp-...
 
-# OpenAI for voice features (optional)
-OPENAI_API_KEY=sk-...
+# Optional
+OPENAI_API_KEY=sk-...                 # For voice (TTS/STT)
 ```
 
-### Model Configuration
+### Daemon Installation
 
-Defined in `fda/config.py`:
-- `MODEL_FDA`: Claude Opus 4.5 for FDA agent
-- `MODEL_EXECUTOR`: Claude 3.5 Sonnet for executor
-- `MODEL_LIBRARIAN`: Claude 3.5 Sonnet for librarian
-
-## Development
+FDA can run as a system service that starts at boot:
 
 ```bash
-# Install dev dependencies
-pip install -e ".[dev]"
-
-# Run tests
-pytest
-
-# Check code quality
-black . && ruff check .
+# Installed automatically during `fda onboard`, or manually:
+# macOS — creates ~/Library/LaunchAgents/com.fda.agent.plist
+# Linux — creates ~/.config/systemd/user/fda.service
 ```
+
+## Tech Stack
+
+- **Python 3.10+**
+- **Claude API** (Anthropic) — tool-use, streaming, extended thinking
+- **SQLite** — state persistence, message bus, chat history
+- **SSH** (ControlMaster) — remote VM operations with connection multiplexing
+- **launchd / systemd** — daemon management
+
+### Dependencies
+
+Core: `anthropic`, `pandas`, `requests`, `flask`
+Optional: `python-telegram-bot`, `discord.py[voice]`, `slack-bolt`, `openai`, `msal`
 
 ## License
 
 Proprietary - Jae Heuk Jung
 
-## Support
+## Links
 
-- GitHub Issues: https://github.com/white-dots/FDA/issues
-- Documentation files: `SCAFFOLD_SUMMARY.md`, `IMPLEMENTATION_EXAMPLES.md`
+- GitHub: [white-dots/FDA](https://github.com/white-dots/FDA)
+- Issues: [github.com/white-dots/FDA/issues](https://github.com/white-dots/FDA/issues)

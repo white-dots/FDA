@@ -1,16 +1,17 @@
 """
 Worker Agent — merged Librarian + Executor for remote code operations.
 
+Uses Claude's tool-use API to autonomously explore and modify remote
+codebases via SSH. Instead of walking all files upfront, Claude uses
+tools (list_directory, read_file, search_files, etc.) to decide what
+to explore — like a developer would.
+
 The Worker handles the technical side of client requests:
 1. Receives task briefs from FDA via the message bus
-2. SSHs into the correct Azure VM to read the codebase
-3. Generates code fixes using Claude with full context
+2. Uses tools to explore the codebase on the Azure VM via SSH
+3. Generates code fixes autonomously
 4. Creates diffs for FDA to send to the user for approval
 5. Deploys approved changes to the VM
-
-This replaces the separate Librarian and Executor agents from the
-original FDA architecture, since for Datacore's use case, the agent
-that reads the code is the same one that needs to change it.
 """
 
 import json
@@ -22,8 +23,8 @@ from typing import Any, Callable, Optional
 from datetime import datetime
 
 from fda.base_agent import BaseAgent
-from fda.claude_backend import get_claude_backend
-from fda.config import MODEL_EXECUTOR, MODEL_MEETING_SUMMARY
+from fda.claude_backend import get_claude_backend, ToolLoopTimeoutError
+from fda.config import MODEL_EXECUTOR, MODEL_MEETING_SUMMARY, ANALYZE_TIMEOUT_SECONDS
 from fda.clients.client_config import ClientConfig, ClientManager
 from fda.remote.ssh_manager import SSHManager
 from fda.remote.deploy import Deployer, DeployResult
@@ -32,7 +33,7 @@ from fda.comms.message_bus import MessageBus
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Stopwords for keyword extraction (filtered out of task briefs)
+# Stopwords for keyword extraction (kept for backward compatibility)
 # ---------------------------------------------------------------------------
 _STOPWORDS = frozenset({
     "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
@@ -49,33 +50,172 @@ _STOPWORDS = frozenset({
     "works", "work", "working", "make", "run", "use", "used",
 })
 
+# ---------------------------------------------------------------------------
+# Tool definitions for the agentic loop
+# ---------------------------------------------------------------------------
+
+_REMOTE_WORKER_TOOLS: list[dict[str, Any]] = [
+    {
+        "name": "list_directory",
+        "description": (
+            "List files and subdirectories on the remote VM. "
+            "Returns directory contents. Use '.' for the repo root. "
+            "Good for understanding project structure."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": (
+                        "Path on the remote VM, relative to repo root "
+                        "or absolute. Use '.' for the repo root."
+                    ),
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "read_file",
+        "description": (
+            "Read the full contents of a file from the remote VM. "
+            "Use this to examine source code, configs, or any text file."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": (
+                        "File path on the remote VM (relative to repo root "
+                        "or absolute)."
+                    ),
+                },
+            },
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "search_files",
+        "description": (
+            "Search for a regex pattern in files on the remote VM (like grep). "
+            "Returns matching lines with file paths and line numbers. "
+            "Great for finding function definitions, imports, error messages, etc."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "Search pattern (regular expression).",
+                },
+                "path": {
+                    "type": "string",
+                    "description": (
+                        "Directory to search in (relative to repo root or "
+                        "absolute). Defaults to repo root."
+                    ),
+                },
+                "file_pattern": {
+                    "type": "string",
+                    "description": (
+                        "File glob to filter (e.g. '*.py', '*.sql'). "
+                        "Defaults to all code files."
+                    ),
+                },
+            },
+            "required": ["pattern"],
+        },
+    },
+    {
+        "name": "write_file",
+        "description": (
+            "Record a code change to a file on the remote VM. Provide the "
+            "COMPLETE new file content, not just the changed part. The "
+            "change will be applied after user approval. You MUST read "
+            "the file first before writing."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "File path on the remote VM.",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "The COMPLETE new content for the file.",
+                },
+            },
+            "required": ["path", "content"],
+        },
+    },
+    {
+        "name": "run_command",
+        "description": (
+            "Execute a shell command on the remote VM via SSH. "
+            "Use for checking service status, running tests, "
+            "inspecting logs, git operations, etc. Output is capped at 10k chars."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "Shell command to execute on the remote VM.",
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": (
+                        "Working directory for the command. "
+                        "Defaults to the repo root."
+                    ),
+                },
+            },
+            "required": ["command"],
+        },
+    },
+]
+
 
 class WorkerAgent(BaseAgent):
     """
     Technical execution agent for Datacore client operations.
 
-    Combines code reading (Librarian) and code execution (Executor)
-    into a single agent that operates on remote Azure VMs via SSH.
+    Uses Claude's tool-use API to autonomously explore and modify
+    client codebases on remote Azure VMs via SSH. Claude decides
+    which files to read and what to change, rather than scanning
+    all files upfront.
     """
 
     SYSTEM_PROMPT = """You are the Worker agent for Datacore, a software consultancy.
-Your job is to make code changes on client Azure VMs based on task briefs from the FDA agent.
+Your job is to analyze codebases and make code changes on client Azure VMs based on task briefs from the FDA agent.
 
-When you receive a task brief, you will:
-1. Understand the client's request in business context
-2. Read the relevant source files from their codebase
-3. Identify what needs to change
-4. Generate the minimal, correct code fix
-5. Produce a clean diff showing exactly what changed
+You have tools to explore and modify the remote filesystem via SSH:
+- list_directory: See what files and folders exist on the VM
+- read_file: Read a file's contents from the VM
+- search_files: Search for patterns across files (like grep)
+- write_file: Record code changes (provide COMPLETE file content)
+- run_command: Execute shell commands on the VM
 
-Important rules:
-- Make minimal changes. Don't refactor unrelated code.
+WORKFLOW:
+1. Start by listing the project root to understand the structure
+2. Read key files (README, config files, etc.) to understand the project
+3. Use search_files to find relevant code patterns
+4. Read the specific files you need to understand
+5. Analyze and form your response
+6. If code changes are needed, use write_file with the COMPLETE new file content
+
+IMPORTANT RULES:
+- Make minimal changes — don't refactor unrelated code
 - Preserve the existing code style (indentation, naming conventions, etc.)
-- If you're unsure about the fix, say so rather than guessing.
-- Always explain what you changed and why in plain language.
-- Consider edge cases and potential side effects.
-- Never change database schemas without explicit approval.
-- Never delete data or drop tables.
+- If you're unsure about the fix, say so rather than guessing
+- Always explain what you found/changed and why in plain language
+- Consider edge cases and potential side effects
+- Never change database schemas without explicit approval
+- Never delete data or drop tables
+- For investigation/query tasks, just report your findings — no changes needed
 """
 
     def __init__(
@@ -106,15 +246,12 @@ Important rules:
         self._ssh_connections: dict[str, SSHManager] = {}
         self._deployers: dict[str, Deployer] = {}
 
-        # Cache for codebase file listings (avoids re-running `find` every call)
-        # Key: (client_id, repo_path), Value: (timestamp, file_list)
-        self._structure_cache: dict[tuple[str, str], tuple[float, list[str]]] = {}
-        self._structure_cache_ttl = 300.0  # 5 minutes
-
-        # Cache for file importance rankings (git-based, refreshed daily)
-        # Key: client_id, Value: (timestamp, {filepath: importance_score})
-        self._ranking_cache: dict[str, tuple[float, dict[str, float]]] = {}
-        self._ranking_cache_ttl = 86400.0  # 24 hours
+        # Tool-use state (reset per analyze_and_fix call)
+        self._current_ssh: Optional[SSHManager] = None
+        self._current_client: Optional[ClientConfig] = None
+        self._current_repo_path: Optional[str] = None
+        self._pending_changes: dict[str, str] = {}
+        self._files_read: dict[str, str] = {}
 
         # Warm up SSH connections to all clients at init time
         self._warmup_connections()
@@ -160,6 +297,10 @@ Important rules:
             except Exception as e:
                 logger.warning(f"SSH warmup error for {client.name}: {e}")
 
+    # ------------------------------------------------------------------
+    # Main entry point — agentic tool-use loop
+    # ------------------------------------------------------------------
+
     def analyze_and_fix(
         self,
         client_id: str,
@@ -168,24 +309,25 @@ Important rules:
         progress_callback: Optional[Callable[[str], None]] = None,
     ) -> dict[str, Any]:
         """
-        Analyze a client request and generate a code fix.
+        Analyze a client request and generate a code fix using agentic tool-use.
 
-        This is the main entry point for the Worker.
+        Instead of walking all files upfront, Claude uses tools to
+        autonomously explore the remote codebase and decide what to
+        read/change.
 
         Args:
             client_id: Client identifier.
             task_brief: Business-context task description from FDA.
             hint_files: Optional list of file paths to examine first.
             progress_callback: Optional callback for live progress updates.
-                Called with a status string at each step. Thread-safe.
 
         Returns:
             Dict with:
               - success: bool
-              - analysis: str (what the agent found)
+              - analysis: str
               - changes: dict[str, str] (file path -> new content)
-              - diff: str (unified diff of all changes)
-              - explanation: str (human-readable explanation)
+              - diff: str (unified diff)
+              - explanation: str
               - error: Optional[str]
         """
         def _progress(msg: str) -> None:
@@ -195,7 +337,7 @@ Important rules:
                 try:
                     progress_callback(msg)
                 except Exception:
-                    pass  # Never let callback errors break the pipeline
+                    pass
 
         client = self.client_manager.get_client(client_id)
         if not client:
@@ -207,764 +349,342 @@ Important rules:
         ssh = self._get_ssh(client)
         repo_path = client.project.repo_path
 
-        # Step 1: Understand the codebase structure
-        all_paths = [repo_path] + (client.project.extra_repo_paths or [])
-        path_label = f" across {len(all_paths)} paths" if len(all_paths) > 1 else ""
-        _progress(f"📂 Scanning codebase on {client.name} VM...")
-        structure = self._explore_codebase(ssh, repo_path, client)
-        _progress(f"📂 Found {len(structure)} files{path_label}")
+        # Reset tool-use state for this call
+        self._current_ssh = ssh
+        self._current_client = client
+        self._current_repo_path = repo_path
+        self._pending_changes = {}
+        self._files_read = {}
 
-        # Step 2: Identify relevant files
-        _progress("🔍 Identifying relevant files...")
-        relevant_files = self._identify_relevant_files(
-            task_brief, structure, hint_files, client
-        )
+        # Build context with hint files if provided
+        hint_context = ""
+        if hint_files:
+            hint_context = (
+                f"\n\nHINT: Start by examining these files: "
+                f"{', '.join(hint_files)}"
+            )
 
-        if not relevant_files:
-            _progress("❌ No relevant files found")
+        # Include extra repo paths in the context
+        extra_paths = client.project.extra_repo_paths or []
+        extra_context = ""
+        if extra_paths:
+            extra_context = (
+                f"\n\nADDITIONAL PATHS: The project also includes these "
+                f"directories: {', '.join(extra_paths)}"
+            )
+
+        messages = [{
+            "role": "user",
+            "content": (
+                f"{client.get_context_for_prompt()}\n\n"
+                f"REPO ROOT: {repo_path}\n"
+                f"TASK:\n{task_brief}"
+                f"{hint_context}"
+                f"{extra_context}\n\n"
+                "Please explore the codebase via the tools and address "
+                "this task. Use list_directory and read_file to understand "
+                "the code, search_files to find relevant patterns, and "
+                "write_file if code changes are needed."
+            ),
+        }]
+
+        _progress(f"📂 Analyzing {client.name} codebase with tool-use...")
+
+        try:
+            response = self._backend.complete_with_tools(
+                system=self.SYSTEM_PROMPT,
+                messages=messages,
+                tools=_REMOTE_WORKER_TOOLS,
+                tool_executor=self._execute_tool,
+                model=MODEL_MEETING_SUMMARY,
+                max_tokens=8000,
+                max_iterations=15,
+                progress_callback=_progress,
+                timeout=ANALYZE_TIMEOUT_SECONDS,
+            )
+        except ToolLoopTimeoutError as e:
+            logger.warning(f"Remote worker timed out: {e}")
             return {
                 "success": False,
-                "error": "Could not identify relevant files for this task",
-                "analysis": f"Explored {len(structure)} files but none matched the request",
+                "error": f"Analysis timed out after {e.elapsed:.0f}s. Try a simpler task or a more specific request.",
             }
+        except Exception as e:
+            logger.error(f"Tool-use loop failed: {e}", exc_info=True)
+            return {"success": False, "error": str(e)}
 
-        # Show which files were selected
-        short_names = [f.rsplit("/", 1)[-1] for f in relevant_files[:5]]
-        extras = f" +{len(relevant_files) - 5} more" if len(relevant_files) > 5 else ""
-        _progress(f"🔍 Found {len(relevant_files)} relevant files: {', '.join(short_names)}{extras}")
+        # Build result from tool-use state
+        changes = dict(self._pending_changes)
+        diff_parts = []
+        for filepath, new_content in changes.items():
+            old_content = self._files_read.get(filepath, "")
+            diff = difflib.unified_diff(
+                old_content.splitlines(keepends=True),
+                new_content.splitlines(keepends=True),
+                fromfile=f"a/{filepath}",
+                tofile=f"b/{filepath}",
+            )
+            diff_parts.append("".join(diff))
 
-        # Step 3: Read the relevant source files
-        _progress(f"📖 Reading {len(relevant_files)} files from VM...")
-
-        # Resolve relative paths (from `find .`) to absolute paths
-        # so read_files() can cat them without needing cwd.
-        # Also expand ~ to $HOME since cat "~/..." won't expand tilde
-        # inside quotes on the remote shell.
-        def _resolve(f: str) -> str:
-            if f.startswith("./"):
-                return f"{repo_path}/{f[2:]}"
-            elif f.startswith("~") or f.startswith("/"):
-                return f  # already absolute (from extra paths or hint_files)
-            else:
-                return f"{repo_path}/{f}"
-
-        abs_files = [_resolve(f) for f in relevant_files]
-
-        # Expand ~ → $HOME on the remote host (tilde doesn't expand inside quotes)
-        if any("~" in f for f in abs_files):
-            home_result = ssh.execute("echo $HOME")
-            remote_home = home_result.stdout.strip() if home_result.success else "/home"
-            abs_files = [f.replace("~", remote_home) for f in abs_files]
-
-        file_contents = ssh.read_files(abs_files)
-
-        # Re-map keys back to the original relative paths for downstream use
-        file_contents = {
-            rel: file_contents.get(absl)
-            for rel, absl in zip(relevant_files, abs_files)
-        }
-
-        # Filter out files that couldn't be read
-        readable_files = {
-            path: content
-            for path, content in file_contents.items()
-            if content is not None
-        }
-
-        if not readable_files:
-            _progress("❌ Could not read any files")
-            return {
-                "success": False,
-                "error": "Could not read any of the relevant files",
-            }
-
-        total_chars = sum(len(c) for c in readable_files.values())
-        _progress(f"📖 Read {len(readable_files)} files ({total_chars:,} chars)")
-
-        # Step 4: Generate the fix using Claude
-        _progress("🧠 Analyzing with Claude...")
-        fix_result = self._generate_fix(
-            task_brief=task_brief,
-            client=client,
-            file_contents=readable_files,
-            repo_path=repo_path,
-        )
-
-        if fix_result.get("success"):
-            _progress("✅ Analysis complete")
+        is_investigation = not changes
+        if changes:
+            _progress(f"✅ Generated changes to {len(changes)} file(s)")
         else:
-            _progress(f"⚠️ Analysis finished with errors: {fix_result.get('error', 'unknown')[:100]}")
+            _progress("✅ Analysis complete (no code changes)")
 
-        return fix_result
+        return {
+            "success": True,
+            "investigation": is_investigation,
+            "analysis": response,
+            "changes": changes,
+            "diff": "\n".join(diff_parts),
+            "explanation": response,
+            "confidence": "high" if changes else "medium",
+            "warnings": [],
+        }
 
-    def _explore_codebase(
+    # ------------------------------------------------------------------
+    # Tool execution (via SSH)
+    # ------------------------------------------------------------------
+
+    def _execute_tool(
+        self, tool_name: str, tool_input: dict[str, Any]
+    ) -> str:
+        """Execute a worker tool via SSH and return the result."""
+        ssh = self._current_ssh
+        repo_path = self._current_repo_path
+
+        if ssh is None or repo_path is None:
+            return "Error: no SSH context set"
+
+        try:
+            if tool_name == "list_directory":
+                return self._tool_list_directory(ssh, repo_path, tool_input)
+            elif tool_name == "read_file":
+                return self._tool_read_file(ssh, repo_path, tool_input)
+            elif tool_name == "search_files":
+                return self._tool_search_files(ssh, repo_path, tool_input)
+            elif tool_name == "write_file":
+                return self._tool_write_file(tool_input)
+            elif tool_name == "run_command":
+                return self._tool_run_command(ssh, repo_path, tool_input)
+            else:
+                return f"Unknown tool: {tool_name}"
+        except Exception as e:
+            logger.error(f"Tool {tool_name} error: {e}", exc_info=True)
+            return f"Error executing {tool_name}: {e}"
+
+    def _resolve_path(self, repo_path: str, rel_path: str) -> str:
+        """Resolve a relative path to an absolute path on the remote VM."""
+        if not rel_path or rel_path == ".":
+            return repo_path
+        if rel_path.startswith("/"):
+            return rel_path  # already absolute
+        if rel_path.startswith("~"):
+            return rel_path  # let the remote shell expand it
+        return f"{repo_path}/{rel_path}"
+
+    def _tool_list_directory(
         self,
         ssh: SSHManager,
         repo_path: str,
-        client: ClientConfig,
-    ) -> list[str]:
-        """
-        Get an overview of the codebase structure across all repo paths.
+        tool_input: dict[str, Any],
+    ) -> str:
+        """List files and directories on the remote VM."""
+        rel_path = tool_input.get("path", ".")
+        full_path = self._resolve_path(repo_path, rel_path)
 
-        Scans ``repo_path`` plus any ``extra_repo_paths`` from the client
-        config.  Each path is cached independently (5-min TTL).  After
-        collecting all files, they are sorted by importance score (most
-        important first) using git-based ranking (24h TTL cache).
+        # List with file types: d for dir, f for file
+        cmd = (
+            f'ls -1ap "{full_path}" 2>/dev/null '
+            f'| grep -v "^\\.$" | grep -v "^\\.\\.$" | head -200'
+        )
+        result = ssh.execute(cmd, timeout=10)
 
-        Returns a list of file paths sorted by importance.
-        """
-        all_paths = [repo_path] + (client.project.extra_repo_paths or [])
-        combined_files: list[str] = []
-        now = time.monotonic()
+        if not result.success or not result.stdout.strip():
+            # Try with find as fallback
+            cmd = (
+                f'find "{full_path}" -maxdepth 1 -mindepth 1 '
+                f'! -name ".*" '
+                f'! -name "node_modules" ! -name "__pycache__" '
+                f'! -name "venv" ! -name ".venv" '
+                f'-printf "%f%y\\n" 2>/dev/null '
+                f'| sort | head -200'
+            )
+            result = ssh.execute(cmd, timeout=10)
+            if not result.success or not result.stdout.strip():
+                return f"Error: Could not list directory: {rel_path}"
 
-        _find_cmd = (
-            "find . -type f "
-            "! -path './.git/*' "
-            "! -path './node_modules/*' "
-            "! -path './__pycache__/*' "
-            "! -path './venv/*' "
-            "! -path './.venv/*' "
-            "! -path './env/*' "
-            "! -path './.env/*' "
-            "! -path './dist/*' "
-            "! -path './build/*' "
-            "! -path './*.pyc' "
-            "| head -2000"
+            # Parse find output (filename + type char: d for dir, f for file)
+            entries = []
+            for line in result.stdout.strip().split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                if line.endswith("d"):
+                    entries.append(line[:-1] + "/")
+                else:
+                    entries.append(line[:-1] if line.endswith("f") else line)
+            return "\n".join(entries) if entries else "(empty directory)"
+
+        return result.stdout.strip()
+
+    def _tool_read_file(
+        self,
+        ssh: SSHManager,
+        repo_path: str,
+        tool_input: dict[str, Any],
+    ) -> str:
+        """Read a file from the remote VM."""
+        rel_path = tool_input.get("path", "")
+        if not rel_path:
+            return "Error: path is required"
+
+        full_path = self._resolve_path(repo_path, rel_path)
+
+        # Expand ~ on remote
+        if "~" in full_path:
+            home_result = ssh.execute("echo $HOME", timeout=5)
+            remote_home = (
+                home_result.stdout.strip() if home_result.success else "/home"
+            )
+            full_path = full_path.replace("~", remote_home)
+
+        # Read via SSH
+        file_contents = ssh.read_files([full_path])
+        content = file_contents.get(full_path)
+
+        if content is None:
+            return f"Error: Could not read file: {rel_path}"
+
+        # Store for diffing later
+        self._files_read[rel_path] = content
+
+        if len(content) > 30000:
+            return (
+                content[:30000]
+                + f"\n... [truncated — file is {len(content):,} chars total]"
+            )
+        return content
+
+    def _tool_search_files(
+        self,
+        ssh: SSHManager,
+        repo_path: str,
+        tool_input: dict[str, Any],
+    ) -> str:
+        """Search for a pattern in files on the remote VM (like grep)."""
+        pattern = tool_input.get("pattern", "")
+        if not pattern:
+            return "Error: pattern is required"
+
+        rel_path = tool_input.get("path", ".")
+        file_pattern = tool_input.get("file_pattern", "")
+        full_path = self._resolve_path(repo_path, rel_path)
+
+        # Build grep command
+        if file_pattern:
+            include_flags = f'--include="{file_pattern}"'
+        else:
+            include_flags = (
+                '--include="*.py" --include="*.sql" --include="*.yaml" '
+                '--include="*.yml" --include="*.sh" --include="*.cfg" '
+                '--include="*.conf" --include="*.json" --include="*.toml" '
+                '--include="*.js" --include="*.ts" --include="*.html"'
+            )
+
+        # Escape double quotes in pattern for shell safety
+        safe_pattern = pattern.replace('"', '\\"')
+
+        cmd = (
+            f'grep -rn -i {include_flags} '
+            f'--exclude-dir=node_modules --exclude-dir=__pycache__ '
+            f'--exclude-dir=.git --exclude-dir=venv --exclude-dir=.venv '
+            f'--exclude-dir=env --exclude-dir=.env '
+            f'-E "{safe_pattern}" "{full_path}" 2>/dev/null | head -50'
         )
 
-        for path in all_paths:
-            cache_key = (client.client_id, path)
+        result = ssh.execute(cmd, timeout=15)
 
-            # Check cache
-            if cache_key in self._structure_cache:
-                cached_time, cached_files = self._structure_cache[cache_key]
-                if (now - cached_time) < self._structure_cache_ttl:
-                    combined_files.extend(cached_files)
-                    continue
+        if result.success and result.stdout.strip():
+            return result.stdout.strip()
+        return f"No matches found for pattern: {pattern}"
 
-            result = ssh.execute(_find_cmd, cwd=path, timeout=15)
+    def _tool_write_file(self, tool_input: dict[str, Any]) -> str:
+        """Record a file change (applied after user approval via deploy)."""
+        rel_path = tool_input.get("path", "")
+        content = tool_input.get("content", "")
+        if not rel_path:
+            return "Error: path is required"
+        if not content:
+            return "Error: content is required"
 
-            if result.success and result.stdout.strip():
-                files = [
-                    line.strip()
-                    for line in result.stdout.strip().split("\n")
-                    if line.strip()
-                ]
-                # Prefix files from extra paths with their root so they
-                # can be resolved to absolute paths downstream.
-                if path != repo_path:
-                    files = [
-                        f"{path}/{f[2:]}" if f.startswith("./") else f"{path}/{f}"
-                        for f in files
-                    ]
-                self._structure_cache[cache_key] = (now, files)
-                logger.info(f"Cached file listing for {client.name} ({path}): {len(files)} files")
-                combined_files.extend(files)
+        # Store the pending change
+        self._pending_changes[rel_path] = content
 
-        # Rank files by importance (git signals + query history)
-        rankings = self._rank_files(ssh, client, all_paths)
-        if rankings:
-            combined_files.sort(key=lambda f: rankings.get(f, 0.0), reverse=True)
+        # If not already read, store empty for diff
+        if rel_path not in self._files_read:
+            self._files_read[rel_path] = ""
 
-        return combined_files
+        return (
+            f"✓ Recorded change to {rel_path} ({len(content):,} chars). "
+            "Change will be applied after approval."
+        )
+
+    def _tool_run_command(
+        self,
+        ssh: SSHManager,
+        repo_path: str,
+        tool_input: dict[str, Any],
+    ) -> str:
+        """Execute a shell command on the remote VM via SSH."""
+        command = tool_input.get("command", "")
+        if not command:
+            return "Error: command is required"
+
+        cwd = tool_input.get("cwd", repo_path)
+        if cwd == ".":
+            cwd = repo_path
+
+        # Block dangerous commands
+        dangerous_patterns = [
+            "rm -rf /", "rm -r /", "dd if=", "mkfs.", "> /dev/",
+            "chmod -R 777", ":(){",
+        ]
+        cmd_lower = command.lower()
+        for d in dangerous_patterns:
+            if d in cmd_lower:
+                return "Error: Potentially dangerous command blocked"
+
+        result = ssh.execute(command, cwd=cwd, timeout=30)
+
+        output = ""
+        if result.stdout:
+            output += result.stdout
+        if result.stderr:
+            if output:
+                output += f"\n[stderr]\n{result.stderr}"
+            else:
+                output = result.stderr
+        if not result.success:
+            output += f"\n[command failed]"
+
+        return output[:10000] if output else "(no output)"
+
+    # ------------------------------------------------------------------
+    # Backward compatibility — no-op cache methods
+    # ------------------------------------------------------------------
 
     def invalidate_structure_cache(self, client_id: Optional[str] = None) -> None:
-        """Clear the codebase structure cache.
+        """No-op — kept for backward compatibility.
 
-        Args:
-            client_id: If provided, only clear cache for this client.
-                       If None, clear all cached structures.
+        The tool-use approach doesn't use a file listing cache;
+        Claude explores the codebase dynamically via tools.
         """
-        if client_id:
-            keys_to_remove = [k for k in self._structure_cache if k[0] == client_id]
-            for key in keys_to_remove:
-                del self._structure_cache[key]
-            logger.debug(f"Cleared structure cache for {client_id}")
-        else:
-            self._structure_cache.clear()
-            logger.debug("Cleared all structure caches")
+        pass
 
     # ------------------------------------------------------------------
-    # File ranking — git signals + query history
+    # Deploy
     # ------------------------------------------------------------------
-
-    def _rank_files(
-        self,
-        ssh: SSHManager,
-        client: ClientConfig,
-        search_paths: Optional[list[str]] = None,
-    ) -> dict[str, float]:
-        """Compute importance scores for all files using git or filesystem signals.
-
-        When git is available:
-          - Recent edits in last 3 months via git log (0.30)
-          - All-time commit frequency via git log   (0.25)
-        When git is NOT available (fallback):
-          - Recently modified files via find -mtime  (0.30)
-          - File complexity via wc -l                (0.25)
-
-        Always:
-          - Python import hub score via grep         (0.15)
-          - Query history from state DB              (0.30)
-
-        Results are cached per client for 24 hours.
-        """
-        now = time.monotonic()
-        if client.client_id in self._ranking_cache:
-            cached_time, cached_ranks = self._ranking_cache[client.client_id]
-            if (now - cached_time) < self._ranking_cache_ttl:
-                return cached_ranks
-
-        if search_paths is None:
-            search_paths = [client.project.repo_path] + (client.project.extra_repo_paths or [])
-
-        # Collect raw counts per signal across all paths
-        recent: dict[str, int] = {}   # filepath → recency score
-        frequency: dict[str, int] = {}  # filepath → frequency/complexity score
-        imports: dict[str, int] = {}   # module name → import count
-
-        # Check if first path has git (use test -d to avoid SSH warning on non-git repos)
-        git_check = ssh.execute('test -d .git && echo yes || echo no',
-                                cwd=search_paths[0], timeout=5)
-        has_git = git_check.success and git_check.stdout.strip() == 'yes'
-
-        if has_git:
-            batch_cmd = (
-                '('
-                'echo "===RECENT==="; '
-                'git log --all --pretty=format: --name-only --since="3 months ago" 2>/dev/null '
-                '| grep -v "^$" | sort | uniq -c | sort -rn | head -200; '
-                'echo "===FREQUENCY==="; '
-                'git log --all --pretty=format: --name-only 2>/dev/null '
-                '| grep -v "^$" | sort | uniq -c | sort -rn | head -200; '
-                'echo "===IMPORTS==="; '
-                'grep -rh "^from \\|^import " --include="*.py" . 2>/dev/null '
-                "| sed 's/from \\([^ ]*\\).*/\\1/; s/import \\([^ ,]*\\).*/\\1/' "
-                '| sort | uniq -c | sort -rn | head -100'
-                ')'
-            )
-        else:
-            # Filesystem-based fallback: mtime for recency, line count for complexity
-            excl = (
-                '! -path "*/node_modules/*" ! -path "*/__pycache__/*" '
-                '! -path "*/.git/*" ! -path "*/.ipynb_checkpoints/*" '
-                '! -path "*/backup*/*"'
-            )
-            batch_cmd = (
-                '('
-                'echo "===RECENT==="; '
-                'find . -type f \\( -name "*.py" -o -name "*.sql" -o -name "*.yaml" -o -name "*.yml" '
-                '-o -name "*.sh" -o -name "*.cfg" -o -name "*.conf" \\) '
-                f'{excl} '
-                '-mtime -90 -printf "%T@ %p\\n" 2>/dev/null '
-                '| sort -rn | head -200 | awk \'{print NR, $2}\'; '
-                'echo "===FREQUENCY==="; '
-                f'find . -type f -name "*.py" {excl} -exec wc -l {{}} + 2>/dev/null '
-                '| grep -v " total$" | sort -rn | head -200; '
-                'echo "===IMPORTS==="; '
-                'grep -rh "^from \\|^import " --include="*.py" '
-                '--exclude-dir=node_modules --exclude-dir=__pycache__ . 2>/dev/null '
-                "| sed 's/from \\([^ ]*\\).*/\\1/; s/import \\([^ ,]*\\).*/\\1/' "
-                '| sort | uniq -c | sort -rn | head -100'
-                ')'
-            )
-
-        for path in search_paths:
-            result = ssh.execute(batch_cmd, cwd=path, timeout=30)
-            if not result.success:
-                continue
-
-            section = None
-            is_primary = (path == search_paths[0])
-
-            for line in result.stdout.split("\n"):
-                stripped = line.strip()
-                if stripped == "===RECENT===":
-                    section = "recent"
-                    continue
-                elif stripped == "===FREQUENCY===":
-                    section = "frequency"
-                    continue
-                elif stripped == "===IMPORTS===":
-                    section = "imports"
-                    continue
-
-                if not stripped or section is None:
-                    continue
-
-                # Lines look like: "  42 path/to/file.py"
-                parts = stripped.split(None, 1)
-                if len(parts) != 2:
-                    continue
-
-                try:
-                    count = int(parts[0])
-                except ValueError:
-                    continue
-
-                name = parts[1]
-                # Strip leading "./" from find output
-                if name.startswith("./"):
-                    name = name[2:]
-
-                # Prefix files from extra paths
-                if not is_primary and section in ("recent", "frequency"):
-                    name = f"{path}/{name}"
-
-                if section == "recent":
-                    recent[name] = recent.get(name, 0) + count
-                elif section == "frequency":
-                    frequency[name] = frequency.get(name, 0) + count
-                elif section == "imports":
-                    imports[name] = imports.get(name, 0) + count
-
-        # Query history from state DB
-        query_counts: dict[str, int] = {}
-        try:
-            from fda.state.project_state import ProjectState
-            state = ProjectState()
-            for fp, cnt in state.get_top_files_by_relevance(client.client_id, limit=100):
-                query_counts[fp] = cnt
-        except Exception:
-            pass  # state DB may not be available
-
-        # Normalize each signal and combine
-        def _max_or_1(d: dict) -> float:
-            return max(d.values()) if d else 1.0
-
-        max_recent = _max_or_1(recent)
-        max_freq = _max_or_1(frequency)
-        max_imports = _max_or_1(imports)
-        max_query = _max_or_1(query_counts)
-
-        all_files = set(recent) | set(frequency) | set(query_counts)
-        scores: dict[str, float] = {}
-
-        for f in all_files:
-            s = 0.0
-            s += (recent.get(f, 0) / max_recent) * 0.30
-            s += (frequency.get(f, 0) / max_freq) * 0.25
-            s += (query_counts.get(f, 0) / max_query) * 0.30
-            # Import score: match module names to file paths
-            # e.g. imports["utils.helpers"] matches file "./utils/helpers.py"
-            for mod, cnt in imports.items():
-                mod_path = mod.replace(".", "/")
-                if mod_path in f:
-                    s += (cnt / max_imports) * 0.15
-                    break
-            scores[f] = s
-
-        mode = "git" if has_git else "filesystem"
-        self._ranking_cache[client.client_id] = (now, scores)
-        logger.info(
-            f"Ranked {len(scores)} files for {client.name} ({mode} mode, "
-            f"recent={len(recent)}, freq={len(frequency)}, "
-            f"imports={len(imports)}, queries={len(query_counts)})"
-        )
-        return scores
-
-    # ------------------------------------------------------------------
-    # Keyword extraction + remote grep
-    # ------------------------------------------------------------------
-
-    def _extract_search_keywords(
-        self, task_brief: str, client: ClientConfig
-    ) -> list[str]:
-        """Extract meaningful search keywords from task brief."""
-        words = set()
-        for word in re.split(r"[\s,;:!?.\"'()\[\]{}/]+", task_brief.lower()):
-            if word and len(word) > 2 and word not in _STOPWORDS:
-                words.add(word)
-                # Add singular/plural variants so "dags" also matches "dag"
-                if word.endswith("s") and len(word) > 4:
-                    words.add(word[:-1])
-                elif not word.endswith("s"):
-                    words.add(word + "s")
-
-        # Add compound pairs for adjacent keywords (e.g. brand+sales)
-        word_list = [
-            w for w in re.split(r"[\s,;:!?.\"'()\[\]{}/]+", task_brief.lower())
-            if w and len(w) > 2 and w not in _STOPWORDS
-        ]
-        for i in range(len(word_list) - 1):
-            a, b = word_list[i], word_list[i + 1]
-            words.add(f"{a}_{b}")
-            words.add(f"{a}.*{b}")  # regex-friendly for grep
-
-        return list(words)
-
-    def _grep_remote_files(
-        self,
-        ssh: SSHManager,
-        keywords: list[str],
-        search_paths: list[str],
-    ) -> list[str]:
-        """Use remote ``grep -rl`` to find files containing keywords."""
-        if not keywords:
-            return []
-
-        # Pick the most specific keywords (longer = more specific)
-        sorted_kw = sorted(keywords, key=len, reverse=True)[:15]
-        pattern = "|".join(sorted_kw)
-
-        grep_files: list[str] = []
-        seen: set[str] = set()
-
-        for path in search_paths:
-            result = ssh.execute(
-                f'grep -rl -i --include="*.py" --include="*.sql" '
-                f'--include="*.yaml" --include="*.yml" --include="*.cfg" '
-                f'--include="*.conf" --include="*.sh" '
-                f'--exclude-dir=node_modules --exclude-dir=__pycache__ '
-                f'--exclude-dir=.git --exclude-dir=.ipynb_checkpoints '
-                f'-E "{pattern}" . 2>/dev/null | head -100',
-                cwd=path,
-                timeout=15,
-            )
-            if not result.success or not result.stdout.strip():
-                continue
-
-            is_primary = (path == search_paths[0])
-            for line in result.stdout.strip().split("\n"):
-                f = line.strip()
-                if not f:
-                    continue
-                if not is_primary:
-                    f = f"{path}/{f[2:]}" if f.startswith("./") else f"{path}/{f}"
-                if f not in seen:
-                    seen.add(f)
-                    grep_files.append(f)
-
-        return grep_files
-
-    # ------------------------------------------------------------------
-    # File identification — 3-tier strategy
-    # ------------------------------------------------------------------
-
-    def _identify_relevant_files(
-        self,
-        task_brief: str,
-        all_files: list[str],
-        hint_files: Optional[list[str]],
-        client: ClientConfig,
-    ) -> list[str]:
-        """
-        Identify files relevant to the task using a three-tier strategy:
-
-        1. If *hint_files* provided, use those directly.
-        2. Extract keywords → ``grep`` remote VM for content matches.
-        3. Send grep hits + **all** filenames to Claude for final selection.
-        4. Fallback to improved heuristic if Claude fails.
-
-        After selection, records query history in the state DB so the
-        "most queried" ranking signal improves over time.
-        """
-        if hint_files:
-            return hint_files
-
-        ssh = self._get_ssh(client)
-        search_paths = [client.project.repo_path] + (client.project.extra_repo_paths or [])
-
-        # --- Stage 1: keyword extraction + remote grep ---
-        keywords = self._extract_search_keywords(task_brief, client)
-        grep_hits = self._grep_remote_files(ssh, keywords, search_paths)
-        if grep_hits:
-            logger.info(f"Grep found {len(grep_hits)} content-matching files")
-
-        # --- Stage 2: Claude selection ---
-        grep_section = ""
-        if grep_hits:
-            grep_section = (
-                "FILES CONTAINING RELEVANT KEYWORDS (high priority — these "
-                "files actually contain terms from the task):\n"
-                + "\n".join(grep_hits[:50])
-                + "\n\n"
-            )
-
-        # Send top-ranked files + grep hits (not all 4000 — that exceeds token budget)
-        # Grep hits are highest priority, then ranked files fill the rest
-        file_set = set(grep_hits)
-        ordered = list(grep_hits)
-        for f in all_files:
-            if f not in file_set:
-                file_set.add(f)
-                ordered.append(f)
-            if len(ordered) >= 800:
-                break
-        files_list = "\n".join(ordered)
-
-        try:
-            text = self._backend.complete(
-                system=(
-                    "You are a code analyst. Given a task description and "
-                    "file listings, identify which files are relevant to the "
-                    "task. Return ONLY a JSON array of file paths, nothing else.\n\n"
-                    "IMPORTANT: Be INCLUSIVE, not exclusive. When the task asks "
-                    "about a category (e.g. 'all DAGs', 'all scripts', 'all "
-                    "configs'), include ALL files that belong to that category. "
-                    "When in doubt, include the file — it's better to include "
-                    "a few extra files than to miss relevant ones."
-                ),
-                messages=[{
-                    "role": "user",
-                    "content": (
-                        f"Task: {task_brief}\n\n"
-                        f"Tech stack: {client.project.tech_stack}\n"
-                        f"Business context: {client.business_context[:300]}\n\n"
-                        f"{grep_section}"
-                        f"ALL REPOSITORY FILES:\n{files_list}\n\n"
-                        "Which files should I read to understand and address "
-                        "this task?\n"
-                        "Return a JSON array of ALL relevant file paths "
-                        "(up to 50 files). Include every file that could be "
-                        "relevant — err on the side of inclusion.\n"
-                        "Prioritize files from the keyword-matching section "
-                        "if present."
-                    ),
-                }],
-                model=MODEL_EXECUTOR,
-                max_tokens=4000,
-            )
-
-            text = text.strip()
-            # Strip markdown code blocks if present
-            if text.startswith("```"):
-                text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-            # Try direct parse first, then extract JSON array from mixed text
-            files = None
-            try:
-                files = json.loads(text)
-            except json.JSONDecodeError:
-                # Claude often adds explanation text around the JSON array —
-                # extract the first [...] block from the response
-                match = re.search(r'\[.*\]', text, re.DOTALL)
-                if match:
-                    try:
-                        files = json.loads(match.group())
-                    except json.JSONDecodeError:
-                        pass
-            if isinstance(files, list) and files:
-                known = set(all_files) | set(grep_hits)
-                valid = [f for f in files if f in known]
-                if valid:
-                    self._record_file_access(client.client_id, valid)
-                    return valid
-                else:
-                    logger.warning(
-                        f"File identification returned {len(files)} files but "
-                        f"none matched known files (sample: {files[:3]})"
-                    )
-        except Exception as e:
-            logger.warning(f"File identification Claude call failed: {e}")
-
-        # --- Stage 3: improved heuristic fallback ---
-        fallback = self._heuristic_file_search(
-            task_brief, all_files, grep_hits=grep_hits, client=client
-        )
-        if fallback:
-            self._record_file_access(client.client_id, fallback)
-        return fallback
-
-    def _record_file_access(self, client_id: str, file_paths: list[str]) -> None:
-        """Record selected files in the state DB for query-history ranking."""
-        try:
-            from fda.state.project_state import ProjectState
-            state = ProjectState()
-            state.increment_file_relevance(client_id, file_paths)
-        except Exception:
-            pass  # non-critical
-
-    def _heuristic_file_search(
-        self,
-        task_brief: str,
-        all_files: list[str],
-        grep_hits: Optional[list[str]] = None,
-        client: Optional[ClientConfig] = None,
-    ) -> list[str]:
-        """Improved fallback file search with stopword filtering and grep boost."""
-        keywords = (
-            self._extract_search_keywords(task_brief, client)
-            if client
-            else [w for w in task_brief.lower().split() if len(w) > 2 and w not in _STOPWORDS]
-        )
-        # Filter out regex-style compound keywords for filepath matching
-        path_keywords = [kw for kw in keywords if ".*" not in kw]
-
-        grep_set = set(grep_hits or [])
-        rankings = self._ranking_cache.get(
-            client.client_id, (0, {})
-        )[1] if client else {}
-
-        # File extensions to skip in heuristic (log files, data, images, etc.)
-        _JUNK_EXTENSIONS = frozenset({
-            ".log", ".bak", ".tmp", ".swp", ".pyc", ".pyo",
-            ".jpg", ".jpeg", ".png", ".gif", ".svg", ".ico",
-            ".zip", ".tar", ".gz", ".whl", ".egg",
-            ".csv", ".tsv", ".parquet", ".pkl",
-        })
-
-        scored: list[tuple[str, float]] = []
-
-        for filepath in set(all_files) | grep_set:
-            fp_lower = filepath.lower()
-
-            # Skip junk files
-            ext = "." + fp_lower.rsplit(".", 1)[-1] if "." in fp_lower else ""
-            if ext in _JUNK_EXTENSIONS:
-                continue
-
-            score = 0.0
-
-            for kw in path_keywords:
-                if kw in fp_lower:
-                    score += 2.0
-
-            if filepath in grep_set:
-                score += 5.0
-
-            # Boost from git-based importance
-            score += rankings.get(filepath, 0.0) * 3.0
-
-            if fp_lower.endswith((".py", ".sql")):
-                score += 1.0
-
-            if score > 0:
-                scored.append((filepath, score))
-
-        scored.sort(key=lambda x: x[1], reverse=True)
-        return [path for path, _ in scored[:50]]
-
-    def _generate_fix(
-        self,
-        task_brief: str,
-        client: ClientConfig,
-        file_contents: dict[str, str],
-        repo_path: str,
-    ) -> dict[str, Any]:
-        """
-        Generate a code fix using Claude.
-
-        Args:
-            task_brief: Business-context task description.
-            client: Client configuration.
-            file_contents: Dict of file path -> file content.
-            repo_path: Repository root path on the VM.
-
-        Returns:
-            Dict with success, changes, diff, and explanation.
-        """
-        # Build the source code context
-        source_context = ""
-        for path, content in file_contents.items():
-            # Truncate very large files
-            if len(content) > 10000:
-                content = content[:10000] + "\n... [truncated] ..."
-            source_context += f"\n=== {path} ===\n{content}\n"
-
-        prompt = f"""You are working on a client project.
-
-{client.get_context_for_prompt()}
-
-TASK:
-{task_brief}
-
-SOURCE CODE:
-{source_context}
-
-INSTRUCTIONS:
-1. Analyze the codebase in the context of the task
-2. If the task requires code changes, make the MINIMAL change needed -- don't refactor unrelated code
-3. If the task is an investigation or question (e.g. "check if X is configured", "does Y exist"), answer the question based on what you see in the code -- do NOT make any changes
-4. Preserve the existing code style
-
-RESPONSE FORMAT:
-You MUST return a JSON object (no markdown, no extra text). Use this format:
-{{
-  "analysis": "Brief analysis of what you found",
-  "explanation": "Plain-language explanation of your findings or what you changed and why",
-  "changes": {{
-    "relative/path/to/file.py": "FULL new content of the file (not just the changed part)"
-  }},
-  "confidence": "high|medium|low",
-  "warnings": ["any concerns or things to check"]
-}}
-
-IMPORTANT:
-- If no code changes are needed (investigation/query tasks), set "changes" to an empty object {{}}.
-- If code changes are needed, include the COMPLETE file content in "changes", not just the diff.
-- Only include files that actually changed.
-- Your response must be valid JSON. Do not wrap it in markdown code blocks.
-"""
-
-        try:
-            text = self._backend.complete(
-                system=self.SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": prompt}],
-                model=MODEL_MEETING_SUMMARY,  # Use Sonnet for quality code generation
-                max_tokens=8000,
-            ).strip()
-
-            # Extract JSON from response
-            if text.startswith("```"):
-                text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-
-            result = json.loads(text)
-
-            # Generate unified diff
-            diff_parts = []
-            changes = result.get("changes", {})
-
-            for filepath, new_content in changes.items():
-                old_content = file_contents.get(filepath, "")
-                diff = difflib.unified_diff(
-                    old_content.splitlines(keepends=True),
-                    new_content.splitlines(keepends=True),
-                    fromfile=f"a/{filepath}",
-                    tofile=f"b/{filepath}",
-                )
-                diff_parts.append("".join(diff))
-
-            is_investigation = not changes
-            return {
-                "success": True,
-                "investigation": is_investigation,
-                "analysis": result.get("analysis", ""),
-                "changes": changes,
-                "diff": "\n".join(diff_parts),
-                "explanation": result.get("explanation", ""),
-                "confidence": result.get("confidence", "unknown"),
-                "warnings": result.get("warnings", []),
-            }
-
-        except json.JSONDecodeError as e:
-            raw = text if 'text' in dir() else ""
-            if raw:
-                logger.info(
-                    f"Claude returned non-JSON response ({len(raw)} chars) — "
-                    "treating as investigation result"
-                )
-                return {
-                    "success": True,
-                    "investigation": True,
-                    "analysis": raw,
-                    "changes": {},
-                    "diff": "",
-                    "explanation": raw,
-                    "confidence": "medium",
-                    "warnings": [],
-                }
-            logger.error(f"Failed to parse Claude's response as JSON: {e}")
-            return {
-                "success": False,
-                "error": f"Failed to parse code fix response: {e}",
-                "raw_response": raw,
-            }
-        except Exception as e:
-            logger.error(f"Error generating fix: {e}")
-            return {
-                "success": False,
-                "error": str(e),
-            }
 
     def deploy_approved_changes(
         self,
@@ -993,11 +713,6 @@ IMPORTANT:
 
         deployer = self._get_deployer(client)
         result = deployer.deploy_files(file_changes)
-
-        # Invalidate structure cache after deploy (files may have changed)
-        if result.success:
-            self.invalidate_structure_cache(client_id)
-
         return result
 
     def test_all_connections(self) -> dict[str, dict]:
@@ -1013,7 +728,9 @@ IMPORTANT:
             results[client.client_id] = deployer.test_connectivity()
         return results
 
+    # ------------------------------------------------------------------
     # Message bus integration
+    # ------------------------------------------------------------------
 
     def handle_task_request(self, message: dict) -> None:
         """
@@ -1023,7 +740,7 @@ IMPORTANT:
         {
             "client_id": "client_a",
             "task_brief": "Client A wants...",
-            "hint_files": ["path/to/file.py"],  # optional
+            "hint_files": ["path/to/file.py"],  // optional
         }
         """
         body = json.loads(message.get("body", "{}"))
@@ -1089,8 +806,6 @@ IMPORTANT:
         """
         Main event loop — listen for task and deploy requests from FDA.
         """
-        import time
-
         logger.info("Worker agent started, listening for requests...")
 
         if self.state:

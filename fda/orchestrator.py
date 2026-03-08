@@ -163,6 +163,21 @@ class FDAOrchestrator:
         self._slack_bot: Optional[Any] = None
         self._discord_bot: Optional[Any] = None
 
+        # Bot threads — keyed by name for health monitoring & targeted restart
+        self._bot_threads: dict[str, threading.Thread] = {}
+        self._last_health_check: float = 0.0
+        self._health_check_interval: int = 3600  # 1 hour
+
+        # Daily notetaking — tracks last run date to avoid duplicates
+        self._notetaking_last_run: Optional[str] = self.state.get_context(
+            "notetaking_last_run"
+        )
+
+        # Daily journal review — morning briefing to Discord/Slack
+        self._journal_review_last_run: Optional[str] = self.state.get_context(
+            "journal_review_last_run"
+        )
+
         # Restore last-checked timestamps from state
         self._restore_checkpoints()
 
@@ -214,6 +229,7 @@ class FDAOrchestrator:
                 bot_token=bot_token,
                 local_task_dispatch=self._handle_local_task_request,
                 remote_task_dispatch=self._handle_remote_task_request,
+                local_organize_dispatch=self._handle_local_organize_request,
             )
 
             # Register approval command handlers (/approve, /reject, etc.)
@@ -258,6 +274,9 @@ class FDAOrchestrator:
                 worker=self.worker,
                 local_task_dispatch=self._handle_local_task_request,
                 remote_task_dispatch=self._handle_remote_task_request,
+                local_command_dispatch=self._handle_local_command,
+                remote_command_dispatch=self._handle_remote_command,
+                local_organize_dispatch=self._handle_local_organize_request,
                 approval_manager=self.approval_manager,
                 restart_callback=self.restart,
             )
@@ -294,6 +313,8 @@ class FDAOrchestrator:
                 local_task_dispatch=self._handle_local_task_request,
                 remote_task_dispatch=self._handle_remote_task_request,
                 remote_command_dispatch=self._handle_remote_command,
+                local_command_dispatch=self._handle_local_command,
+                local_organize_dispatch=self._handle_local_organize_request,
                 approval_manager=self.approval_manager,
                 restart_callback=self.restart,
             )
@@ -362,6 +383,475 @@ class FDAOrchestrator:
         thread.start()
         logger.info("✓ Local Worker agent started")
         return thread
+
+    # ------------------------------------------------------------------
+    # Bot health monitoring
+    # ------------------------------------------------------------------
+
+    def _check_bot_health(self) -> None:
+        """Check if bot threads are alive and restart dead ones.
+
+        Called periodically from the main polling loop (default: every hour).
+        If a bot thread has died (e.g. unhandled exception, network failure),
+        restarts just that bot without restarting the entire FDA process.
+        """
+        logger.info("[HealthCheck] Checking bot thread health...")
+        dead_bots: list[str] = []
+
+        for name, thread in list(self._bot_threads.items()):
+            if not thread.is_alive():
+                dead_bots.append(name)
+                logger.warning(f"[HealthCheck] {name} bot thread is DEAD")
+            else:
+                logger.debug(f"[HealthCheck] {name} bot thread is alive")
+
+        if not dead_bots:
+            logger.info("[HealthCheck] All bot threads healthy")
+            return
+
+        # Restart dead bots
+        for name in dead_bots:
+            logger.info(f"[HealthCheck] Restarting {name} bot...")
+            try:
+                new_thread = self._restart_bot(name)
+                if new_thread:
+                    self._bot_threads[name] = new_thread
+                    self._threads.append(new_thread)
+                    logger.info(f"[HealthCheck] {name} bot restarted successfully")
+                else:
+                    logger.error(f"[HealthCheck] {name} bot failed to restart (returned None)")
+            except Exception as e:
+                logger.error(f"[HealthCheck] Failed to restart {name} bot: {e}", exc_info=True)
+
+        # Log journal entry for visibility
+        try:
+            self._journal.write_entry(
+                author="orchestrator",
+                tags=["health-check", "bot-restart"],
+                summary=f"Restarted dead bot(s): {', '.join(dead_bots)}",
+                content=(
+                    f"## Bot Health Check\n\n"
+                    f"Dead bots detected and restarted: **{', '.join(dead_bots)}**\n\n"
+                    f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                ),
+                relevance_decay="fast",
+            )
+        except Exception as e:
+            logger.error(f"[HealthCheck] Failed to write journal entry: {e}")
+
+    def _restart_bot(self, name: str) -> Optional[threading.Thread]:
+        """Restart a specific bot by name.
+
+        Args:
+            name: One of 'telegram', 'slack', 'discord'.
+
+        Returns:
+            The new thread, or None if the bot couldn't be started.
+        """
+        if name == "telegram":
+            return self._start_telegram_bot()
+        elif name == "slack":
+            # Clear stale reference before restart
+            self._slack_bot = None
+            return self._start_slack_bot()
+        elif name == "discord":
+            self._discord_bot = None
+            return self._start_discord_bot()
+        else:
+            logger.warning(f"[HealthCheck] Unknown bot name: {name}")
+            return None
+
+    # ------------------------------------------------------------------
+    # Daily notetaking
+    # ------------------------------------------------------------------
+
+    def _should_run_notetaking(self) -> bool:
+        """
+        Check if daily notetaking should run.
+
+        Runs once per day, after the configured notetaking time (default 21:00).
+
+        Returns:
+            True if notetaking should run now.
+        """
+        try:
+            from fda.utils.timezone import get_user_timezone, get_current_time_for_user
+
+            user_tz = get_user_timezone(self.state)
+            now = get_current_time_for_user(user_tz)
+            today = now.strftime("%Y-%m-%d")
+
+            # Already ran today
+            if self._notetaking_last_run == today:
+                return False
+
+            # Check if it's past the configured time
+            nt_time = self.state.get_context("notetaking_time") or "21:00"
+            try:
+                hour, minute = map(int, nt_time.split(":"))
+            except (ValueError, AttributeError):
+                hour, minute = 21, 0
+
+            if now.hour < hour or (now.hour == hour and now.minute < minute):
+                return False
+
+            # Check if there are any notetaking channels configured
+            channels = self.state.get_notetaking_channels()
+            return len(channels) > 0
+
+        except Exception as e:
+            logger.debug(f"Notetaking check failed: {e}")
+            return False
+
+    def _run_daily_notetaking(self) -> None:
+        """
+        Summarize conversations from notetaking channels into journal entries.
+
+        For each configured notetaking channel, fetches today's messages,
+        asks Claude to summarize them, and writes a journal entry.
+        """
+        from fda.journal.index import JournalIndex
+
+        channels = self.state.get_notetaking_channels()
+        if not channels:
+            return
+
+        try:
+            from fda.utils.timezone import get_user_timezone, get_local_today
+
+            user_tz = get_user_timezone(self.state)
+            start_of_day, end_of_day = get_local_today(user_tz)
+        except Exception:
+            start_of_day = datetime.now().replace(hour=0, minute=0, second=0)
+            end_of_day = datetime.now()
+
+        today = start_of_day.strftime("%Y-%m-%d")
+        index = JournalIndex()
+
+        for ch in channels:
+            try:
+                # Fetch today's messages for this channel
+                channel_key = f"{ch['platform']}_{ch['channel_id']}"
+                messages = self.state.get_messages_today(
+                    channel_id=channel_key,
+                    limit=200,
+                )
+
+                if not messages:
+                    logger.debug(
+                        f"No messages today for notetaking channel: {channel_key}"
+                    )
+                    continue
+
+                # Build transcript
+                transcript_lines = []
+                for m in messages:
+                    username = m.get("username", "unknown")
+                    content = m.get("content", "")[:500]
+                    transcript_lines.append(f"[{username}] {content}")
+                transcript = "\n".join(transcript_lines)
+
+                # Summarize with Claude
+                label = ch.get("label") or ch["channel_id"]
+                summary_prompt = (
+                    f'Summarize today\'s conversation from the "{label}" channel '
+                    f"into concise daily notes.\n\n"
+                    f"Focus on:\n"
+                    f"- Key topics discussed\n"
+                    f"- Decisions made\n"
+                    f"- Action items mentioned\n"
+                    f"- Important information shared\n\n"
+                    f"Conversation transcript:\n{transcript[:6000]}\n\n"
+                    f"Write clear, organized notes in markdown. "
+                    f"Be concise but capture everything important."
+                )
+
+                summary = self._backend.complete(
+                    system=(
+                        "You are a note-taking assistant. "
+                        "Write clear, organized daily notes from chat transcripts."
+                    ),
+                    messages=[{"role": "user", "content": summary_prompt}],
+                    max_tokens=2000,
+                )
+
+                # Write to journal
+                entry = self._journal.write_entry(
+                    author="FDA",
+                    summary=f"Daily notes: {label} ({today})",
+                    content=(
+                        f"# Daily Notes — {label}\n"
+                        f"**Date:** {today}\n\n"
+                        f"{summary}"
+                    ),
+                    tags=[
+                        "notetaking",
+                        "daily-summary",
+                        ch["platform"],
+                        ch["channel_id"],
+                    ],
+                    relevance_decay="medium",
+                )
+                index.add_entry(entry)
+
+                logger.info(
+                    f"Daily notetaking complete for {label}: "
+                    f"{len(messages)} messages summarized"
+                )
+
+            except Exception as e:
+                logger.error(
+                    f"Failed notetaking for {ch.get('label', ch)}: {e}",
+                    exc_info=True,
+                )
+
+        # Mark as done for today
+        self._notetaking_last_run = today
+        self.state.set_context("notetaking_last_run", today)
+        logger.info(f"Daily notetaking finished for {today}")
+
+    # ------------------------------------------------------------------
+    # Daily journal review — morning briefing to Discord/Slack
+    # ------------------------------------------------------------------
+
+    def _should_run_journal_review(self) -> bool:
+        """
+        Check if the daily journal review should run.
+
+        Runs once per day after 9 AM (configurable via
+        ``journal_review_time`` in state). Posts a summary of
+        yesterday's journal entries to Discord and Slack.
+
+        Returns:
+            True if the journal review should run now.
+        """
+        try:
+            from fda.utils.timezone import (
+                get_user_timezone,
+                get_current_time_for_user,
+            )
+
+            user_tz = get_user_timezone(self.state)
+            now = get_current_time_for_user(user_tz)
+            today = now.strftime("%Y-%m-%d")
+
+            # Already ran today
+            if self._journal_review_last_run == today:
+                return False
+
+            # Check if it's past the configured time (default 09:00)
+            from fda.config import DEFAULT_JOURNAL_REVIEW_TIME
+
+            review_time = (
+                self.state.get_context("journal_review_time")
+                or DEFAULT_JOURNAL_REVIEW_TIME
+            )
+            try:
+                hour, minute = map(int, review_time.split(":"))
+            except (ValueError, AttributeError):
+                hour, minute = 9, 0
+
+            if now.hour < hour or (now.hour == hour and now.minute < minute):
+                return False
+
+            # Need at least one bot to post to
+            return bool(self._slack_bot or self._discord_bot)
+
+        except Exception as e:
+            logger.debug(f"Journal review check failed: {e}")
+            return False
+
+    def _run_daily_journal_review(self) -> None:
+        """
+        Summarize yesterday's journal entries and post to Discord/Slack.
+
+        Fetches all journal entries from the previous day, asks Claude
+        to produce a concise morning briefing, and broadcasts it.
+        """
+        import asyncio
+        from fda.journal.index import JournalIndex
+
+        try:
+            from fda.utils.timezone import (
+                get_user_timezone,
+                get_current_time_for_user,
+            )
+
+            user_tz = get_user_timezone(self.state)
+            now = get_current_time_for_user(user_tz)
+        except Exception:
+            now = datetime.now()
+
+        today = now.strftime("%Y-%m-%d")
+
+        # Calculate yesterday's date range
+        from datetime import timedelta
+
+        yesterday_start = (now - timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        yesterday_end = yesterday_start.replace(
+            hour=23, minute=59, second=59, microsecond=999999
+        )
+        yesterday_str = yesterday_start.strftime("%Y-%m-%d")
+
+        # Fetch yesterday's journal entries
+        index = JournalIndex()
+        entries = index.get_by_date_range(yesterday_start, yesterday_end)
+
+        if not entries:
+            # Still post — let the team know it was a quiet day
+            no_update_msg_slack = (
+                f":sunrise: *Morning Briefing — {yesterday_str}*\n\n"
+                f"No updates yesterday."
+            )
+            no_update_msg_discord = (
+                f"🌅 **Morning Briefing — {yesterday_str}**\n\n"
+                f"No updates yesterday."
+            )
+            if self._slack_bot:
+                try:
+                    self._slack_bot.broadcast_to_channel(no_update_msg_slack)
+                except Exception as e:
+                    logger.error(f"Failed to post empty journal review to Slack: {e}")
+            if self._discord_bot and self._discord_bot._response_channel:
+                try:
+                    import asyncio
+                    channel = self._discord_bot._response_channel
+                    loop = self._discord_bot._bot.loop if self._discord_bot._bot else None
+                    if loop and loop.is_running():
+                        asyncio.run_coroutine_threadsafe(
+                            channel.send(no_update_msg_discord), loop
+                        )
+                except Exception as e:
+                    logger.error(f"Failed to post empty journal review to Discord: {e}")
+
+            self._journal_review_last_run = today
+            self.state.set_context("journal_review_last_run", today)
+            logger.info(f"Daily journal review: no entries from {yesterday_str}")
+            return
+
+        # Read full content of each entry
+        from fda.journal.retriever import JournalRetriever
+
+        retriever = JournalRetriever()
+        entries_with_content: list[str] = []
+        for entry in entries:
+            filename = entry.get("filename", "")
+            summary = entry.get("summary", "")
+            tags = entry.get("tags", [])
+            content = retriever._read_entry_content(filename) if filename else ""
+
+            entry_block = (
+                f"### {summary}\n"
+                f"**Tags:** {', '.join(tags)}\n"
+            )
+            if content:
+                # Truncate very long entries
+                entry_block += content[:2000] + "\n"
+            entries_with_content.append(entry_block)
+
+        # Build transcript of all entries
+        transcript = "\n---\n".join(entries_with_content)
+
+        # Ask Claude for a morning briefing
+        briefing_prompt = (
+            f"Here are all the journal entries from yesterday "
+            f"({yesterday_str}):\n\n"
+            f"{transcript[:8000]}\n\n"
+            f"Write a concise morning briefing summarizing what happened "
+            f"yesterday. Include:\n"
+            f"- Key activities and accomplishments\n"
+            f"- Investigations completed and their findings\n"
+            f"- Code changes made or deployed\n"
+            f"- Issues or errors encountered\n"
+            f"- Open items or follow-ups needed today\n\n"
+            f"Be concise but comprehensive. Use bullet points. "
+            f"Skip trivial entries."
+        )
+
+        try:
+            briefing = self._backend.complete(
+                system=(
+                    "You are FDA's morning briefing assistant. "
+                    "Summarize yesterday's journal entries into a clear, "
+                    "actionable morning briefing for the team. "
+                    "Use concise bullet points."
+                ),
+                messages=[{"role": "user", "content": briefing_prompt}],
+                max_tokens=2000,
+            )
+        except Exception as e:
+            logger.error(f"Failed to generate journal briefing: {e}")
+            self._journal_review_last_run = today
+            self.state.set_context("journal_review_last_run", today)
+            return
+
+        # Format the message for each platform
+        entry_count = len(entries)
+
+        # --- Post to Slack ---
+        if self._slack_bot:
+            try:
+                slack_msg = (
+                    f":sunrise: *Morning Briefing — {yesterday_str}*\n"
+                    f"_{entry_count} journal "
+                    f"{'entry' if entry_count == 1 else 'entries'} "
+                    f"from yesterday_\n\n"
+                    f"{briefing}"
+                )
+                self._slack_bot.broadcast_to_channel(slack_msg)
+                logger.info("Journal review posted to Slack")
+            except Exception as e:
+                logger.error(f"Failed to post journal review to Slack: {e}")
+
+        # --- Post to Discord ---
+        if self._discord_bot and self._discord_bot._response_channel:
+            try:
+                discord_msg = (
+                    f"🌅 **Morning Briefing — {yesterday_str}**\n"
+                    f"*{entry_count} journal "
+                    f"{'entry' if entry_count == 1 else 'entries'} "
+                    f"from yesterday*\n\n"
+                    f"{briefing}"
+                )
+
+                # Discord bot runs in its own asyncio loop
+                channel = self._discord_bot._response_channel
+                loop = (
+                    self._discord_bot._bot.loop
+                    if self._discord_bot._bot
+                    else None
+                )
+
+                if loop and loop.is_running():
+                    # Split into 2000-char chunks for Discord's limit
+                    remaining = discord_msg
+                    while remaining:
+                        chunk = remaining[:2000]
+                        remaining = remaining[2000:]
+                        asyncio.run_coroutine_threadsafe(
+                            channel.send(chunk), loop
+                        )
+                else:
+                    logger.debug(
+                        "Discord bot event loop not running — "
+                        "skipping journal review"
+                    )
+
+                logger.info("Journal review posted to Discord")
+            except Exception as e:
+                logger.error(
+                    f"Failed to post journal review to Discord: {e}"
+                )
+
+        # Mark as done for today
+        self._journal_review_last_run = today
+        self.state.set_context("journal_review_last_run", today)
+        logger.info(
+            f"Daily journal review complete: {entry_count} entries "
+            f"from {yesterday_str}"
+        )
 
     # ------------------------------------------------------------------
     # Checkpoint management
@@ -597,8 +1087,10 @@ Be specific and actionable. The developer needs to know exactly what to change.
         Returns:
             Dict with: success, approval_id, files, explanation, diff, error.
         """
-        # Resolve project path
-        if not project_path:
+        # Resolve project path (supports name shortcuts like "FDA")
+        if project_path:
+            project_path = self.worker_local.resolve_project_path(project_path)
+        else:
             project_path = str(self.worker_local.projects[0])
 
         project_name = Path(project_path).name
@@ -705,6 +1197,127 @@ Be specific and actionable. The developer needs to know exactly what to change.
                 "error": error,
                 "analysis": fix_result.get("analysis", ""),
             }
+
+    # ------------------------------------------------------------------
+    # Local file organization
+    # ------------------------------------------------------------------
+
+    def _handle_local_organize_request(
+        self,
+        target_path: str,
+        instructions: str = "",
+        progress_callback: Optional[Any] = None,
+    ) -> dict[str, Any]:
+        """
+        Handle a file organization request — scan a directory and sort files.
+
+        1. Call LocalWorkerAgent.organize_files()
+        2. Log results to journal
+        3. Return summary for the calling bot
+
+        Args:
+            target_path: Directory to organize.
+            instructions: Optional user instructions.
+            progress_callback: Optional callback(msg: str) for live progress.
+
+        Returns:
+            Dict with: success, summary, moves, deletions, repos_skipped, error.
+        """
+        # Resolve name shortcuts
+        target_path = self.worker_local.resolve_project_path(target_path)
+        dir_name = Path(target_path).name
+        logger.info(
+            f"File organize request: {dir_name} — {instructions[:80]}"
+        )
+
+        # Create task in state DB
+        task_id = self.state.add_task(
+            title=f"[ORGANIZE] {dir_name}",
+            description=instructions or f"Organize files in {target_path}",
+            owner="worker_local",
+            priority="low",
+        )
+
+        try:
+            result = self.worker_local.organize_files(
+                target_path=target_path,
+                instructions=instructions,
+                progress_callback=progress_callback,
+            )
+        except Exception as e:
+            logger.error(f"File organization error: {e}")
+            self.state.update_task(task_id, status="blocked")
+            return {"success": False, "error": str(e)}
+
+        if result.get("success"):
+            self.state.update_task(task_id, status="completed")
+
+            # Log to journal
+            moves = result.get("moves", [])
+            deletions = result.get("deletions", [])
+            repos_skipped = result.get("repos_skipped", [])
+            dirs_created = result.get("dirs_created", [])
+            summary = result.get("summary", "")
+
+            # Build journal content
+            parts = [f"## Target\n`{target_path}`"]
+            if instructions:
+                parts.append(f"## Instructions\n{instructions}")
+
+            if moves:
+                move_lines = "\n".join(
+                    f"- `{m['from']}` → `{m['to']}`" for m in moves[:50]
+                )
+                parts.append(f"## Files Moved ({len(moves)})\n{move_lines}")
+
+            if dirs_created:
+                dir_lines = "\n".join(f"- `{d}`" for d in dirs_created)
+                parts.append(f"## Directories Created\n{dir_lines}")
+
+            if deletions:
+                del_lines = "\n".join(f"- `{d}`" for d in deletions)
+                parts.append(f"## Junk Deleted\n{del_lines}")
+
+            if repos_skipped:
+                repo_lines = "\n".join(f"- `{r}`" for r in repos_skipped)
+                parts.append(f"## Git Repos Skipped\n{repo_lines}")
+
+            if summary:
+                parts.append(f"## Summary\n{summary[:2000]}")
+
+            content = "\n\n".join(parts)
+
+            journal_tags = ["worker", "local", "file-organization"]
+            brief = instructions[:60] if instructions else f"Organize {dir_name}"
+            journal_summary = (
+                f"[LOCAL] File organization: {brief} "
+                f"({len(moves)} moves, {len(deletions)} deletions)"
+            )
+
+            try:
+                self._journal.write_entry(
+                    author="orchestrator",
+                    tags=journal_tags,
+                    summary=journal_summary,
+                    content=content,
+                    relevance_decay="medium",
+                )
+            except Exception as e:
+                logger.warning(f"Failed to write organize journal entry: {e}")
+
+            return result
+        else:
+            error = result.get("error", "Unknown error")
+            self.state.update_task(task_id, status="blocked")
+
+            self._log_worker_journal(
+                task_brief=instructions or f"Organize {dir_name}",
+                target=f"LOCAL ({dir_name})",
+                result_type="error",
+                error=error,
+            )
+
+            return result
 
     # ------------------------------------------------------------------
     # Journal logging for worker results
@@ -964,6 +1577,80 @@ Be specific and actionable. The developer needs to know exactly what to change.
             }
         except Exception as e:
             logger.error(f"Remote command error: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _handle_local_command(
+        self,
+        command: str,
+        cwd: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        Execute a shell command on the local Mac Mini.
+
+        Gives the Slack/Discord bot Claude direct local shell access
+        for quick operations (ls, grep, cat, find, etc.) without
+        triggering the full analyze_and_fix pipeline.
+
+        Args:
+            command: Shell command to execute.
+            cwd: Working directory. Defaults to ~/Documents.
+
+        Returns:
+            Dict with: success, stdout, stderr, error.
+        """
+        import subprocess
+
+        # Safety: block destructive commands
+        cmd_lower = command.strip().lower()
+        blocked = [
+            "rm -rf /", "rm -rf ~", "mkfs", "dd if=",
+            "> /dev/", "shutdown", "reboot", "sudo rm",
+            "format ", "diskutil erase",
+        ]
+        if any(b in cmd_lower for b in blocked):
+            return {"success": False, "error": "Blocked: potentially destructive command"}
+
+        # Restrict working directory to allowed project roots
+        work_dir = cwd or str(Path.home() / "Documents")
+        resolved_cwd = Path(work_dir).resolve()
+
+        allowed_roots = [Path(p).resolve() for p in [
+            str(Path.home() / "Documents"),
+            str(Path.home() / "Downloads"),
+            str(Path.home() / "Desktop"),
+        ]]
+        if not any(
+            resolved_cwd == root or resolved_cwd.is_relative_to(root)
+            for root in allowed_roots
+        ):
+            return {
+                "success": False,
+                "error": f"Working directory not in allowed roots: {resolved_cwd}",
+            }
+
+        logger.info(f"Local command: {command[:100]} (cwd: {work_dir})")
+
+        try:
+            result = subprocess.run(
+                command,
+                shell=True,
+                cwd=work_dir,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            return {
+                "success": result.returncode == 0,
+                "stdout": result.stdout[:5000] if result.stdout else "",
+                "stderr": result.stderr[:2000] if result.stderr else "",
+                "error": "" if result.returncode == 0 else (
+                    result.stderr or f"Exit code {result.returncode}"
+                )[:500],
+            }
+        except subprocess.TimeoutExpired:
+            return {"success": False, "error": "Command timed out (30s)"}
+        except Exception as e:
+            logger.error(f"Local command error: {e}")
             return {"success": False, "error": str(e)}
 
     # ------------------------------------------------------------------
@@ -1266,23 +1953,43 @@ Be specific and actionable. The developer needs to know exactly what to change.
         # 1b. Local Worker agent (local filesystem)
         self._threads.append(self._start_worker_local())
 
+        # 1c. Discover local git repos at startup
+        try:
+            new_repos = self.worker_local.discover_repos()
+            if new_repos:
+                logger.info(f"Discovered {len(new_repos)} new local repo(s)")
+                for r in new_repos:
+                    logger.info(f"  New repo: {r['name']} ({r['path']})")
+            else:
+                try:
+                    known = self.state.get_all_projects()
+                    logger.info(f"Repo discovery: {len(known)} known repos, no new ones")
+                except Exception:
+                    logger.info("Repo discovery: no new repos found")
+        except Exception as e:
+            logger.warning(f"Repo discovery failed: {e}")
+        self._last_repo_discovery = time.time()
+
         # 2. Telegram bot (with /approve, /reject, /pending commands)
         if self._enable_telegram:
             t = self._start_telegram_bot()
             if t:
                 self._threads.append(t)
+                self._bot_threads["telegram"] = t
 
         # 3. Slack bot (Socket Mode)
         if self._enable_slack:
             t = self._start_slack_bot()
             if t:
                 self._threads.append(t)
+                self._bot_threads["slack"] = t
 
         # 4. Discord bot (voice meetings)
         if self._enable_discord:
             t = self._start_discord_bot()
             if t:
                 self._threads.append(t)
+                self._bot_threads["discord"] = t
 
         # 5. Calendar monitor
         if self._enable_calendar:
@@ -1297,7 +2004,10 @@ Be specific and actionable. The developer needs to know exactly what to change.
             logger.info(f"  • {t.name}")
         logger.info("-" * 40)
 
-        # 5. KakaoTalk polling (main thread)
+        # Initialize health check timer
+        self._last_health_check = time.time()
+
+        # 5. KakaoTalk polling (main thread) + bot health monitoring
         logger.info(f"Starting KakaoTalk polling (every {self.poll_interval}s)...")
         try:
             while self._running:
@@ -1305,6 +2015,40 @@ Be specific and actionable. The developer needs to know exactly what to change.
                     self.process_new_messages()
                 except Exception as e:
                     logger.error(f"Error in polling loop: {e}", exc_info=True)
+
+                # Periodic bot health check
+                now = time.time()
+                if now - self._last_health_check >= self._health_check_interval:
+                    self._check_bot_health()
+                    self._last_health_check = now
+
+                # Periodic repo discovery
+                from fda.config import REPO_DISCOVERY_INTERVAL_MINUTES
+                if now - self._last_repo_discovery >= REPO_DISCOVERY_INTERVAL_MINUTES * 60:
+                    try:
+                        new_repos = self.worker_local.discover_repos()
+                        if new_repos:
+                            logger.info(f"Periodic discovery: {len(new_repos)} new repo(s)")
+                    except Exception as e:
+                        logger.warning(f"Periodic repo discovery failed: {e}")
+                    self._last_repo_discovery = now
+
+                # Daily notetaking check (9 PM)
+                if self._should_run_notetaking():
+                    try:
+                        self._run_daily_notetaking()
+                    except Exception as e:
+                        logger.error(f"Daily notetaking failed: {e}", exc_info=True)
+
+                # Daily journal review — morning briefing (9 AM)
+                if self._should_run_journal_review():
+                    try:
+                        self._run_daily_journal_review()
+                    except Exception as e:
+                        logger.error(
+                            f"Daily journal review failed: {e}",
+                            exc_info=True,
+                        )
 
                 time.sleep(self.poll_interval)
 

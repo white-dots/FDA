@@ -6,6 +6,7 @@ proactive notifications about project status, alerts, and updates.
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -18,6 +19,16 @@ from fda.base_agent import BaseAgent
 from fda.config import (
     TELEGRAM_BOT_TOKEN_ENV,
     MODEL_FDA,
+    ENABLE_EXTENDED_THINKING,
+    EXTENDED_THINKING_BUDGET,
+    MAX_IMAGE_UPLOAD_MB,
+    MAX_DOCUMENT_UPLOAD_MB,
+    SUPPORTED_IMAGE_TYPES,
+    SUPPORTED_DOC_TYPES,
+    SUPPORTED_TEXT_EXTENSIONS,
+    HISTORY_MESSAGE_LIMIT,
+    HISTORY_CHAR_LIMIT,
+    HISTORY_HOURS_CUTOFF,
 )
 from fda.state.project_state import ProjectState
 
@@ -88,6 +99,7 @@ class TelegramBotAgent(BaseAgent):
         project_state_path: Optional[Path] = None,
         local_task_dispatch: Optional[Any] = None,
         remote_task_dispatch: Optional[Any] = None,
+        local_organize_dispatch: Optional[Any] = None,
     ):
         """
         Initialize the Telegram Bot Agent.
@@ -98,6 +110,7 @@ class TelegramBotAgent(BaseAgent):
             project_state_path: Path to the project state database.
             local_task_dispatch: Optional callback(task_brief, project_path, progress_callback) -> result dict.
             remote_task_dispatch: Optional callback(task_brief, client_id, progress_callback) -> result dict.
+            local_organize_dispatch: Optional callback(target_path, instructions, progress_callback) -> result dict.
         """
         print("[TelegramBot] Initializing...", flush=True)
         print("[TelegramBot] Calling super().__init__...", flush=True)
@@ -121,6 +134,7 @@ class TelegramBotAgent(BaseAgent):
         self._loop = None
         self._local_task_dispatch = local_task_dispatch
         self._remote_task_dispatch = remote_task_dispatch
+        self._local_organize_dispatch = local_organize_dispatch
         print("[TelegramBot] Initialization complete", flush=True)
 
     def _get_application(self) -> Any:
@@ -168,10 +182,14 @@ class TelegramBotAgent(BaseAgent):
         self._application.add_handler(CommandHandler("tasks", self._handle_tasks))
         self._application.add_handler(CommandHandler("alerts", self._handle_alerts))
         self._application.add_handler(CommandHandler("stop", self._handle_stop))
+        self._application.add_handler(CommandHandler("organize", self._handle_organize))
 
-        # Handle plain text messages as questions
+        # Handle plain text messages, photos, and documents as questions
         self._application.add_handler(
-            MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_message)
+            MessageHandler(
+                (filters.TEXT | filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND,
+                self._handle_message,
+            )
         )
 
         # Add error handler
@@ -261,6 +279,75 @@ What do you need?
 """
         await update.message.reply_text(help_message)
 
+    async def _extract_telegram_attachments(self, update: Any, context: Any) -> list[dict]:
+        """Download Telegram photo/document attachments and build Anthropic content blocks."""
+        content_blocks: list[dict] = []
+
+        # Photos
+        if update.message.photo:
+            try:
+                photo = update.message.photo[-1]  # highest resolution
+                if not photo.file_size or photo.file_size < MAX_IMAGE_UPLOAD_MB * 1024 * 1024:
+                    file = await context.bot.get_file(photo.file_id)
+                    data = await file.download_as_bytearray()
+                    content_blocks.append({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/jpeg",
+                            "data": base64.b64encode(bytes(data)).decode(),
+                        },
+                    })
+            except Exception as e:
+                logger.warning(f"[TelegramBot] Failed to download photo: {e}")
+
+        # Documents (PDFs, images sent as files, text files)
+        if update.message.document:
+            doc = update.message.document
+            try:
+                mime = doc.mime_type or ""
+                filename = doc.file_name or ""
+                ext = Path(filename).suffix.lower()
+                file_size = doc.file_size or 0
+
+                if mime in SUPPORTED_IMAGE_TYPES:
+                    if file_size < MAX_IMAGE_UPLOAD_MB * 1024 * 1024:
+                        file = await context.bot.get_file(doc.file_id)
+                        data = await file.download_as_bytearray()
+                        content_blocks.append({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": mime,
+                                "data": base64.b64encode(bytes(data)).decode(),
+                            },
+                        })
+                elif mime in SUPPORTED_DOC_TYPES:
+                    if file_size < MAX_DOCUMENT_UPLOAD_MB * 1024 * 1024:
+                        file = await context.bot.get_file(doc.file_id)
+                        data = await file.download_as_bytearray()
+                        content_blocks.append({
+                            "type": "document",
+                            "source": {
+                                "type": "base64",
+                                "media_type": mime,
+                                "data": base64.b64encode(bytes(data)).decode(),
+                            },
+                        })
+                elif ext in SUPPORTED_TEXT_EXTENSIONS:
+                    if file_size < 1 * 1024 * 1024:
+                        file = await context.bot.get_file(doc.file_id)
+                        data = await file.download_as_bytearray()
+                        text = bytes(data).decode("utf-8", errors="replace")[:8000]
+                        content_blocks.append({
+                            "type": "text",
+                            "text": f"[File: {filename}]\n```\n{text}\n```",
+                        })
+            except Exception as e:
+                logger.warning(f"[TelegramBot] Failed to download document: {e}")
+
+        return content_blocks
+
     async def _handle_ask(self, update: Any, context: Any) -> None:
         """Handle /ask command - answer project questions."""
         # Get question from command arguments
@@ -293,18 +380,26 @@ What do you need?
             )
 
     async def _handle_message(self, update: Any, context: Any) -> None:
-        """Handle plain text messages - either onboarding or questions."""
-        message = update.message.text
+        """Handle text messages, photos, and documents — either onboarding or questions."""
+        # Get text from message body or caption (for photos with captions)
+        message = update.message.text or update.message.caption or ""
 
-        if not message:
-            return
-
-        # Check if we're in onboarding flow
+        # Check if we're in onboarding flow (text-only)
         onboarding_step = context.user_data.get("onboarding_step", 0)
-
-        if onboarding_step > 0:
+        if onboarding_step > 0 and message:
             await self._handle_onboarding(update, context, message)
             return
+
+        # Extract image/file attachments
+        attachment_blocks = await self._extract_telegram_attachments(update, context)
+
+        # Must have either text or attachments
+        if not message and not attachment_blocks:
+            return
+
+        # Default question if only an image was sent
+        if not message and attachment_blocks:
+            message = "What do you see in this image?"
 
         # Regular message - answer as a question
         chat_id = str(update.effective_chat.id)
@@ -315,12 +410,19 @@ What do you need?
             # Save user message to state DB
             self.state.add_conversation_message(chat_id, "user", message, source="telegram", username=username)
 
-            response = self._answer_question(message, chat_id=chat_id)
+            response = self._answer_question(
+                message, chat_id=chat_id, attachment_blocks=attachment_blocks,
+            )
 
             # Save assistant response to state DB
             self.state.add_conversation_message(chat_id, "assistant", response, source="telegram")
 
-            await update.message.reply_text(response)
+            # Telegram limit: 4096 chars per message
+            if len(response) > 4000:
+                for i in range(0, len(response), 4000):
+                    await update.message.reply_text(response[i:i + 4000])
+            else:
+                await update.message.reply_text(response)
         except Exception as e:
             logger.error(f"[TelegramBot] Error answering message: {e}")
             await update.message.reply_text(
@@ -794,7 +896,12 @@ Keep it conversational and under 150 words. Don't use excessive formatting."""
             logger.error(f"[TelegramBot] Tool {tool_name} error: {e}")
             return f"Error executing {tool_name}: {e}"
 
-    def _answer_with_tools(self, question: str, chat_id: str) -> str:
+    def _answer_with_tools(
+        self,
+        question: str,
+        chat_id: str,
+        attachment_blocks: list[dict] = None,
+    ) -> str:
         """Answer using the API backend's agentic tool-use loop.
 
         Sends the question with tool definitions and lets Claude decide
@@ -808,37 +915,73 @@ Keep it conversational and under 150 words. Don't use excessive formatting."""
 Today is {today}. The user's name is {user_name}.
 
 You have tools to look up the user's data. Use them when you need information to answer the question — don't guess. If the user asks about chats, notes, tasks, calendar, or alerts, call the appropriate tool first.
+
+If the user sends images or files, analyze them directly. You have full vision capabilities.
 """
 
         # Include recent conversation for continuity
         messages: list[dict[str, Any]] = []
         try:
-            recent = self.state.get_messages_recent(channel_id=str(chat_id), limit=5)
+            recent = self.state.get_messages_recent(
+                channel_id=str(chat_id), limit=HISTORY_MESSAGE_LIMIT,
+            )
+            cutoff = datetime.now() - timedelta(hours=HISTORY_HOURS_CUTOFF)
             for msg in recent:
+                created = msg.get("created_at", "")
+                if created:
+                    try:
+                        msg_time = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                        if msg_time.tzinfo:
+                            msg_time = msg_time.replace(tzinfo=None)
+                        if msg_time < cutoff:
+                            continue
+                    except (ValueError, TypeError):
+                        pass
                 messages.append({
                     "role": msg["role"],
-                    "content": msg["content"][:300],
+                    "content": msg["content"][:HISTORY_CHAR_LIMIT],
                 })
         except Exception:
             pass
 
-        messages.append({"role": "user", "content": question})
+        # Build user message — include attachment content blocks if present
+        if attachment_blocks:
+            user_content = attachment_blocks + [{"type": "text", "text": question}]
+        else:
+            user_content = question
+        messages.append({"role": "user", "content": user_content})
+
+        # Extended thinking configuration
+        thinking_config = (
+            {"type": "enabled", "budget_tokens": EXTENDED_THINKING_BUDGET}
+            if ENABLE_EXTENDED_THINKING else None
+        )
+
+        # Combine user-defined tools with server-side web search
+        all_tools = self._FDA_TOOLS + [{"type": "web_search_20250305"}]
 
         return self.backend.complete_with_tools(
             system=system,
             messages=messages,
-            tools=self._FDA_TOOLS,
+            tools=all_tools,
             tool_executor=self._execute_tool,
             model=self.model,
             max_tokens=4096,
-            max_iterations=5,
+            max_iterations=10,
+            temperature=0.7,
+            thinking=thinking_config,
         )
 
     # ------------------------------------------------------------------
     # Answer question — dispatches to agentic or intent-based routing
     # ------------------------------------------------------------------
 
-    def _answer_question(self, question: str, chat_id: str = "telegram") -> str:
+    def _answer_question(
+        self,
+        question: str,
+        chat_id: str = "telegram",
+        attachment_blocks: list[dict] = None,
+    ) -> str:
         """Answer a question using the best available backend.
 
         If the API backend is available (supports tool use), uses the
@@ -848,7 +991,9 @@ You have tools to look up the user's data. Use them when you need information to
         from fda.claude_backend import AnthropicAPIBackend
 
         if isinstance(self.backend, AnthropicAPIBackend):
-            return self._answer_with_tools(question, chat_id)
+            return self._answer_with_tools(
+                question, chat_id, attachment_blocks=attachment_blocks,
+            )
 
         return self._answer_with_intent_router(question, chat_id)
 
@@ -1049,6 +1194,74 @@ You have tools to look up the user's data. Use them when you need information to
             "Send /start to resubscribe."
         )
         logger.info(f"[TelegramBot] User deactivated: {chat_id}")
+
+    async def _handle_organize(self, update: Any, context: Any) -> None:
+        """Handle /organize <path> [instructions] — organize local files."""
+        args = " ".join(context.args) if context.args else ""
+        if not args:
+            await update.message.reply_text(
+                "Usage: /organize <path> [instructions]\n\n"
+                "Examples:\n"
+                "- /organize ~/Downloads\n"
+                "- /organize ~/Desktop sort by file type\n"
+                "- /organize ~/Documents/projects group related files"
+            )
+            return
+
+        if not self._local_organize_dispatch:
+            await update.message.reply_text(
+                "⚠️ File organization not available. Make sure FDA is fully started."
+            )
+            return
+
+        # Parse path and instructions
+        parts = args.split(None, 1)
+        target_path = os.path.expanduser(parts[0])
+        instructions = parts[1] if len(parts) > 1 else ""
+
+        await update.message.reply_text(
+            f"🧹 Scanning and organizing `{target_path}`...\n\n"
+            f"{('Instructions: ' + instructions + chr(10)) if instructions else ''}"
+            "Git repositories will be left untouched."
+        )
+
+        try:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None, self._local_organize_dispatch,
+                target_path, instructions,
+            )
+
+            if result.get("success"):
+                moves = result.get("moves", [])
+                deletions = result.get("deletions", [])
+                repos_skipped = result.get("repos_skipped", [])
+                summary = result.get("summary", "")
+
+                response = "✅ Organization complete\n\n"
+                if moves:
+                    response += f"Moved: {len(moves)} files\n"
+                if deletions:
+                    response += f"Deleted junk: {len(deletions)} files\n"
+                if repos_skipped:
+                    response += f"Git repos skipped: {len(repos_skipped)}\n"
+                if summary:
+                    response += f"\n{summary[:3000]}"
+
+                # Telegram message limit is 4096
+                if len(response) > 4000:
+                    response = response[:4000] + "..."
+
+                await update.message.reply_text(response)
+            else:
+                error = result.get("error", "Unknown error")
+                await update.message.reply_text(
+                    f"❌ Organization failed: {error[:500]}"
+                )
+
+        except Exception as e:
+            logger.error(f"[TelegramBot] Organize command failed: {e}")
+            await update.message.reply_text(f"❌ Error: {e}")
 
     def run_event_loop(self) -> None:
         """

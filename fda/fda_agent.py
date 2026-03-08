@@ -15,8 +15,17 @@ from pathlib import Path
 from typing import Any, Optional
 from datetime import datetime
 
+import requests
+import shutil
+import sys
+
 from fda.base_agent import BaseAgent
-from fda.config import MODEL_FDA, DEFAULT_CHECK_INTERVAL_MINUTES
+from fda.config import (
+    MODEL_FDA,
+    DEFAULT_CHECK_INTERVAL_MINUTES,
+    PROJECT_ROOT,
+    DEFAULT_NOTETAKING_TIME,
+)
 from fda.outlook import OutlookCalendar
 from fda.comms.message_bus import MessageTypes, Agents
 
@@ -476,224 +485,562 @@ class FDAAgent(BaseAgent):
         """
         return self.state.get_all_agent_statuses()
 
-    def onboard_interactive(self) -> dict[str, Any]:
+    def onboard_interactive(self, skip_profile: bool = False) -> dict[str, Any]:
         """
-        Interactive onboarding that asks the user questions to set up FDA.
+        Interactive 7-step onboarding wizard.
 
-        Asks about:
-        - Who the user is and what they do
-        - Their goals and priorities
-        - Where their data lives (calendars, task systems, files)
-        - Communication preferences
+        Steps:
+        1. System check — Python, packages, PROJECT_ROOT
+        2. API keys — Anthropic (required), OpenAI (optional)
+        3. Channel selection — Telegram, Discord, Slack inline setup
+        4. Daily notetaking — choose channels for auto-summarization
+        5. User profile — name, role, goals (skippable with --skip-profile)
+        6. Daemon installation — launchd (macOS) / systemd (Linux)
+        7. Completion summary
+
+        Args:
+            skip_profile: If True, skip the profile questions (step 5).
 
         Returns:
             Dictionary containing onboarding results.
         """
-        import os
-        from pathlib import Path
-
         print("\n" + "=" * 60)
-        print("Welcome to FDA - Your Personal AI Assistant")
+        print("  FDA Onboarding Wizard")
         print("=" * 60)
-        print("\nI'd like to get to know you and understand how I can help.")
-        print("Let's go through a few questions to set things up.\n")
+        print("\nThis wizard will set up everything FDA needs to run.")
+        print("You can press Ctrl+C at any time to cancel.\n")
 
-        # Gather information through questions
-        responses = {}
+        responses: dict[str, Any] = {}
 
-        # Question 1: About the user
-        print("-" * 40)
-        print("1. ABOUT YOU")
-        print("-" * 40)
-        responses["name"] = input("What should I call you? > ").strip()
-        responses["role"] = input("What do you do? (e.g., 'software engineer', 'product manager', 'entrepreneur') > ").strip()
-        responses["context"] = input("Tell me briefly about your current work or situation: > ").strip()
+        # Step 1: System Check
+        self._onboard_step_system_check()
 
-        # Question 2: Goals
-        print("\n" + "-" * 40)
-        print("2. YOUR GOALS")
-        print("-" * 40)
-        responses["goals"] = input("What are you trying to accomplish right now? What are your priorities? > ").strip()
-        responses["challenges"] = input("What's challenging or frustrating about your current workflow? > ").strip()
+        # Step 2: API Keys
+        self._onboard_step_api_keys(responses)
 
-        # Question 3: Data sources
-        print("\n" + "-" * 40)
-        print("3. YOUR DATA & TOOLS")
-        print("-" * 40)
-        print("Where do you keep your important information?")
-        print("(I can connect to calendars, read files, track tasks, etc.)")
-        print()
+        # Step 3: Channel Selection + Bot Setup
+        self._onboard_step_channels(responses)
 
-        # Calendar
-        cal_response = input("Do you use Outlook/Office 365 calendar? (y/n) > ").strip().lower()
-        responses["uses_outlook"] = cal_response in ("y", "yes")
+        # Step 4: Daily Notetaking Channels
+        self._onboard_step_notetaking(responses)
 
-        # Files/Documents
-        responses["important_folders"] = input("Any folders I should know about? (paths, comma-separated, or 'skip') > ").strip()
+        # Step 5: User Profile (skip if --skip-profile)
+        if not skip_profile:
+            self._onboard_step_profile(responses)
 
-        # Communication
-        print("\nFor notifications and quick questions:")
-        tg_response = input("Do you want to set up Telegram notifications? (y/n) > ").strip().lower()
-        responses["uses_telegram"] = tg_response in ("y", "yes")
+        # Step 6: Daemon Installation
+        self._onboard_step_daemon(responses)
 
-        discord_response = input("Do you want to set up Discord integration? (y/n) > ").strip().lower()
-        responses["uses_discord"] = discord_response in ("y", "yes")
-
-        # Question 4: Preferences
-        print("\n" + "-" * 40)
-        print("4. PREFERENCES")
-        print("-" * 40)
-        responses["check_in_time"] = input("What time should I do daily check-ins? (e.g., '9:00 AM' or 'skip') > ").strip()
-        responses["communication_style"] = input("How should I communicate? (brief/detailed/adaptive) > ").strip() or "adaptive"
-
-        # Question 5: Timezone
-        print("\n" + "-" * 40)
-        print("5. TIMEZONE")
-        print("-" * 40)
-        print("What's your timezone? Examples: America/New_York, Europe/London, Asia/Tokyo")
-        print("(Enter 'auto' to detect from system, or just press Enter to skip)")
-        tz_response = input("Timezone > ").strip()
-
-        if tz_response.lower() == "auto" or not tz_response:
-            # Try to detect system timezone
-            responses["timezone"] = self._detect_system_timezone()
-            if responses["timezone"]:
-                print(f"  Detected timezone: {responses['timezone']}")
-            else:
-                print("  Could not detect timezone, will use system default")
-        else:
-            # Validate the provided timezone
-            from fda.utils.timezone import validate_timezone
-            validated_tz = validate_timezone(tz_response)
-            if validated_tz:
-                responses["timezone"] = validated_tz
-                print(f"  Using timezone: {validated_tz}")
-            else:
-                print(f"  Warning: '{tz_response}' doesn't look like a valid timezone. Using system default.")
-                responses["timezone"] = None
-
-        # Now process with Claude to create a personalized setup
-        print("\n" + "=" * 60)
-        print("Setting up your personalized FDA assistant...")
-        print("=" * 60 + "\n")
-
-        # Store raw responses
-        self.state.set_context("user_name", responses["name"])
-        self.state.set_context("user_role", responses["role"])
-        self.state.set_context("user_context", responses["context"])
-        self.state.set_context("user_goals", responses["goals"])
-        self.state.set_context("user_challenges", responses["challenges"])
-        self.state.set_context("communication_style", responses["communication_style"])
-        self.state.set_context("user_timezone", responses.get("timezone"))
-        self.state.set_context("onboarded", True)
-        self.state.set_context("onboarded_at", datetime.now().isoformat())
-
-        # Build the full interview transcript for the journal
-        interview_transcript = f"""# First Meeting with {responses['name']}
-
-**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M')}
-
----
-
-## About {responses['name']}
-
-**What should I call you?**
-> {responses['name']}
-
-**What do you do?**
-> {responses['role']}
-
-**Tell me about your current work or situation:**
-> {responses['context']}
-
----
-
-## Goals & Priorities
-
-**What are you trying to accomplish right now?**
-> {responses['goals']}
-
-**What's challenging or frustrating about your current workflow?**
-> {responses['challenges']}
-
----
-
-## Tools & Data Sources
-
-- **Outlook/Office 365 calendar:** {'Yes' if responses['uses_outlook'] else 'No'}
-- **Important folders:** {responses['important_folders'] if responses['important_folders'] and responses['important_folders'].lower() != 'skip' else 'None specified'}
-- **Telegram notifications:** {'Yes' if responses['uses_telegram'] else 'No'}
-- **Discord integration:** {'Yes' if responses['uses_discord'] else 'No'}
-
----
-
-## Preferences
-
-- **Daily check-in time:** {responses['check_in_time'] if responses['check_in_time'] and responses['check_in_time'].lower() != 'skip' else 'Not set'}
-- **Communication style:** {responses['communication_style']}
-- **Timezone:** {responses.get('timezone') or 'System default'}
-
----
-
-## Key Takeaways
-
-- {responses['name']} is a {responses['role']}
-- Main focus: {responses['goals'][:200] if len(responses['goals']) > 200 else responses['goals']}
-- Key challenge: {responses['challenges'][:200] if len(responses['challenges']) > 200 else responses['challenges']}
-"""
-
-        # Save the full interview as the first journal entry
-        self.log_to_journal(
-            summary=f"First meeting with {responses['name']} - Onboarding interview",
-            content=interview_transcript,
-            tags=["onboarding", "first-meeting", "user-profile"],
-            relevance_decay="slow",
-        )
-
-        # Ask Claude to synthesize and create a personalized welcome
-        synthesis_prompt = f"""Based on this onboarding information, create a brief personalized summary and suggest 2-3 immediate ways I can help.
-
-User Info:
-- Name: {responses['name']}
-- Role: {responses['role']}
-- Context: {responses['context']}
-- Goals: {responses['goals']}
-- Challenges: {responses['challenges']}
-- Communication style preference: {responses['communication_style']}
-- Uses Outlook calendar: {responses['uses_outlook']}
-- Uses Telegram: {responses['uses_telegram']}
-- Uses Discord: {responses['uses_discord']}
-
-Keep it warm and conversational. Don't use excessive formatting. End by asking what they'd like to tackle first."""
-
-        welcome_response = self.chat(synthesis_prompt, include_history=False)
-
-        print(welcome_response)
-
-        # Provide next steps based on their choices
-        print("\n" + "-" * 40)
-        print("NEXT STEPS")
-        print("-" * 40)
-
-        if responses["uses_outlook"]:
-            print("- Run 'fda calendar login' to connect your Outlook calendar")
-
-        if responses["uses_telegram"]:
-            print("- Run 'fda telegram setup' to configure Telegram notifications")
-
-        if responses["uses_discord"]:
-            print("- Run 'fda discord setup' to configure Discord integration")
-
-        print("- Run 'fda ask \"<your question>\"' to chat with me anytime")
-        print("- Run 'fda task add \"<task>\"' to track something")
-        print()
+        # Step 7: Completion Summary
+        self._onboard_step_complete(responses)
 
         return {
             "status": "completed",
             "responses": responses,
-            "welcome": welcome_response,
             "timestamp": datetime.now().isoformat(),
         }
+
+    # ------------------------------------------------------------------
+    # Onboarding step helpers
+    # ------------------------------------------------------------------
+
+    def _onboard_step_system_check(self) -> None:
+        """Step 1: Check system requirements and show status."""
+        print("-" * 40)
+        print("STEP 1/7 — SYSTEM CHECK")
+        print("-" * 40)
+
+        # Python version
+        py_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+        py_ok = sys.version_info >= (3, 9)
+        print(f"  Python:       {py_ver}  {'✓' if py_ok else '✗ (need 3.9+)'}")
+
+        # Platform
+        platform_name = {"darwin": "macOS", "linux": "Linux"}.get(
+            sys.platform, sys.platform
+        )
+        print(f"  Platform:     {platform_name}")
+
+        # Project root
+        print(f"  Data dir:     {PROJECT_ROOT}")
+
+        # Key packages
+        for pkg_name in ("anthropic", "pandas", "requests"):
+            try:
+                mod = __import__(pkg_name)
+                ver = getattr(mod, "__version__", "?")
+                print(f"  {pkg_name:13s} {ver}  ✓")
+            except ImportError:
+                print(f"  {pkg_name:13s} not installed  ✗")
+
+        # Claude Code CLI
+        cli_path = shutil.which("claude")
+        if cli_path:
+            print(f"  Claude CLI:   {cli_path}  ✓")
+        else:
+            print("  Claude CLI:   not found (will use API)")
+
+        print()
+
+    def _onboard_step_api_keys(self, responses: dict[str, Any]) -> None:
+        """Step 2: Configure API keys with validation."""
+        print("-" * 40)
+        print("STEP 2/7 — API KEYS")
+        print("-" * 40)
+
+        # --- Anthropic API Key ---
+        cli_available = shutil.which("claude") is not None
+        existing_key = (
+            os.environ.get("ANTHROPIC_API_KEY")
+            or self.state.get_context("anthropic_api_key")
+        )
+
+        if cli_available:
+            print("  ✓ Claude Code CLI detected — no API key needed for LLM calls.")
+            print("    (CLI uses your Max subscription automatically.)")
+            responses["anthropic_method"] = "cli"
+        elif existing_key:
+            masked = existing_key[:8] + "..." + existing_key[-4:]
+            print(f"  ✓ Anthropic API key already configured: {masked}")
+            responses["anthropic_method"] = "api"
+        else:
+            print("\n  FDA needs an Anthropic API key to call Claude.")
+            print("  Get one at: https://console.anthropic.com/settings/keys\n")
+            while True:
+                key = input("  Anthropic API key (sk-ant-...) > ").strip()
+                if not key:
+                    print("  Skipped. You'll need to set ANTHROPIC_API_KEY later.")
+                    break
+                if self._validate_anthropic_key(key):
+                    self.state.set_context("anthropic_api_key", key)
+                    print("  ✓ API key validated and saved!")
+                    responses["anthropic_method"] = "api"
+                    break
+                else:
+                    print("  ✗ Invalid key — try again or press Enter to skip.")
+
+        # --- OpenAI API Key (optional) ---
+        existing_openai = (
+            os.environ.get("OPENAI_API_KEY")
+            or self.state.get_context("openai_api_key")
+        )
+        if existing_openai:
+            masked = existing_openai[:8] + "..." + existing_openai[-4:]
+            print(f"\n  ✓ OpenAI API key already configured: {masked}")
+            responses["has_openai"] = True
+        else:
+            print("\n  Optional: OpenAI API key (for voice/TTS in Discord).")
+            key = input("  OpenAI API key (sk-...) or press Enter to skip > ").strip()
+            if key:
+                self.state.set_context("openai_api_key", key)
+                print("  ✓ OpenAI key saved!")
+                responses["has_openai"] = True
+            else:
+                responses["has_openai"] = False
+
+        print()
+
+    def _validate_anthropic_key(self, key: str) -> bool:
+        """Validate an Anthropic API key with a minimal test call."""
+        try:
+            import anthropic
+
+            client = anthropic.Anthropic(api_key=key)
+            client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=10,
+                messages=[{"role": "user", "content": "hi"}],
+            )
+            return True
+        except Exception as e:
+            logger.debug(f"API key validation failed: {e}")
+            return False
+
+    def _onboard_step_channels(self, responses: dict[str, Any]) -> None:
+        """Step 3: Select and configure messaging channels."""
+        print("-" * 40)
+        print("STEP 3/7 — MESSAGING CHANNELS")
+        print("-" * 40)
+        print("\n  Which messaging platforms do you want to connect?")
+        print("  [1] Telegram")
+        print("  [2] Discord")
+        print("  [3] Slack")
+        print("  [4] None (CLI only)\n")
+
+        selection = input("  Enter numbers (comma-separated, e.g. 1,2) > ").strip()
+        selected = {s.strip() for s in selection.split(",")} if selection else set()
+
+        responses["channels_enabled"] = []
+
+        # --- Telegram ---
+        if "1" in selected:
+            print("\n  --- Telegram Setup ---")
+            print("  1. Open Telegram and search for @BotFather")
+            print("  2. Send /newbot and follow the prompts")
+            print("  3. Copy the bot token provided\n")
+
+            token = input("  Telegram bot token > ").strip()
+            if token:
+                if self._validate_telegram_token(token):
+                    self.state.set_context("telegram_bot_token", token)
+                    responses["channels_enabled"].append("telegram")
+                    print("  ✓ Telegram bot connected!")
+                else:
+                    print("  ✗ Token validation failed — you can set it later with 'fda telegram setup'")
+            else:
+                print("  Skipped.")
+
+        # --- Discord ---
+        if "2" in selected:
+            print("\n  --- Discord Setup ---")
+            print("  1. Go to https://discord.com/developers/applications")
+            print("  2. Click 'New Application' → name it → go to 'Bot' tab")
+            print("  3. Click 'Reset Token' and copy it")
+            print("  4. Go to 'OAuth2' → 'General' → copy the Client ID")
+            print("  5. Under 'Bot', enable: Message Content Intent, Server Members Intent\n")
+
+            bot_token = input("  Discord bot token > ").strip()
+            client_id = input("  Discord client ID > ").strip()
+            if bot_token and client_id:
+                self.state.set_context("discord_bot_token", bot_token)
+                self.state.set_context("discord_client_id", client_id)
+                responses["channels_enabled"].append("discord")
+                # Generate invite URL
+                perms = 3263552  # Send Messages, Speak, Connect, Read History, etc.
+                invite_url = (
+                    f"https://discord.com/api/oauth2/authorize"
+                    f"?client_id={client_id}&permissions={perms}"
+                    f"&scope=bot%20applications.commands"
+                )
+                print(f"  ✓ Discord bot configured!")
+                print(f"  Invite URL: {invite_url}")
+            else:
+                print("  Skipped.")
+
+        # --- Slack ---
+        if "3" in selected:
+            print("\n  --- Slack Setup ---")
+            print("  1. Go to https://api.slack.com/apps → Create New App → From Manifest")
+            print("  2. Paste the manifest (Socket Mode, events, commands)")
+            print("  3. Install to workspace")
+            print("  4. Copy Bot Token (xoxb-...) from OAuth & Permissions")
+            print("  5. Copy App Token (xapp-...) from Basic Information → App-Level Tokens\n")
+
+            bot_token = input("  Slack bot token (xoxb-...) > ").strip()
+            app_token = input("  Slack app token (xapp-...) > ").strip()
+            if bot_token and app_token:
+                if bot_token.startswith("xoxb-") and app_token.startswith("xapp-"):
+                    self.state.set_context("slack_bot_token", bot_token)
+                    self.state.set_context("slack_app_token", app_token)
+                    responses["channels_enabled"].append("slack")
+                    print("  ✓ Slack bot configured!")
+                else:
+                    print("  ✗ Token format looks wrong — expected xoxb-/xapp- prefixes.")
+                    print("    You can set them later with 'fda setup'.")
+            else:
+                print("  Skipped.")
+
+        if "4" in selected or not responses["channels_enabled"]:
+            print("\n  No messaging channels configured. You can add them later")
+            print("  with 'fda telegram setup', 'fda discord setup', etc.")
+
+        print()
+
+    def _validate_telegram_token(self, token: str) -> bool:
+        """Validate a Telegram bot token via the getMe API."""
+        try:
+            resp = requests.get(
+                f"https://api.telegram.org/bot{token}/getMe",
+                timeout=5,
+            )
+            data = resp.json()
+            if data.get("ok"):
+                bot_name = data["result"].get("username", "unknown")
+                print(f"  Bot username: @{bot_name}")
+                return True
+            return False
+        except Exception as e:
+            logger.debug(f"Telegram token validation failed: {e}")
+            return False
+
+    def _onboard_step_notetaking(self, responses: dict[str, Any]) -> None:
+        """Step 4: Configure channels for daily note summaries."""
+        print("-" * 40)
+        print("STEP 4/7 — DAILY NOTETAKING")
+        print("-" * 40)
+        print("\n  FDA can auto-summarize conversations from specific channels")
+        print("  into daily journal entries (runs at 9 PM by default).\n")
+
+        # Show available options based on what's enabled
+        options: list[tuple[str, str, str]] = []  # (platform, channel_id, label)
+
+        # Check for KakaoTalk client rooms
+        try:
+            from fda.clients.client_config import ClientManager
+
+            cm = ClientManager()
+            for client in cm.list_clients():
+                if client.kakaotalk_room:
+                    options.append(
+                        ("kakaotalk", client.kakaotalk_room, f"KakaoTalk: {client.name}")
+                    )
+        except Exception:
+            pass
+
+        # Channels enabled in step 3
+        channels_enabled = responses.get("channels_enabled", [])
+        if "telegram" in channels_enabled:
+            options.append(("telegram", "all_dms", "Telegram: all DMs"))
+        if "discord" in channels_enabled:
+            options.append(("discord", "all_channels", "Discord: all channels"))
+        if "slack" in channels_enabled:
+            options.append(("slack", "all_channels", "Slack: all channels"))
+
+        if not options:
+            print("  No channels available for notetaking yet.")
+            print("  You can add them later: fda config notetaking add <platform> <channel_id>\n")
+            return
+
+        print("  Available channels:")
+        for i, (platform, ch_id, label) in enumerate(options, 1):
+            print(f"  [{i}] {label}")
+        print(f"  [{len(options) + 1}] Skip\n")
+
+        selection = input("  Select channels (comma-separated, e.g. 1,2) > ").strip()
+        if not selection or selection == str(len(options) + 1):
+            print("  Skipped.\n")
+            return
+
+        selected_indices = {s.strip() for s in selection.split(",")}
+        notetaking_channels: list[dict[str, str]] = []
+
+        for idx_str in selected_indices:
+            try:
+                idx = int(idx_str) - 1
+                if 0 <= idx < len(options):
+                    platform, ch_id, label = options[idx]
+                    notetaking_channels.append({
+                        "platform": platform,
+                        "channel_id": ch_id,
+                        "label": label,
+                    })
+            except ValueError:
+                continue
+
+        if notetaking_channels:
+            self.state.set_notetaking_channels(notetaking_channels)
+            responses["notetaking_channels"] = notetaking_channels
+            print(f"  ✓ {len(notetaking_channels)} channel(s) configured for daily notetaking!")
+        else:
+            print("  No valid channels selected.")
+
+        # Notetaking time
+        print(f"\n  Default summary time: 9:00 PM")
+        nt_time = input("  Change time? (HH:MM or Enter to keep default) > ").strip()
+        if nt_time:
+            self.state.set_context("notetaking_time", nt_time)
+            print(f"  ✓ Notetaking time set to {nt_time}")
+
+        print()
+
+    def _onboard_step_profile(self, responses: dict[str, Any]) -> None:
+        """Step 5: User profile questions (who you are, goals, preferences)."""
+        print("-" * 40)
+        print("STEP 5/7 — ABOUT YOU")
+        print("-" * 40)
+
+        # Basic info
+        responses["name"] = input("\n  What should I call you? > ").strip()
+        responses["role"] = input("  What do you do? (e.g., 'software engineer') > ").strip()
+        responses["context"] = input("  Tell me briefly about your current work: > ").strip()
+
+        # Goals
+        print()
+        responses["goals"] = input("  What are your priorities right now? > ").strip()
+        responses["challenges"] = input("  What's frustrating about your workflow? > ").strip()
+
+        # Calendar
+        print()
+        cal = input("  Do you use Outlook/Office 365 calendar? (y/n) > ").strip().lower()
+        responses["uses_outlook"] = cal in ("y", "yes")
+
+        # Preferences
+        responses["communication_style"] = (
+            input("  Communication style? (brief/detailed/adaptive) > ").strip()
+            or "adaptive"
+        )
+        responses["check_in_time"] = input(
+            "  Daily check-in time? (e.g., '9:00 AM' or 'skip') > "
+        ).strip()
+
+        # Timezone
+        print("\n  Timezone (e.g., Asia/Seoul, America/New_York)")
+        print("  Press Enter to auto-detect.")
+        tz_response = input("  Timezone > ").strip()
+
+        if tz_response.lower() == "auto" or not tz_response:
+            responses["timezone"] = self._detect_system_timezone()
+            if responses["timezone"]:
+                print(f"  Detected: {responses['timezone']}")
+            else:
+                print("  Could not detect — using system default.")
+        else:
+            from fda.utils.timezone import validate_timezone
+
+            validated_tz = validate_timezone(tz_response)
+            if validated_tz:
+                responses["timezone"] = validated_tz
+                print(f"  Using: {validated_tz}")
+            else:
+                print(f"  Warning: '{tz_response}' invalid. Using system default.")
+                responses["timezone"] = None
+
+        # Store in state
+        self.state.set_context("user_name", responses.get("name", ""))
+        self.state.set_context("user_role", responses.get("role", ""))
+        self.state.set_context("user_context", responses.get("context", ""))
+        self.state.set_context("user_goals", responses.get("goals", ""))
+        self.state.set_context("user_challenges", responses.get("challenges", ""))
+        self.state.set_context("communication_style", responses.get("communication_style", "adaptive"))
+        self.state.set_context("user_timezone", responses.get("timezone"))
+        self.state.set_context("onboarded", True)
+        self.state.set_context("onboarded_at", datetime.now().isoformat())
+
+        # Save journal entry
+        name = responses.get("name", "User")
+        self.log_to_journal(
+            summary=f"Onboarding interview with {name}",
+            content=(
+                f"# Onboarding — {name}\n\n"
+                f"**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+                f"- **Role:** {responses.get('role', 'N/A')}\n"
+                f"- **Context:** {responses.get('context', 'N/A')}\n"
+                f"- **Goals:** {responses.get('goals', 'N/A')}\n"
+                f"- **Challenges:** {responses.get('challenges', 'N/A')}\n"
+                f"- **Style:** {responses.get('communication_style', 'adaptive')}\n"
+                f"- **Timezone:** {responses.get('timezone') or 'system default'}\n"
+            ),
+            tags=["onboarding", "user-profile"],
+            relevance_decay="slow",
+        )
+
+        print()
+
+    def _onboard_step_daemon(self, responses: dict[str, Any]) -> None:
+        """Step 6: Optionally install FDA as a background service."""
+        print("-" * 40)
+        print("STEP 6/7 — BACKGROUND SERVICE")
+        print("-" * 40)
+
+        platform_name = {"darwin": "macOS (launchd)", "linux": "Linux (systemd)"}.get(
+            sys.platform, sys.platform
+        )
+        print(f"\n  FDA can run as a background service on {platform_name}.")
+        print("  It will auto-start on boot and restart on crash.\n")
+
+        install = input("  Install FDA as a background service? (y/n) > ").strip().lower()
+        if install not in ("y", "yes"):
+            print("  Skipped. Run 'fda start' manually when needed.\n")
+            responses["daemon_installed"] = False
+            return
+
+        from fda.daemon import install_daemon, start_daemon
+
+        if install_daemon(verbose=True):
+            print("  ✓ Service installed!")
+            responses["daemon_installed"] = True
+
+            start_now = input("  Start it now? (y/n) > ").strip().lower()
+            if start_now in ("y", "yes"):
+                if start_daemon():
+                    print("  ✓ FDA is running in the background!")
+                    responses["daemon_started"] = True
+                else:
+                    print("  ✗ Failed to start. Check logs and try 'fda start'.")
+                    responses["daemon_started"] = False
+            else:
+                responses["daemon_started"] = False
+        else:
+            print("  ✗ Failed to install service.")
+            responses["daemon_installed"] = False
+
+        print()
+
+    def _onboard_step_complete(self, responses: dict[str, Any]) -> None:
+        """Step 7: Show summary and next steps."""
+        print("=" * 60)
+        print("  SETUP COMPLETE")
+        print("=" * 60)
+
+        # Summary table
+        print("\n  Configuration Summary:")
+        print("  " + "-" * 36)
+
+        # API
+        api_method = responses.get("anthropic_method", "not set")
+        api_icon = "✓" if api_method != "not set" else "✗"
+        print(f"  {api_icon} Anthropic:  {api_method}")
+
+        openai_icon = "✓" if responses.get("has_openai") else "—"
+        print(f"  {openai_icon} OpenAI:     {'configured' if responses.get('has_openai') else 'skipped'}")
+
+        # Channels
+        channels = responses.get("channels_enabled", [])
+        for ch in ["telegram", "discord", "slack"]:
+            icon = "✓" if ch in channels else "—"
+            print(f"  {icon} {ch.capitalize():11s} {'connected' if ch in channels else 'skipped'}")
+
+        # Notetaking
+        nt_channels = responses.get("notetaking_channels", [])
+        if nt_channels:
+            print(f"  ✓ Notetaking:  {len(nt_channels)} channel(s)")
+        else:
+            print("  — Notetaking:  none")
+
+        # Profile
+        name = responses.get("name", "")
+        if name:
+            print(f"  ✓ Profile:     {name}")
+        else:
+            print("  — Profile:     skipped")
+
+        # Daemon
+        daemon_icon = "✓" if responses.get("daemon_installed") else "—"
+        daemon_status = "installed" if responses.get("daemon_installed") else "skipped"
+        if responses.get("daemon_started"):
+            daemon_status += " (running)"
+        print(f"  {daemon_icon} Daemon:      {daemon_status}")
+
+        print("  " + "-" * 36)
+
+        # Personalized welcome (if profile was filled)
+        if name:
+            print("\n  Generating personalized welcome...\n")
+            try:
+                synthesis_prompt = (
+                    f"The user {name} just completed onboarding. "
+                    f"Role: {responses.get('role', 'N/A')}. "
+                    f"Goals: {responses.get('goals', 'N/A')}. "
+                    f"Channels: {', '.join(channels) or 'CLI only'}. "
+                    f"Write a brief, warm welcome (2-3 sentences) and suggest "
+                    f"one thing they could try first. Keep it conversational."
+                )
+                welcome = self.chat(synthesis_prompt, include_history=False)
+                print(f"  {welcome}")
+            except Exception:
+                print(f"  Welcome, {name}! FDA is ready to help.")
+
+        # Next steps
+        print("\n  Next steps:")
+        if not responses.get("daemon_started"):
+            print("  • Run 'fda start' to launch all agents")
+        if responses.get("uses_outlook"):
+            print("  • Run 'fda calendar login' to connect your calendar")
+        if not channels:
+            print("  • Run 'fda onboard --force --skip-profile' to add channels later")
+        print("  • Run 'fda ask \"...\"' to chat anytime")
+        print("  • Run 'fda config notetaking add <platform> <channel>' to add notetaking")
+        print()
 
     def is_onboarded(self) -> bool:
         """Check if the user has completed onboarding."""

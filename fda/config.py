@@ -114,6 +114,56 @@ LOCAL_WORKER_PROJECTS: Final[list[str]] = [
 ]
 LOCAL_WORKER_BACKUP_DIR: Final[Path] = DATA_DIR / "local_backups"
 
+# Timeout constants (seconds) for agentic tool-use loops
+ANALYZE_TIMEOUT_SECONDS: Final[int] = 300   # 5 minutes for analyze_and_fix
+ORGANIZE_TIMEOUT_SECONDS: Final[int] = 600  # 10 minutes for organize_files
+
+# Repository auto-discovery configuration
+REPO_DISCOVERY_SKIP_DIRS: Final[frozenset[str]] = frozenset({
+    ".Trash", ".Trashes", "node_modules", ".venv", "venv",
+    "__pycache__", ".git", "dist", "build", ".tox",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache",
+    "htmlcov", ".eggs", "site-packages", ".cache", ".npm",
+    ".yarn", "Library", ".local", ".config", ".claude",
+    "Applications", "Music", "Movies", "Pictures",
+})
+REPO_DISCOVERY_MAX_DEPTH: Final[int] = 3
+REPO_DISCOVERY_INTERVAL_MINUTES: Final[int] = 60
+
+# Extended thinking
+ENABLE_EXTENDED_THINKING: Final[bool] = True
+EXTENDED_THINKING_BUDGET: Final[int] = 10000  # max tokens for thinking
+
+# File upload limits
+MAX_IMAGE_UPLOAD_MB: Final[int] = 10
+MAX_DOCUMENT_UPLOAD_MB: Final[int] = 30
+SUPPORTED_IMAGE_TYPES: Final[frozenset[str]] = frozenset({
+    "image/jpeg", "image/png", "image/gif", "image/webp",
+})
+SUPPORTED_DOC_TYPES: Final[frozenset[str]] = frozenset({
+    "application/pdf",
+})
+SUPPORTED_TEXT_EXTENSIONS: Final[frozenset[str]] = frozenset({
+    ".txt", ".py", ".js", ".ts", ".json", ".yaml", ".yml", ".md", ".csv",
+    ".xml", ".html", ".css", ".sh", ".sql", ".go", ".rs", ".java", ".c",
+    ".cpp", ".h", ".rb", ".php", ".log", ".conf", ".toml", ".ini", ".env",
+})
+
+# Conversation history
+HISTORY_MESSAGE_LIMIT: Final[int] = 50     # messages to load for LLM context
+HISTORY_CHAR_LIMIT: Final[int] = 4000      # per-message character truncation
+HISTORY_HOURS_CUTOFF: Final[int] = 72      # hours before messages are considered stale
+
+# Daemon configuration
+FDA_DAEMON_LABEL: Final[str] = "com.fda.agent"
+FDA_SYSTEMD_NAME: Final[str] = "fda"
+
+# Notetaking
+DEFAULT_NOTETAKING_TIME: Final[str] = "21:00"  # 9 PM daily summary
+
+# Daily journal review — morning briefing posted to Discord/Slack
+DEFAULT_JOURNAL_REVIEW_TIME: Final[str] = "09:00"  # 9 AM morning briefing
+
 # Logging
 LOG_DIR: Final[Path] = PROJECT_ROOT / "logs"
 LOG_LEVEL: Final[str] = "INFO"

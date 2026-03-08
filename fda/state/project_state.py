@@ -988,6 +988,75 @@ class ProjectState:
     def get_discord_messages_recent(self, channel_id: str, limit: int = 20) -> list[dict[str, Any]]:
         return self.get_messages_recent(channel_id, limit)
 
+    # ------------------------------------------------------------------
+    # Notetaking channel configuration
+    # ------------------------------------------------------------------
+
+    def get_notetaking_channels(self) -> list[dict[str, str]]:
+        """
+        Get list of channels configured for daily notetaking.
+
+        Returns:
+            List of channel dicts with keys: platform, channel_id, label (optional).
+        """
+        raw = self.get_context("notetaking_channels")
+        if not raw:
+            return []
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return []
+
+    def set_notetaking_channels(self, channels: list[dict[str, str]]) -> None:
+        """
+        Set the full list of notetaking channels.
+
+        Args:
+            channels: List of channel dicts with keys: platform, channel_id, label.
+        """
+        self.set_context("notetaking_channels", json.dumps(channels))
+
+    def add_notetaking_channel(
+        self,
+        platform: str,
+        channel_id: str,
+        label: Optional[str] = None,
+    ) -> None:
+        """
+        Add a channel to the notetaking list (dedup by platform+channel_id).
+
+        Args:
+            platform: Platform name (telegram, discord, slack, kakaotalk).
+            channel_id: Channel or room identifier.
+            label: Human-readable label for the channel.
+        """
+        channels = self.get_notetaking_channels()
+        # Remove existing entry for same platform+channel_id
+        channels = [
+            c for c in channels
+            if not (c["platform"] == platform and c["channel_id"] == channel_id)
+        ]
+        entry: dict[str, str] = {"platform": platform, "channel_id": channel_id}
+        if label:
+            entry["label"] = label
+        channels.append(entry)
+        self.set_notetaking_channels(channels)
+
+    def remove_notetaking_channel(self, platform: str, channel_id: str) -> None:
+        """
+        Remove a channel from the notetaking list.
+
+        Args:
+            platform: Platform name.
+            channel_id: Channel or room identifier.
+        """
+        channels = self.get_notetaking_channels()
+        channels = [
+            c for c in channels
+            if not (c["platform"] == platform and c["channel_id"] == channel_id)
+        ]
+        self.set_notetaking_channels(channels)
+
     # File index methods (for Librarian)
 
     def add_file_to_index(

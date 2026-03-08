@@ -145,7 +145,7 @@ def handle_start(args: argparse.Namespace) -> int:
 
 
 def handle_onboard(args: argparse.Namespace) -> int:
-    """Run interactive onboarding."""
+    """Run the interactive 7-step onboarding wizard."""
     # Ensure system is initialized first
     ensure_fda_initialized()
 
@@ -160,35 +160,12 @@ def handle_onboard(args: argparse.Namespace) -> int:
             user_name = agent.state.get_context("user_name") or "there"
             print(f"Welcome back, {user_name}!")
             print("\nTo redo onboarding, run: fda onboard --force")
+            print("To redo only credentials/channels: fda onboard --force --skip-profile")
             print("To chat with me, run: fda ask \"<your question>\"")
             return 0
 
-        agent.onboard_interactive()
-
-        # After successful onboarding, offer to start all agents
-        print("\n" + "=" * 60)
-        print("READY TO START")
-        print("=" * 60)
-        print("\nOnboarding complete! Would you like to start all FDA agents now?")
-        print("This will start:")
-        print("  - FDA (your personal assistant)")
-        print("  - Librarian (file search & knowledge)")
-        print("  - Executor (command execution)")
-        print()
-
-        start_now = input("Start all agents now? (y/n) > ").strip().lower()
-
-        if start_now in ("y", "yes"):
-            print()
-            # Create a namespace object to pass to handle_start_all_agents
-            start_args = argparse.Namespace(all_agents=True, daemon=False)
-            return handle_start_all_agents(start_args)
-        else:
-            print("\nNo problem! When you're ready, run:")
-            print("  fda start --all    - Start all agents")
-            print("  fda discord start  - Start Discord bot")
-            print("  fda telegram start - Start Telegram bot")
-            print("  fda ask \"...\"      - Ask a question via CLI")
+        skip_profile = getattr(args, "skip_profile", False)
+        agent.onboard_interactive(skip_profile=skip_profile)
 
         return 0
     except KeyboardInterrupt:
@@ -682,6 +659,44 @@ def handle_config_folders_remove(args: argparse.Namespace) -> int:
 
     print(f"Removed exploration folder: {folder_path}")
 
+    return 0
+
+
+def handle_config_notetaking_list(args: argparse.Namespace) -> int:
+    """List channels configured for daily notetaking."""
+    state = ProjectState()
+    channels = state.get_notetaking_channels()
+
+    if not channels:
+        print("No notetaking channels configured.")
+        print("Add one with: fda config notetaking add <platform> <channel_id>")
+        return 0
+
+    print("Daily notetaking channels:")
+    for ch in channels:
+        label = ch.get("label") or ch["channel_id"]
+        print(f"  {ch['platform']:12s} {label}")
+
+    nt_time = state.get_context("notetaking_time") or "21:00"
+    print(f"\nSummary time: {nt_time}")
+
+    return 0
+
+
+def handle_config_notetaking_add(args: argparse.Namespace) -> int:
+    """Add a channel to daily notetaking."""
+    state = ProjectState()
+    state.add_notetaking_channel(args.platform, args.channel_id, getattr(args, "label", None))
+    label = getattr(args, "label", None) or args.channel_id
+    print(f"Added {args.platform}/{label} to notetaking channels.")
+    return 0
+
+
+def handle_config_notetaking_remove(args: argparse.Namespace) -> int:
+    """Remove a channel from daily notetaking."""
+    state = ProjectState()
+    state.remove_notetaking_channel(args.platform, args.channel_id)
+    print(f"Removed {args.platform}/{args.channel_id} from notetaking channels.")
     return 0
 
 
@@ -1451,15 +1466,20 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     start_parser.set_defaults(func=handle_start)
 
-    # onboard command - interactive setup
+    # onboard command - interactive setup wizard
     onboard_parser = subparsers.add_parser(
         "onboard",
-        help="Interactive setup - FDA learns about you and your goals",
+        help="Interactive setup wizard — API keys, channels, profile, daemon",
     )
     onboard_parser.add_argument(
         "--force",
         action="store_true",
         help="Redo onboarding even if already completed",
+    )
+    onboard_parser.add_argument(
+        "--skip-profile",
+        action="store_true",
+        help="Skip profile questions (only set up credentials and channels)",
     )
     onboard_parser.set_defaults(func=handle_onboard)
 
@@ -1604,6 +1624,37 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     # Set default action for 'fda config folders' (no subcommand)
     folders_parser.set_defaults(func=handle_config_folders_list)
+
+    # config notetaking
+    notetaking_parser = config_subparsers.add_parser(
+        "notetaking",
+        help="Manage daily notetaking channels",
+    )
+    notetaking_subparsers = notetaking_parser.add_subparsers(dest="notetaking_command")
+
+    # config notetaking list
+    nt_list_parser = notetaking_subparsers.add_parser("list", help="List notetaking channels")
+    nt_list_parser.set_defaults(func=handle_config_notetaking_list)
+
+    # config notetaking add
+    nt_add_parser = notetaking_subparsers.add_parser("add", help="Add a notetaking channel")
+    nt_add_parser.add_argument(
+        "platform",
+        choices=["telegram", "discord", "slack", "kakaotalk"],
+        help="Platform name",
+    )
+    nt_add_parser.add_argument("channel_id", help="Channel or room identifier")
+    nt_add_parser.add_argument("--label", help="Human-readable label")
+    nt_add_parser.set_defaults(func=handle_config_notetaking_add)
+
+    # config notetaking remove
+    nt_remove_parser = notetaking_subparsers.add_parser("remove", help="Remove a notetaking channel")
+    nt_remove_parser.add_argument("platform", help="Platform name")
+    nt_remove_parser.add_argument("channel_id", help="Channel or room identifier")
+    nt_remove_parser.set_defaults(func=handle_config_notetaking_remove)
+
+    # Set default action for 'fda config notetaking' (no subcommand)
+    notetaking_parser.set_defaults(func=handle_config_notetaking_list)
 
     # discord command
     discord_parser = subparsers.add_parser("discord", help="Discord voice bot operations")

@@ -16,6 +16,7 @@ Voice Architecture:
 """
 
 import asyncio
+import base64
 import io
 import logging
 import os
@@ -26,7 +27,7 @@ import wave
 import struct
 from pathlib import Path
 from typing import Any, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import defaultdict
 
 from fda.base_agent import BaseAgent
@@ -37,6 +38,16 @@ from fda.config import (
     MODEL_FDA,
     MODEL_MEETING_SUMMARY,
     JOURNAL_DIR,
+    ENABLE_EXTENDED_THINKING,
+    EXTENDED_THINKING_BUDGET,
+    MAX_IMAGE_UPLOAD_MB,
+    MAX_DOCUMENT_UPLOAD_MB,
+    SUPPORTED_IMAGE_TYPES,
+    SUPPORTED_DOC_TYPES,
+    SUPPORTED_TEXT_EXTENSIONS,
+    HISTORY_MESSAGE_LIMIT,
+    HISTORY_CHAR_LIMIT,
+    HISTORY_HOURS_CUTOFF,
 )
 from fda.state.project_state import ProjectState
 from fda.comms.message_bus import MessageTypes, Agents
@@ -371,6 +382,9 @@ class DiscordVoiceAgent(BaseAgent):
         worker: Optional[Any] = None,
         local_task_dispatch: Optional[Any] = None,
         remote_task_dispatch: Optional[Any] = None,
+        local_command_dispatch: Optional[Any] = None,
+        remote_command_dispatch: Optional[Any] = None,
+        local_organize_dispatch: Optional[Any] = None,
         approval_manager: Optional[Any] = None,
         restart_callback: Optional[Any] = None,
     ):
@@ -452,6 +466,13 @@ class DiscordVoiceAgent(BaseAgent):
 
         # Remote worker dispatch callback (from orchestrator — SSH into VMs)
         self._remote_task_dispatch = remote_task_dispatch
+
+        # Direct command dispatch callbacks (shell access without full pipeline)
+        self._local_command_dispatch = local_command_dispatch
+        self._remote_command_dispatch = remote_command_dispatch
+
+        # File organization dispatch callback
+        self._local_organize_dispatch = local_organize_dispatch
 
         # Approval manager for approve/reject commands
         self._approval_manager = approval_manager
@@ -606,6 +627,11 @@ class DiscordVoiceAgent(BaseAgent):
             """Run a task on the local codebase. Usage: !local <task description>"""
             await self._cmd_local(ctx, task)
 
+        @self._bot.command(name="organize")
+        async def organize_files(ctx, *, args: str = None):
+            """Organize files in a local directory. Usage: !organize <path> [instructions]"""
+            await self._cmd_organize(ctx, args)
+
         @self._bot.command(name="restart")
         async def restart_fda(ctx):
             """Restart the FDA system."""
@@ -686,20 +712,78 @@ class DiscordVoiceAgent(BaseAgent):
             logger.error(f"[DiscordBot] Failed to save message: {e}")
 
     def _get_conversation_history(self, channel_id: int) -> list[dict[str, str]]:
-        """Load today's conversation history from the state DB for context."""
+        """Load recent conversation history from the state DB for context."""
         try:
-            # Get recent messages for this channel (last 20 for LLM context window)
             messages = self._state_db.get_discord_messages_recent(
                 channel_id=str(channel_id),
-                limit=20,
+                limit=HISTORY_MESSAGE_LIMIT,
             )
             return [
-                {"role": msg["role"], "content": msg["content"]}
+                {
+                    "role": msg["role"],
+                    "content": msg["content"],
+                    "created_at": msg.get("created_at", ""),
+                }
                 for msg in messages
             ]
         except Exception as e:
             logger.error(f"[DiscordBot] Failed to load history: {e}")
             return []
+
+    async def _extract_attachments(self, message: Any) -> list[dict]:
+        """Download message attachments and build Anthropic content blocks.
+
+        Supports images (JPEG/PNG/GIF/WebP), PDFs, and text-based source files.
+        """
+        content_blocks: list[dict] = []
+        if not hasattr(message, "attachments") or not message.attachments:
+            return content_blocks
+
+        for att in message.attachments:
+            try:
+                mime = att.content_type or ""
+                filename = att.filename or ""
+                ext = Path(filename).suffix.lower()
+
+                if mime in SUPPORTED_IMAGE_TYPES:
+                    if att.size > MAX_IMAGE_UPLOAD_MB * 1024 * 1024:
+                        logger.info(f"[DiscordBot] Skipping oversized image: {filename} ({att.size} bytes)")
+                        continue
+                    data = await att.read()
+                    content_blocks.append({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": mime,
+                            "data": base64.b64encode(data).decode(),
+                        },
+                    })
+                elif mime in SUPPORTED_DOC_TYPES:
+                    if att.size > MAX_DOCUMENT_UPLOAD_MB * 1024 * 1024:
+                        logger.info(f"[DiscordBot] Skipping oversized document: {filename} ({att.size} bytes)")
+                        continue
+                    data = await att.read()
+                    content_blocks.append({
+                        "type": "document",
+                        "source": {
+                            "type": "base64",
+                            "media_type": mime,
+                            "data": base64.b64encode(data).decode(),
+                        },
+                    })
+                elif ext in SUPPORTED_TEXT_EXTENSIONS:
+                    if att.size > 1 * 1024 * 1024:  # 1MB text limit
+                        continue
+                    data = await att.read()
+                    text_content = data.decode("utf-8", errors="replace")[:8000]
+                    content_blocks.append({
+                        "type": "text",
+                        "text": f"[File: {filename}]\n```\n{text_content}\n```",
+                    })
+            except Exception as e:
+                logger.warning(f"[DiscordBot] Failed to process attachment {att.filename}: {e}")
+
+        return content_blocks
 
     async def _cmd_dailybrief(self, ctx: Any) -> None:
         """Handle !dailybrief command - generate and speak a daily briefing."""
@@ -751,6 +835,9 @@ class DiscordVoiceAgent(BaseAgent):
             greeting = self._get_greeting()
             thinking_msg = await message.reply(greeting)
 
+            # Extract image/file attachments (if any)
+            attachment_blocks = await self._extract_attachments(message)
+
             # Load conversation history from state DB
             channel_id = message.channel.id
             history = self._get_conversation_history(channel_id)
@@ -760,15 +847,21 @@ class DiscordVoiceAgent(BaseAgent):
             self._save_message(channel_id, "user", content, username=username)
 
             # Run the blocking LLM call in a thread to not freeze Discord
+            # Pass thinking_msg + event loop so streaming can edit in-place
             loop = asyncio.get_event_loop()
             response = await loop.run_in_executor(
-                None, self._answer_question, content, history
+                None,
+                lambda: self._answer_question(
+                    content, history,
+                    thinking_msg=thinking_msg, bot_loop=loop,
+                    attachment_blocks=attachment_blocks,
+                ),
             )
 
             # Save assistant response to DB
             self._save_message(channel_id, "assistant", response)
 
-            # Edit the "Thinking..." message with the actual response
+            # Final polished edit (streaming may have left partial text)
             if len(response) > 2000:
                 await thinking_msg.edit(content=response[:1900])
                 for i in range(1900, len(response), 1900):
@@ -891,6 +984,9 @@ class DiscordVoiceAgent(BaseAgent):
         thinking_msg = await ctx.send(greeting)
 
         try:
+            # Extract image/file attachments (if any)
+            attachment_blocks = await self._extract_attachments(ctx.message)
+
             # Load conversation history from state DB
             channel_id = ctx.channel.id
             history = self._get_conversation_history(channel_id)
@@ -900,15 +996,21 @@ class DiscordVoiceAgent(BaseAgent):
             self._save_message(channel_id, "user", question, username=username)
 
             # Run the blocking LLM call in a thread so Discord stays responsive
+            # Pass thinking_msg + event loop so streaming can edit in-place
             loop = asyncio.get_event_loop()
             response = await loop.run_in_executor(
-                None, self._answer_question, question, history
+                None,
+                lambda: self._answer_question(
+                    question, history,
+                    thinking_msg=thinking_msg, bot_loop=loop,
+                    attachment_blocks=attachment_blocks,
+                ),
             )
 
             # Save assistant response to DB
             self._save_message(channel_id, "assistant", response)
 
-            # Edit the greeting message with the actual response
+            # Final polished edit (streaming may have left partial text)
             if len(response) > 2000:
                 await thinking_msg.edit(content=response[:1900])
                 for i in range(1900, len(response), 1900):
@@ -997,6 +1099,7 @@ No wake word needed — powered by OpenAI Realtime API for low-latency conversat
 `!analyze <request>` - Analyze client code on remote VM (via SSH)
 `!remote <task>` - Dispatch task to remote worker (SSH into VM) → approval flow
 `!local <task>` - Analyze & fix local codebase (FDA, etc.) → approval flow
+`!organize <path> [instructions]` - Sort files in a local directory
 
 **Approvals:**
 `!approve <id>` - Approve a pending code change
@@ -1327,6 +1430,69 @@ No wake word needed — powered by OpenAI Realtime API for low-latency conversat
             logger.error(f"[DiscordBot] Local task command failed: {e}")
             await ctx.send(f"❌ Error during local analysis: {e}")
 
+    async def _cmd_organize(self, ctx: Any, args: Optional[str]) -> None:
+        """Handle !organize command — scan and sort files in a directory."""
+        if not args:
+            await ctx.send(
+                "Usage: `!organize <path> [instructions]`\n\n"
+                "Examples:\n"
+                "- `!organize ~/Downloads`\n"
+                "- `!organize ~/Desktop sort by file type`\n"
+                "- `!organize ~/Documents/projects group related files`"
+            )
+            return
+
+        if not self._local_organize_dispatch:
+            await ctx.send("⚠️ File organization not available. Start FDA with `fda start`.")
+            return
+
+        # Parse path and instructions
+        parts = args.split(None, 1)
+        target_path = os.path.expanduser(parts[0])
+        instructions = parts[1] if len(parts) > 1 else ""
+
+        await ctx.send(
+            f"🧹 Scanning and organizing `{target_path}`...\n"
+            f"{('**Instructions:** ' + instructions) if instructions else ''}\n"
+            "Git repositories will be left untouched."
+        )
+
+        try:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None, self._local_organize_dispatch,
+                target_path, instructions,
+            )
+
+            if result.get("success"):
+                moves = result.get("moves", [])
+                deletions = result.get("deletions", [])
+                repos_skipped = result.get("repos_skipped", [])
+                summary = result.get("summary", "")
+
+                response = "✅ **Organization complete**\n\n"
+                if moves:
+                    response += f"**Moved:** {len(moves)} files\n"
+                if deletions:
+                    response += f"**Deleted junk:** {len(deletions)} files\n"
+                if repos_skipped:
+                    response += f"**Git repos skipped:** {len(repos_skipped)}\n"
+                if summary:
+                    response += f"\n{summary[:1500]}"
+
+                if len(response) > 2000:
+                    for i in range(0, len(response), 1900):
+                        await ctx.send(response[i:i+1900])
+                else:
+                    await ctx.send(response)
+            else:
+                error = result.get("error", "Unknown error")
+                await ctx.send(f"❌ Organization failed: {error[:500]}")
+
+        except Exception as e:
+            logger.error(f"[DiscordBot] Organize command failed: {e}")
+            await ctx.send(f"❌ Error during file organization: {e}")
+
     async def _cmd_restart(self, ctx: Any) -> None:
         """Handle !restart command — restart the FDA system."""
         if not self._restart_callback:
@@ -1636,8 +1802,47 @@ No wake word needed — powered by OpenAI Realtime API for low-latency conversat
             },
         },
         {
+            "name": "run_local_command",
+            "description": (
+                "Execute a shell command on the local Mac Mini. "
+                "Use for quick queries: ls, cat, grep, find, ps, etc. "
+                "PREFER THIS over run_local_task for simple questions. "
+                "Returns stdout/stderr directly."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Shell command to execute locally."},
+                    "cwd": {"type": "string", "description": "Working directory. Defaults to ~/Documents."},
+                },
+                "required": ["command"],
+            },
+        },
+        {
+            "name": "run_remote_command",
+            "description": (
+                "Execute a shell command on a client's remote VM via SSH. "
+                "Use for quick queries: ls, cat, grep, systemctl, airflow CLI, etc. "
+                "PREFER THIS over run_remote_task for simple questions. "
+                "Returns stdout/stderr directly."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Shell command to execute on the remote VM."},
+                    "cwd": {"type": "string", "description": "Working directory."},
+                    "client_id": {"type": "string", "description": "Optional client identifier (e.g., 'aonebnh')."},
+                },
+                "required": ["command"],
+            },
+        },
+        {
             "name": "run_local_task",
-            "description": "Dispatch a task to the local worker agent that operates on the Mac Mini filesystem. Use for tasks on the local FDA codebase or other local projects.",
+            "description": (
+                "Dispatch a complex task to the local worker for full code analysis "
+                "and changes. ONLY use when you need code modifications — "
+                "use run_local_command for simple queries instead."
+            ),
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -1803,6 +2008,51 @@ No wake word needed — powered by OpenAI Realtime API for low-latency conversat
                 except Exception as e:
                     return f"Calendar error: {e}"
 
+            elif tool_name == "run_local_command":
+                command = tool_input.get("command", "")
+                cwd = tool_input.get("cwd")
+                if not self._local_command_dispatch:
+                    return "Local command dispatch not available."
+                try:
+                    result = self._local_command_dispatch(command, cwd=cwd)
+                    if result.get("success"):
+                        output = result.get("stdout", "")
+                        stderr = result.get("stderr", "")
+                        parts = []
+                        if output:
+                            parts.append(output[:3000])
+                        if stderr:
+                            parts.append(f"STDERR:\n{stderr[:1000]}")
+                        return "\n".join(parts) if parts else "(no output)"
+                    else:
+                        return f"Command failed: {result.get('error', 'unknown')}"
+                except Exception as e:
+                    return f"Error running local command: {e}"
+
+            elif tool_name == "run_remote_command":
+                command = tool_input.get("command", "")
+                client_id = tool_input.get("client_id")
+                cwd = tool_input.get("cwd")
+                if not self._remote_command_dispatch:
+                    return "Remote command dispatch not available."
+                try:
+                    result = self._remote_command_dispatch(
+                        command, client_id=client_id, cwd=cwd
+                    )
+                    if result.get("success"):
+                        output = result.get("stdout", "")
+                        stderr = result.get("stderr", "")
+                        parts = []
+                        if output:
+                            parts.append(output[:3000])
+                        if stderr:
+                            parts.append(f"STDERR:\n{stderr[:1000]}")
+                        return "\n".join(parts) if parts else "(no output)"
+                    else:
+                        return f"Command failed: {result.get('error', 'unknown')}"
+                except Exception as e:
+                    return f"Error running remote command: {e}"
+
             elif tool_name in ("run_remote_task", "run_local_task"):
                 task = tool_input.get("task", "")
                 is_remote = tool_name == "run_remote_task"
@@ -1856,11 +2106,26 @@ No wake word needed — powered by OpenAI Realtime API for low-latency conversat
             logger.error(f"[DiscordBot] Tool {tool_name} error: {e}")
             return f"Error executing {tool_name}: {e}"
 
-    def _answer_with_tools(self, question: str, conversation_history: list[dict[str, str]] = None) -> str:
-        """Answer using the API backend's agentic tool-use loop.
+    def _answer_with_tools(
+        self,
+        question: str,
+        conversation_history: list[dict[str, str]] = None,
+        thinking_msg: Any = None,
+        bot_loop: Any = None,
+        attachment_blocks: list[dict] = None,
+    ) -> str:
+        """Answer using the API backend's streaming agentic tool-use loop.
 
-        Sends the question with tool definitions and lets Claude decide
-        which data sources to consult (including worker agents).
+        Streams tokens into a Discord message via message.edit for a
+        real-time typing experience. Falls back to non-streaming
+        if streaming is unavailable.
+
+        Args:
+            question: The user's question.
+            conversation_history: Recent conversation exchanges.
+            thinking_msg: The Discord Message object to edit in-place.
+            bot_loop: The asyncio event loop for bridging sync→async edits.
+            attachment_blocks: Pre-extracted Anthropic content blocks (images, docs, text files).
         """
         user_name = self.state.get_context("user_name") or "the user"
         today = datetime.now().strftime("%Y-%m-%d (%A)")
@@ -1871,30 +2136,131 @@ Today is {today}. The user's name is {user_name}.
 
 You have tools to look up the user's data. Use them when you need information to answer the question — don't guess. If the user asks about chats, notes, tasks, calendar, alerts, remote VMs, or local code, call the appropriate tool first.
 
-Keep responses concise for Discord (under 1800 characters when possible).
+TOOL STRATEGY — choose the right tool for the job:
+- *run_local_command*: For quick shell commands on this Mac Mini (ls, cat, grep, find, ps, etc.). Fast and direct. ALWAYS prefer this over run_local_task for simple questions.
+- *run_local_task*: For complex local code changes requiring full analysis pipeline. ONLY use when you need to modify code.
+- *run_remote_command*: For quick shell commands on client VMs via SSH. Fast and direct. ALWAYS prefer this over run_remote_task for simple questions.
+- *run_remote_task*: For complex code analysis on remote VMs. Only use when you need to analyze/modify code.
+- *search_journal*: For recalling past work — investigations, code changes, deployments, errors.
+
+When investigating a problem, prefer multiple small command calls over the heavy task pipeline. You can run ls, cat, grep, tail logs — just like working in a terminal.
+
+If the user sends images or files, analyze them directly. You have full vision capabilities.
+
+Keep responses concise for Discord (under 1800 characters when possible). Use **bold** for emphasis.
 """
 
         messages: list[dict[str, Any]] = []
         if conversation_history:
-            for msg in conversation_history[-5:]:
+            cutoff = datetime.now() - timedelta(hours=HISTORY_HOURS_CUTOFF)
+            for msg in conversation_history[-HISTORY_MESSAGE_LIMIT:]:
+                # Skip stale messages
+                created = msg.get("created_at", "")
+                if created:
+                    try:
+                        msg_time = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                        if msg_time.tzinfo:
+                            msg_time = msg_time.replace(tzinfo=None)
+                        if msg_time < cutoff:
+                            continue
+                    except (ValueError, TypeError):
+                        pass
                 messages.append({
                     "role": msg.get("role", "user"),
-                    "content": msg.get("content", "")[:300],
+                    "content": msg.get("content", "")[:HISTORY_CHAR_LIMIT],
                 })
 
-        messages.append({"role": "user", "content": question})
+        # Build user message — include attachment content blocks if present
+        if attachment_blocks:
+            user_content = attachment_blocks + [{"type": "text", "text": question}]
+        else:
+            user_content = question
+        messages.append({"role": "user", "content": user_content})
 
-        return self.backend.complete_with_tools(
-            system=system,
-            messages=messages,
-            tools=self._FDA_TOOLS,
-            tool_executor=self._execute_tool,
-            model=self.model,
-            max_tokens=4096,
-            max_iterations=5,
+        # --- Streaming callbacks (bridge sync thread → async Discord edits) ---
+        last_update = [0.0]
+        accumulated = [""]
+
+        def _safe_edit(text: str) -> None:
+            """Edit thinking_msg from the sync executor thread."""
+            if not thinking_msg or not bot_loop:
+                return
+            try:
+                # Discord limit: 2000 chars
+                display = text[:1900] if len(text) > 1900 else text
+                future = asyncio.run_coroutine_threadsafe(
+                    thinking_msg.edit(content=display),
+                    bot_loop,
+                )
+                future.result(timeout=5)
+            except Exception:
+                pass  # Silently skip — final edit will catch up
+
+        def on_text(delta: str, snapshot: str) -> None:
+            accumulated[0] = snapshot
+            now = time.monotonic()
+            if now - last_update[0] >= 1.0:  # throttle: 1 update/sec
+                _safe_edit(snapshot)
+                last_update[0] = now
+
+        def on_tool_start(name: str, label: str) -> None:
+            display = accumulated[0]
+            suffix = f"\n\n⚙️ *{label}*"
+            _safe_edit(display + suffix)
+
+        def on_tool_end(name: str, preview: str) -> None:
+            # Remove tool indicator, show text so far
+            _safe_edit(accumulated[0])
+
+        # Extended thinking configuration
+        thinking_config = (
+            {"type": "enabled", "budget_tokens": EXTENDED_THINKING_BUDGET}
+            if ENABLE_EXTENDED_THINKING else None
         )
 
-    def _answer_question(self, question: str, conversation_history: list[dict[str, str]] = None) -> str:
+        # Combine user-defined tools with server-side web search
+        all_tools = self._FDA_TOOLS + [{"type": "web_search_20250305"}]
+
+        # Try streaming first, fall back to non-streaming
+        try:
+            response = self.backend.complete_with_tools_streaming(
+                system=system,
+                messages=messages,
+                tools=all_tools,
+                tool_executor=self._execute_tool,
+                model=self.model,
+                max_tokens=4096,
+                max_iterations=10,
+                temperature=0.7,
+                on_text=on_text,
+                on_tool_start=on_tool_start,
+                on_tool_end=on_tool_end,
+                thinking=thinking_config,
+            )
+        except Exception as e:
+            logger.warning(f"[DiscordBot] Streaming failed, falling back: {e}")
+            response = self.backend.complete_with_tools(
+                system=system,
+                messages=messages,
+                tools=all_tools,
+                tool_executor=self._execute_tool,
+                model=self.model,
+                max_tokens=4096,
+                max_iterations=10,
+                temperature=0.7,
+                thinking=thinking_config,
+            )
+
+        return response
+
+    def _answer_question(
+        self,
+        question: str,
+        conversation_history: list[dict[str, str]] = None,
+        thinking_msg: Any = None,
+        bot_loop: Any = None,
+        attachment_blocks: list[dict] = None,
+    ) -> str:
         """Answer a question using the best available backend.
 
         If the API backend is available (supports tool use), uses the
@@ -1906,13 +2272,20 @@ Keep responses concise for Discord (under 1800 characters when possible).
         Args:
             question: The user's question.
             conversation_history: Recent conversation exchanges for context continuity.
+            thinking_msg: Discord Message to edit with streaming updates.
+            bot_loop: asyncio event loop for sync→async bridging.
+            attachment_blocks: Pre-extracted Anthropic content blocks (images, docs).
         """
         # Prefer agentic tool-use when Anthropic API backend is available
         from fda.claude_backend import AnthropicAPIBackend
 
         if isinstance(self.backend, AnthropicAPIBackend):
             try:
-                return self._answer_with_tools(question, conversation_history)
+                return self._answer_with_tools(
+                    question, conversation_history,
+                    thinking_msg=thinking_msg, bot_loop=bot_loop,
+                    attachment_blocks=attachment_blocks,
+                )
             except Exception as e:
                 logger.error(f"[DiscordBot] Tool-use answer failed: {e}")
                 # Fall through to FDAAgent
@@ -2654,12 +3027,21 @@ Keep it concise but capture the important points."""
 
         bot = self._get_bot()
 
-        # Add on_ready handler to update status
+        # Add on_ready handler to update status and set presence
         @bot.event
         async def on_ready():
             logger.info(f"[DiscordBot] Logged in as {bot.user}")
             print(f"Discord bot ready: {bot.user}")
             self.state.update_agent_status("discord", "running", f"Connected as {bot.user}")
+            # Set bot as online with activity so it appears in the member list
+            import discord
+            await bot.change_presence(
+                status=discord.Status.online,
+                activity=discord.Activity(
+                    type=discord.ActivityType.watching,
+                    name="for !commands",
+                ),
+            )
 
         try:
             bot.run(self.bot_token)

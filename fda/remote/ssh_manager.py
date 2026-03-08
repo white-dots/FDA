@@ -1,5 +1,4 @@
-"""
-SSH connection manager for remote VM operations.
+"""SSH connection manager for remote VM operations.
 
 Manages SSH connections to Azure VMs, executes commands remotely,
 and reads files from the remote filesystem.
@@ -17,7 +16,7 @@ import hashlib
 import subprocess
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -131,6 +130,20 @@ class SSHManager:
         # ssh-agent has the key loaded or use ~/.ssh/config PasswordAuthentication.
         args.append(f"{self.user}@{self.host}")
         return args
+
+    def test_connection(self) -> bool:
+        """
+        Test if the SSH connection is working.
+
+        Returns:
+            True if connection is good, False if there are issues.
+        """
+        try:
+            result = self.execute("echo 'connection_test'", timeout=10)
+            return result.success and "connection_test" in result.stdout
+        except Exception as e:
+            logger.warning(f"SSH connection test failed for {self.user}@{self.host}: {e}")
+            return False
 
     def close_master(self) -> None:
         """Explicitly close the ControlMaster connection."""
@@ -304,78 +317,76 @@ class SSHManager:
 
         Args:
             directory: Remote directory path.
-            pattern: Glob pattern to match.
+            pattern: File pattern to match (default: all files).
             recursive: Whether to search recursively.
 
         Returns:
             List of file paths.
         """
         if recursive:
-            cmd = f'find {directory} -name "{pattern}" -type f 2>/dev/null'
+            command = f"find {directory} -name '{pattern}' -type f"
         else:
-            cmd = f'ls -1 {directory}/{pattern} 2>/dev/null'
+            command = f"ls -1 {directory}/{pattern} 2>/dev/null || true"
 
-        result = self.execute(cmd, timeout=30)
-        if result.success:
-            return [line for line in result.stdout.strip().split("\n") if line]
+        result = self.execute(command, timeout=30)
+        if result.success and result.stdout:
+            return [line.strip() for line in result.stdout.split("\n") if line.strip()]
         return []
 
-    def file_exists(self, remote_path: str) -> bool:
-        """Check if a file exists on the remote host."""
-        result = self.execute(f"test -f {remote_path} && echo 'yes' || echo 'no'")
-        return result.success and "yes" in result.stdout
-
-    def get_git_status(self, repo_path: str) -> Optional[dict]:
+    def warmup(self) -> bool:
         """
-        Get git status of a repository on the remote host.
-
-        Args:
-            repo_path: Path to the git repository.
+        Warm up the SSH connection by establishing the ControlMaster.
 
         Returns:
-            Dict with branch, commit hash, and dirty status.
+            True if warmup succeeded.
         """
-        result = self.execute(
-            'echo "BRANCH:$(git rev-parse --abbrev-ref HEAD)"; '
-            'echo "COMMIT:$(git rev-parse --short HEAD)"; '
-            'echo "DIRTY:$(git status --porcelain | wc -l)"',
-            cwd=repo_path,
-        )
+        try:
+            result = self.execute("echo warmup", timeout=15)
+            return result.success
+        except Exception as e:
+            logger.warning(f"SSH warmup failed for {self.user}@{self.host}: {e}")
+            return False
 
+    def get_git_status(self, repo_path: str) -> Optional[dict[str, Any]]:
+        """
+        Get git status information from a remote repository.
+
+        Args:
+            repo_path: Path to the git repository on remote host.
+
+        Returns:
+            Dict with git status info, or None if not a git repo.
+        """
+        # Check if it's a git repo
+        result = self.execute(f"cd {repo_path} && git rev-parse --git-dir", timeout=10)
         if not result.success:
             return None
 
-        info = {}
-        for line in result.stdout.strip().split("\n"):
-            if ":" in line:
-                key, value = line.split(":", 1)
-                info[key.strip().lower()] = value.strip()
+        status_info = {}
 
-        return info
+        # Get current branch
+        result = self.execute(f"cd {repo_path} && git branch --show-current", timeout=10)
+        if result.success:
+            status_info["branch"] = result.stdout.strip()
 
-    def warmup(self) -> bool:
-        """Establish the ControlMaster connection proactively.
+        # Get last commit
+        result = self.execute(f"cd {repo_path} && git log -1 --oneline", timeout=10)
+        if result.success:
+            status_info["last_commit"] = result.stdout.strip()
 
-        Call this at startup so the first real command doesn't pay the
-        ~1.5s TCP+SSH handshake cost. Subsequent commands via the same
-        SSHManager reuse the master connection (~50ms).
+        # Get status
+        result = self.execute(f"cd {repo_path} && git status --porcelain", timeout=10)
+        if result.success:
+            changes = result.stdout.strip().split("\n") if result.stdout.strip() else []
+            status_info["modified_files"] = len(changes)
+            status_info["has_changes"] = len(changes) > 0
 
-        Returns:
-            True if the master connection was established.
-        """
-        if self._master_started and self._control_path.exists():
-            return True
-        result = self.execute("true", timeout=15)
-        return result.success
+        return status_info
 
-    def test_connection(self) -> bool:
-        """
-        Test SSH connectivity to the remote host.
+    def __enter__(self):
+        """Context manager entry."""
+        return self
 
-        Also warms up the ControlMaster connection.
-
-        Returns:
-            True if the connection succeeds.
-        """
-        result = self.execute("echo 'FDA_CONNECTION_OK'", timeout=15)
-        return result.success and "FDA_CONNECTION_OK" in result.stdout
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit - close the master connection."""
+        self.close_master()

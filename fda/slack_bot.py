@@ -9,11 +9,14 @@ Requires:
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
 import re
 import threading
+import time
+import urllib.request
 from pathlib import Path
 from typing import Any, Optional
 from datetime import datetime, timedelta
@@ -24,6 +27,16 @@ from fda.config import (
     SLACK_APP_TOKEN_ENV,
     SLACK_CHANNEL_ID_ENV,
     MODEL_FDA,
+    ENABLE_EXTENDED_THINKING,
+    EXTENDED_THINKING_BUDGET,
+    MAX_IMAGE_UPLOAD_MB,
+    MAX_DOCUMENT_UPLOAD_MB,
+    SUPPORTED_IMAGE_TYPES,
+    SUPPORTED_DOC_TYPES,
+    SUPPORTED_TEXT_EXTENSIONS,
+    HISTORY_MESSAGE_LIMIT,
+    HISTORY_CHAR_LIMIT,
+    HISTORY_HOURS_CUTOFF,
 )
 from fda.state.project_state import ProjectState
 
@@ -65,11 +78,13 @@ Your scope is the user's entire work environment:
 - Anything they need help tracking or remembering
 
 TOOL STRATEGY — choose the right tool for the job:
+- *run_local_command*: For quick shell commands on this Mac Mini (ls, cat, grep, find, ps, etc.). Fast and direct. Use this FIRST for most local queries — listing directories, reading files, searching code, checking processes. ALWAYS prefer this over run_local_task for simple questions.
+- *run_local_task*: For complex local code changes requiring full analysis pipeline. ONLY use when you need to modify code, not just read or query.
 - *run_remote_command*: For quick shell commands on client VMs (ls, cat, grep, airflow CLI, systemctl, etc.). Fast and direct. Use this FIRST for most VM queries.
-- *run_remote_task*: For complex code analysis requiring reading + understanding multiple source files (debugging, refactoring, investigating why something broke). Slower but deeper. Only use when you need to analyze code, not just check status.
+- *run_remote_task*: For complex code analysis on remote VMs requiring reading + understanding multiple source files. Only use when you need to analyze/modify code, not just check status.
 - *search_journal*: For recalling past work. All remote/local worker results are journaled — investigations, code changes, deployments, errors. Ask the journal before re-running expensive tasks.
 
-When investigating a problem on the VM, prefer multiple small run_remote_command calls over one big run_remote_task. You can run ls, cat, grep, tail logs, check service status — just like working in a terminal.
+When investigating a problem, prefer multiple small command calls (local or remote) over the heavy task pipeline. You can run ls, cat, grep, tail logs, check service status — just like working in a terminal. Only escalate to run_*_task when you actually need code analysis or modifications.
 
 Keep responses concise:
 - Short paragraphs
@@ -103,6 +118,8 @@ class SlackBotAgent(BaseAgent):
         local_task_dispatch: Optional[Any] = None,
         remote_task_dispatch: Optional[Any] = None,
         remote_command_dispatch: Optional[Any] = None,
+        local_command_dispatch: Optional[Any] = None,
+        local_organize_dispatch: Optional[Any] = None,
         approval_manager: Optional[Any] = None,
         restart_callback: Optional[Any] = None,
     ):
@@ -120,6 +137,10 @@ class SlackBotAgent(BaseAgent):
                                   This is orchestrator._handle_remote_task_request.
             remote_command_dispatch: Optional callback(command, client_id, cwd) -> result dict.
                                      This is orchestrator._handle_remote_command.
+            local_command_dispatch: Optional callback(command, cwd) -> result dict.
+                                    This is orchestrator._handle_local_command.
+            local_organize_dispatch: Optional callback(target_path, instructions) -> result dict.
+                                      This is orchestrator._handle_local_organize_request.
             approval_manager: Optional ApprovalManager for approve/reject commands.
             restart_callback: Optional callback() to restart FDA.
         """
@@ -136,6 +157,8 @@ class SlackBotAgent(BaseAgent):
         self._local_task_dispatch = local_task_dispatch
         self._remote_task_dispatch = remote_task_dispatch
         self._remote_command_dispatch = remote_command_dispatch
+        self._local_command_dispatch = local_command_dispatch
+        self._local_organize_dispatch = local_organize_dispatch
         self._approval_manager = approval_manager
         self._restart_callback = restart_callback
 
@@ -231,7 +254,7 @@ class SlackBotAgent(BaseAgent):
         # listener and causing subsequent messages to time out.
         threading.Thread(
             target=self._process_message_safe,
-            args=(text, channel, user_id, thread_ts, _say, client),
+            args=(text, channel, user_id, thread_ts, _say, client, event),
             daemon=True,
         ).start()
 
@@ -257,7 +280,7 @@ class SlackBotAgent(BaseAgent):
 
         threading.Thread(
             target=self._process_message_safe,
-            args=(text, channel, user_id, thread_ts, _say, client),
+            args=(text, channel, user_id, thread_ts, _say, client, event),
             daemon=True,
         ).start()
 
@@ -280,6 +303,7 @@ class SlackBotAgent(BaseAgent):
         thread_ts: str,
         say: Any,
         client: Any,
+        event: dict = None,
     ) -> None:
         """Process an incoming message — commands or questions."""
         # Store context so tools can post intermediate updates
@@ -303,6 +327,9 @@ class SlackBotAgent(BaseAgent):
             return
         if text == "!alerts":
             self._handle_alerts(say, thread_ts)
+            return
+        if text.startswith("!organize"):
+            self._handle_organize(text, channel, say, thread_ts, client)
             return
         if text.startswith("!local"):
             self._handle_local(text, channel, say, thread_ts, client)
@@ -334,6 +361,9 @@ class SlackBotAgent(BaseAgent):
             pass
 
         try:
+            # Extract file attachments (images, PDFs, text files)
+            attachment_blocks = self._extract_slack_attachments(event or {}, client)
+
             # Save user message
             self.state.add_conversation_message(
                 channel_id=channel,
@@ -343,8 +373,14 @@ class SlackBotAgent(BaseAgent):
                 username=username,
             )
 
-            # Get answer
-            response = self._answer_question(text, chat_id=channel)
+            # Check if we'll use the streaming path (API backend)
+            from fda.claude_backend import AnthropicAPIBackend
+            is_streaming = isinstance(self.backend, AnthropicAPIBackend)
+
+            # Get answer — streaming path handles its own message posting
+            response = self._answer_question(
+                text, chat_id=channel, attachment_blocks=attachment_blocks,
+            )
 
             # Save assistant response
             self.state.add_conversation_message(
@@ -354,10 +390,11 @@ class SlackBotAgent(BaseAgent):
                 source="slack",
             )
 
-            # Format and send
-            formatted = self._to_slack_markdown(response)
-            for chunk in self._split_message(formatted):
-                say(text=chunk, thread_ts=thread_ts)
+            # Non-streaming path: post the response the old way
+            if not is_streaming:
+                formatted = self._to_slack_markdown(response)
+                for chunk in self._split_message(formatted):
+                    say(text=chunk, thread_ts=thread_ts)
 
             # Update reaction
             try:
@@ -410,6 +447,7 @@ class SlackBotAgent(BaseAgent):
                 "`!tasks` — List your tasks\n"
                 "`!alerts` — Show pending alerts\n"
                 "`!local <task>` — Dispatch task to worker agent (VM/codebase)\n"
+                "`!organize <path> [instructions]` — Sort files in a directory\n"
                 "`!pending` — List pending approvals\n"
                 "`!approve <id>` — Approve a code change\n"
                 "`!reject <id> [reason]` — Reject a code change\n"
@@ -588,6 +626,108 @@ class SlackBotAgent(BaseAgent):
 
         except Exception as e:
             logger.error(f"[SlackBot] Error in !local command: {e}")
+            say(text=f":x: Error: {e}", thread_ts=thread_ts)
+
+    # ------------------------------------------------------------------
+    # File organization command
+    # ------------------------------------------------------------------
+
+    def _handle_organize(
+        self,
+        text: str,
+        channel: str,
+        say: Any,
+        thread_ts: str,
+        client: Any,
+    ) -> None:
+        """Handle !organize [path] [instructions] — organize local files."""
+        args = text[len("!organize"):].strip()
+        if not args:
+            say(
+                text=(
+                    "Usage: `!organize <path> [instructions]`\n\n"
+                    "Examples:\n"
+                    "- `!organize ~/Downloads`\n"
+                    "- `!organize ~/Desktop sort by file type`\n"
+                    "- `!organize ~/Documents/projects group related files`"
+                ),
+                thread_ts=thread_ts,
+            )
+            return
+
+        if not self._local_organize_dispatch:
+            say(
+                text="File organization not available. Make sure FDA is fully started.",
+                thread_ts=thread_ts,
+            )
+            return
+
+        # Parse path and instructions — first token is the path
+        parts = args.split(None, 1)
+        target_path = os.path.expanduser(parts[0])
+        instructions = parts[1] if len(parts) > 1 else ""
+
+        say(
+            text=(
+                f":broom: Scanning and organizing `{target_path}`...\n\n"
+                f"{('*Instructions:* ' + instructions) if instructions else ''}\n\n"
+                "Git repositories will be left untouched."
+            ),
+            thread_ts=thread_ts,
+        )
+
+        try:
+            try:
+                client.reactions_add(
+                    channel=channel, name="gear", timestamp=thread_ts,
+                )
+            except Exception:
+                pass
+
+            progress_cb = self._make_progress_callback(say, thread_ts)
+            result = self._local_organize_dispatch(
+                target_path, instructions, progress_callback=progress_cb,
+            )
+
+            if result.get("success"):
+                moves = result.get("moves", [])
+                deletions = result.get("deletions", [])
+                repos_skipped = result.get("repos_skipped", [])
+                summary = result.get("summary", "")
+
+                response = f":white_check_mark: *Organization complete*\n\n"
+                if moves:
+                    response += f"*Moved:* {len(moves)} files\n"
+                if deletions:
+                    response += f"*Deleted junk:* {len(deletions)} files\n"
+                if repos_skipped:
+                    response += f"*Git repos skipped:* {len(repos_skipped)}\n"
+                if summary:
+                    response += f"\n{summary[:1500]}"
+
+                for chunk in self._split_message(response):
+                    say(text=chunk, thread_ts=thread_ts)
+            else:
+                error = result.get("error", "Unknown error")
+                say(
+                    text=f":x: Organization failed.\n\nError: {error[:500]}",
+                    thread_ts=thread_ts,
+                )
+
+            try:
+                client.reactions_remove(
+                    channel=channel, name="gear", timestamp=thread_ts,
+                )
+                client.reactions_add(
+                    channel=channel,
+                    name="white_check_mark" if result.get("success") else "x",
+                    timestamp=thread_ts,
+                )
+            except Exception:
+                pass
+
+        except Exception as e:
+            logger.error(f"[SlackBot] Error in !organize command: {e}")
             say(text=f":x: Error: {e}", thread_ts=thread_ts)
 
     # ------------------------------------------------------------------
@@ -961,8 +1101,39 @@ class SlackBotAgent(BaseAgent):
             },
         },
         {
+            "name": "run_local_command",
+            "description": (
+                "Execute a shell command on the local Mac Mini. "
+                "Use this for quick queries like listing files/directories, "
+                "searching code, checking processes, reading files, etc. "
+                "(e.g. 'ls ~/Documents', 'grep -r pattern dir/', "
+                "'cat file.py', 'find . -name \"*.py\"', 'ps aux | grep fda'). "
+                "PREFER THIS over run_local_task when you just need command "
+                "output — not full code analysis/changes. Returns stdout/stderr directly."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Shell command to execute locally.",
+                    },
+                    "cwd": {
+                        "type": "string",
+                        "description": "Working directory. Defaults to ~/Documents.",
+                    },
+                },
+                "required": ["command"],
+            },
+        },
+        {
             "name": "run_local_task",
-            "description": "Dispatch a task to the local worker agent that operates on the Mac Mini filesystem. Use for tasks on the local FDA codebase or other local projects.",
+            "description": (
+                "Dispatch a complex task to the local worker agent for full "
+                "code analysis and changes on the Mac Mini filesystem. "
+                "Use ONLY when you need code modifications, not for simple "
+                "queries — use run_local_command for those instead."
+            ),
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -1159,6 +1330,28 @@ class SlackBotAgent(BaseAgent):
                 except Exception as e:
                     return f"Error dispatching {dispatch_label.lower()} task: {e}"
 
+            elif tool_name == "run_local_command":
+                command = tool_input.get("command", "")
+                cwd = tool_input.get("cwd")
+
+                if not self._local_command_dispatch:
+                    return "Local command dispatch not available."
+                try:
+                    result = self._local_command_dispatch(command, cwd=cwd)
+                    if result.get("success"):
+                        output = result.get("stdout", "")
+                        stderr = result.get("stderr", "")
+                        parts = []
+                        if output:
+                            parts.append(output[:3000])
+                        if stderr:
+                            parts.append(f"STDERR:\n{stderr[:1000]}")
+                        return "\n".join(parts) if parts else "(no output)"
+                    else:
+                        return f"Command failed: {result.get('error', 'unknown')}"
+                except Exception as e:
+                    return f"Error running local command: {e}"
+
             elif tool_name == "run_remote_command":
                 command = tool_input.get("command", "")
                 client_id = tool_input.get("client_id")
@@ -1191,50 +1384,278 @@ class SlackBotAgent(BaseAgent):
             logger.error(f"[SlackBot] Tool {tool_name} error: {e}")
             return f"Error executing {tool_name}: {e}"
 
-    def _answer_with_tools(self, question: str, chat_id: str) -> str:
-        """Answer using the API backend's agentic tool-use loop."""
+    def _extract_slack_attachments(self, event: dict, client: Any) -> list[dict]:
+        """Download Slack file attachments and build Anthropic content blocks.
+
+        Supports images (JPEG/PNG/GIF/WebP), PDFs, and text-based source files.
+        """
+        content_blocks: list[dict] = []
+        files = event.get("files", [])
+        if not files:
+            return content_blocks
+
+        bot_token = getattr(client, "token", None) or self.bot_token
+        for f in files:
+            try:
+                mime = f.get("mimetype", "")
+                filename = f.get("name", "")
+                size = f.get("size", 0)
+                ext = Path(filename).suffix.lower()
+                url = f.get("url_private", "")
+                if not url:
+                    continue
+
+                if mime in SUPPORTED_IMAGE_TYPES:
+                    if size > MAX_IMAGE_UPLOAD_MB * 1024 * 1024:
+                        continue
+                    req = urllib.request.Request(url)
+                    req.add_header("Authorization", f"Bearer {bot_token}")
+                    data = urllib.request.urlopen(req, timeout=30).read()
+                    content_blocks.append({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": mime,
+                            "data": base64.b64encode(data).decode(),
+                        },
+                    })
+                elif mime in SUPPORTED_DOC_TYPES:
+                    if size > MAX_DOCUMENT_UPLOAD_MB * 1024 * 1024:
+                        continue
+                    req = urllib.request.Request(url)
+                    req.add_header("Authorization", f"Bearer {bot_token}")
+                    data = urllib.request.urlopen(req, timeout=30).read()
+                    content_blocks.append({
+                        "type": "document",
+                        "source": {
+                            "type": "base64",
+                            "media_type": mime,
+                            "data": base64.b64encode(data).decode(),
+                        },
+                    })
+                elif ext in SUPPORTED_TEXT_EXTENSIONS:
+                    if size > 1 * 1024 * 1024:
+                        continue
+                    req = urllib.request.Request(url)
+                    req.add_header("Authorization", f"Bearer {bot_token}")
+                    data = urllib.request.urlopen(req, timeout=30).read()
+                    text_content = data.decode("utf-8", errors="replace")[:8000]
+                    content_blocks.append({
+                        "type": "text",
+                        "text": f"[File: {filename}]\n```\n{text_content}\n```",
+                    })
+            except Exception as e:
+                logger.warning(f"[SlackBot] Failed to process file {f.get('name')}: {e}")
+
+        return content_blocks
+
+    def _build_system_prompt(self) -> str:
+        """Build the full system prompt with dynamic context."""
         user_name = self.state.get_context("user_name") or "the user"
         today = datetime.now().strftime("%Y-%m-%d (%A)")
-
-        system = SLACK_SYSTEM_PROMPT + f"""
+        return SLACK_SYSTEM_PROMPT + f"""
 Today is {today}. The user's name is {user_name}.
 
 You have tools to look up the user's data. Use them when you need information to answer the question — don't guess. If the user asks about chats, notes, tasks, calendar, or alerts, call the appropriate tool first.
+
+If the user sends images or files, analyze them directly. You have full vision capabilities.
 """
 
+    def _build_conversation_messages(
+        self,
+        chat_id: str,
+        question: str,
+        attachment_blocks: list[dict] = None,
+    ) -> list[dict[str, Any]]:
+        """Build the messages array with recent history + current question."""
         messages: list[dict[str, Any]] = []
         try:
-            recent = self.state.get_messages_recent(channel_id=str(chat_id), limit=5)
+            recent = self.state.get_messages_recent(
+                channel_id=str(chat_id), limit=HISTORY_MESSAGE_LIMIT,
+            )
+            cutoff = datetime.now() - timedelta(hours=HISTORY_HOURS_CUTOFF)
             for msg in recent:
+                created = msg.get("created_at", "")
+                if created:
+                    try:
+                        msg_time = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                        if msg_time.tzinfo:
+                            msg_time = msg_time.replace(tzinfo=None)
+                        if msg_time < cutoff:
+                            continue
+                    except (ValueError, TypeError):
+                        pass
                 messages.append({
                     "role": msg["role"],
-                    "content": msg["content"][:300],
+                    "content": msg["content"][:HISTORY_CHAR_LIMIT],
                 })
         except Exception:
             pass
 
-        messages.append({"role": "user", "content": question})
+        # Build user message — include attachment content blocks if present
+        if attachment_blocks:
+            user_content = attachment_blocks + [{"type": "text", "text": question}]
+        else:
+            user_content = question
+        messages.append({"role": "user", "content": user_content})
+        return messages
 
-        return self.backend.complete_with_tools(
-            system=system,
-            messages=messages,
-            tools=self._FDA_TOOLS,
-            tool_executor=self._execute_tool,
-            model=self.model,
-            max_tokens=4096,
-            max_iterations=10,
+    def _answer_with_tools(
+        self,
+        question: str,
+        chat_id: str,
+        attachment_blocks: list[dict] = None,
+    ) -> str:
+        """Answer using the API backend's streaming agentic tool-use loop.
+
+        Streams tokens into a Slack message via chat.update for a
+        real-time typing experience. Falls back to non-streaming
+        if streaming is unavailable.
+        """
+        system = self._build_system_prompt()
+        messages = self._build_conversation_messages(
+            chat_id, question, attachment_blocks=attachment_blocks,
         )
+
+        # Post an initial "Thinking..." message to stream into
+        client = self._current_client
+        channel = self._current_channel
+        thread_ts = self._current_thread_ts
+        msg_ts = None  # timestamp of the streaming message
+
+        if client and channel and thread_ts:
+            try:
+                result = client.chat_postMessage(
+                    channel=channel,
+                    text=":hourglass_flowing_sand: Thinking...",
+                    thread_ts=thread_ts,
+                )
+                msg_ts = result.get("ts")
+            except Exception:
+                pass
+
+        # Streaming callbacks — throttled edit-in-place
+        last_update = [0.0]
+        accumulated = [""]
+
+        def on_text(delta: str, snapshot: str) -> None:
+            accumulated[0] = snapshot
+            if not msg_ts or not client:
+                return
+            now = time.monotonic()
+            if now - last_update[0] >= 0.8:  # throttle: ~1.2 updates/sec
+                try:
+                    display = self._to_slack_markdown(snapshot)
+                    # Slack limit: 4000 chars — truncate live preview
+                    if len(display) > 3900:
+                        display = display[:3900] + "\n..."
+                    client.chat_update(
+                        channel=channel, ts=msg_ts, text=display,
+                    )
+                    last_update[0] = now
+                except Exception:
+                    pass
+
+        def on_tool_start(name: str, label: str) -> None:
+            if not msg_ts or not client:
+                return
+            try:
+                display = self._to_slack_markdown(accumulated[0])
+                suffix = f"\n\n:gear: _{label}_"
+                client.chat_update(
+                    channel=channel, ts=msg_ts,
+                    text=(display + suffix)[:3900],
+                )
+            except Exception:
+                pass
+
+        def on_tool_end(name: str, preview: str) -> None:
+            if not msg_ts or not client:
+                return
+            try:
+                # Remove tool indicator, show text so far
+                display = self._to_slack_markdown(accumulated[0])
+                client.chat_update(
+                    channel=channel, ts=msg_ts, text=display[:3900],
+                )
+            except Exception:
+                pass
+
+        # Extended thinking configuration
+        thinking_config = (
+            {"type": "enabled", "budget_tokens": EXTENDED_THINKING_BUDGET}
+            if ENABLE_EXTENDED_THINKING else None
+        )
+
+        # Combine user-defined tools with server-side web search
+        all_tools = self._FDA_TOOLS + [{"type": "web_search_20250305"}]
+
+        # Try streaming first, fall back to non-streaming
+        try:
+            response = self.backend.complete_with_tools_streaming(
+                system=system,
+                messages=messages,
+                tools=all_tools,
+                tool_executor=self._execute_tool,
+                model=self.model,
+                max_tokens=4096,
+                max_iterations=10,
+                temperature=0.7,
+                on_text=on_text,
+                on_tool_start=on_tool_start,
+                on_tool_end=on_tool_end,
+                thinking=thinking_config,
+            )
+        except Exception as e:
+            logger.warning(f"[SlackBot] Streaming failed, falling back: {e}")
+            response = self.backend.complete_with_tools(
+                system=system,
+                messages=messages,
+                tools=all_tools,
+                tool_executor=self._execute_tool,
+                model=self.model,
+                max_tokens=4096,
+                max_iterations=10,
+                temperature=0.7,
+                thinking=thinking_config,
+            )
+
+        # Final polished edit (or delete streaming msg + post as new messages)
+        formatted = self._to_slack_markdown(response)
+        if msg_ts and client:
+            try:
+                chunks = self._split_message(formatted)
+                # Update the streaming message with final first chunk
+                client.chat_update(
+                    channel=channel, ts=msg_ts, text=chunks[0],
+                )
+                # Post overflow chunks as new messages
+                for chunk in chunks[1:]:
+                    client.chat_postMessage(
+                        channel=channel, text=chunk, thread_ts=thread_ts,
+                    )
+            except Exception:
+                pass
+
+        return response
 
     # ------------------------------------------------------------------
     # Answer question — dispatches to agentic or intent-based routing
     # ------------------------------------------------------------------
 
-    def _answer_question(self, question: str, chat_id: str = "slack") -> str:
+    def _answer_question(
+        self,
+        question: str,
+        chat_id: str = "slack",
+        attachment_blocks: list[dict] = None,
+    ) -> str:
         """Answer a question using the best available backend."""
         from fda.claude_backend import AnthropicAPIBackend
 
         if isinstance(self.backend, AnthropicAPIBackend):
-            return self._answer_with_tools(question, chat_id)
+            return self._answer_with_tools(
+                question, chat_id, attachment_blocks=attachment_blocks,
+            )
 
         return self._answer_with_intent_router(question, chat_id)
 
