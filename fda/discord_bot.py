@@ -2219,7 +2219,7 @@ Keep responses concise for Discord (under 1800 characters when possible). Use **
         )
 
         # Combine user-defined tools with server-side web search
-        all_tools = self._FDA_TOOLS + [{"type": "web_search_20250305"}]
+        all_tools = self._FDA_TOOLS + [{"type": "web_search_20250305", "name": "web_search"}]
 
         # Try streaming first, fall back to non-streaming
         try:

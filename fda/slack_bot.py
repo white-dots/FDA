@@ -1588,7 +1588,7 @@ If the user sends images or files, analyze them directly. You have full vision c
         )
 
         # Combine user-defined tools with server-side web search
-        all_tools = self._FDA_TOOLS + [{"type": "web_search_20250305"}]
+        all_tools = self._FDA_TOOLS + [{"type": "web_search_20250305", "name": "web_search"}]
 
         # Try streaming first, fall back to non-streaming
         try:
