@@ -28,6 +28,7 @@ from fda.config import (
     DISCORD_BOT_TOKEN_ENV,
     DISCORD_CLIENT_ID_ENV,
     OPENAI_API_KEY_ENV,
+    PROJECT_ROOT,
     TELEGRAM_BOT_TOKEN_ENV,
 )
 from fda.state.project_state import ProjectState
@@ -533,6 +534,54 @@ SETUP_PAGE_HTML = """
         .chat-message.agent {
             background: var(--bg);
             color: var(--text);
+            white-space: pre-wrap;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        }
+
+        .chat-message.agent code {
+            background: #e2e8f0;
+            padding: 0.1rem 0.4rem;
+            border-radius: 4px;
+            font-family: 'SF Mono', Monaco, 'Cascadia Code', monospace;
+            font-size: 0.85em;
+        }
+
+        .chat-message.agent pre {
+            background: #1e293b;
+            color: #e2e8f0;
+            padding: 0.75rem;
+            border-radius: 6px;
+            overflow-x: auto;
+            margin: 0.5rem 0;
+            font-size: 0.85em;
+        }
+
+        .chat-message.agent pre code {
+            background: none;
+            padding: 0;
+            color: inherit;
+        }
+
+        .chat-source {
+            font-size: 0.65rem;
+            opacity: 0.5;
+            margin-top: 0.25rem;
+        }
+
+        .chat-hint {
+            text-align: center;
+            color: var(--text-muted);
+            font-size: 0.8rem;
+            padding: 0.5rem;
+            border-top: 1px solid var(--border);
+            background: var(--bg);
+        }
+
+        .chat-hint code {
+            background: #e2e8f0;
+            padding: 0.1rem 0.3rem;
+            border-radius: 3px;
+            font-size: 0.85em;
         }
 
         .chat-input-container {
@@ -878,12 +927,15 @@ SETUP_PAGE_HTML = """
                     <div class="chat-header" id="chat-header">Chat with FDA</div>
                     <div class="chat-messages" id="chat-messages">
                         <div style="text-align: center; color: var(--text-muted); padding: 2rem;">
-                            Select an agent and start chatting
+                            Try <code>help</code> to see commands, or just start chatting.
                         </div>
                     </div>
                     <div class="chat-input-container">
-                        <textarea class="chat-input" id="chat-input" placeholder="Type your message..." rows="1" onkeydown="handleChatKeydown(event)"></textarea>
+                        <textarea class="chat-input" id="chat-input" placeholder="Try: status, tasks, help, or any question..." rows="1" onkeydown="handleChatKeydown(event)"></textarea>
                         <button class="btn-primary" onclick="sendChatMessage()">Send</button>
+                    </div>
+                    <div class="chat-hint">
+                        Local commands: <code>status</code> <code>tasks</code> <code>journal</code> <code>note ...</code> <code>add task ...</code> <code>ls</code> <code>help</code>
                     </div>
                 </div>
             </div>
@@ -1168,6 +1220,21 @@ SETUP_PAGE_HTML = """
             renderChatHistory();
         }
 
+        function renderMarkdown(text) {
+            // Simple markdown renderer for chat messages
+            let html = escapeHtml(text);
+            // Code blocks (```...```)
+            html = html.replace(/```([\\s\\S]*?)```/g, '<pre><code>$1</code></pre>');
+            // Inline code
+            html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+            // Bold
+            html = html.replace(/\\*\\*(.+?)\\*\\*/g, '<strong>$1</strong>');
+            // Headers
+            html = html.replace(/^### (.+)$/gm, '<strong style="font-size:0.9em;">$1</strong>');
+            html = html.replace(/^## (.+)$/gm, '<strong style="font-size:1em;">$1</strong>');
+            return html;
+        }
+
         function renderChatHistory() {
             const container = document.getElementById('chat-messages');
             const history = chatHistories[currentAgent];
@@ -1175,7 +1242,7 @@ SETUP_PAGE_HTML = """
             if (history.length === 0) {
                 container.innerHTML = `
                     <div style="text-align: center; color: var(--text-muted); padding: 2rem;">
-                        Start a conversation with this agent
+                        Try <code>help</code> to see commands, or just start chatting.
                     </div>
                 `;
                 return;
@@ -1183,7 +1250,8 @@ SETUP_PAGE_HTML = """
 
             container.innerHTML = history.map(msg => `
                 <div class="chat-message ${msg.role}">
-                    ${escapeHtml(msg.content)}
+                    ${msg.role === 'agent' ? renderMarkdown(msg.content) : escapeHtml(msg.content)}
+                    ${msg.source ? '<div class="chat-source">' + msg.source + '</div>' : ''}
                 </div>
             `).join('');
 
@@ -1233,7 +1301,8 @@ SETUP_PAGE_HTML = """
                 typingDiv.remove();
 
                 if (result.success) {
-                    chatHistories[currentAgent].push({ role: 'agent', content: result.response });
+                    const sourceLabel = result.source === 'claude' ? 'via Claude API' : 'local';
+                    chatHistories[currentAgent].push({ role: 'agent', content: result.response, source: sourceLabel });
                 } else {
                     chatHistories[currentAgent].push({ role: 'agent', content: 'Error: ' + (result.error || 'Failed to get response') });
                 }
@@ -1718,6 +1787,218 @@ def create_setup_app() -> Any:
     # Chat API
     # ============================================
 
+    # ============================================
+    # Local Chat Handler
+    # ============================================
+
+    def _handle_local_command(msg: str) -> tuple[bool, str]:
+        """
+        Try to handle a message using local capabilities (no API key needed).
+
+        Returns (handled, response). If handled is False, fall through to Claude API.
+        """
+        msg_lower = msg.lower().strip()
+
+        # --- Status ---
+        if msg_lower in ("status", "show status", "system status", "how are things"):
+            tasks = state.get_tasks()
+            alerts = state.get_alerts(acknowledged=False)
+            by_status = {}
+            for t in tasks:
+                s = t.get("status", "pending")
+                by_status.setdefault(s, []).append(t)
+
+            lines = ["Here's the current system status:\n"]
+            lines.append(f"Tasks: {len(tasks)} total")
+            for s in ["in_progress", "pending", "blocked", "completed"]:
+                if s in by_status:
+                    lines.append(f"  {s.replace('_', ' ').title()}: {len(by_status[s])}")
+            if alerts:
+                lines.append(f"\nAlerts: {len(alerts)} unacknowledged")
+                for a in alerts[:3]:
+                    lines.append(f"  [{a.get('level', '?')}] {a.get('message', '')}")
+            else:
+                lines.append("\nNo unacknowledged alerts.")
+            return True, "\n".join(lines)
+
+        # --- Task listing ---
+        if any(msg_lower.startswith(p) for p in [
+            "list tasks", "show tasks", "tasks", "my tasks", "what tasks",
+            "show my tasks", "what are my tasks", "what's on my plate",
+        ]):
+            tasks = state.get_tasks()
+            if not tasks:
+                return True, "No tasks found. Add one with: `fda task add \"your task\"`"
+            lines = [f"You have {len(tasks)} task(s):\n"]
+            status_icons = {"completed": "[done]", "in_progress": "[...]", "blocked": "[!!]", "pending": "[ ]"}
+            for t in tasks:
+                icon = status_icons.get(t.get("status", "pending"), "[ ]")
+                pri = t.get("priority", "medium")
+                pri_mark = "!!!" if pri == "high" else "!!" if pri == "medium" else "!"
+                lines.append(f"  {icon} {t.get('title', 'Untitled')} {pri_mark}")
+                lines.append(f"      id: {t.get('id')}  owner: {t.get('owner', '-')}  status: {t.get('status', 'pending')}")
+            return True, "\n".join(lines)
+
+        # --- Add task ---
+        for prefix in ["add task ", "create task ", "new task ", "task add "]:
+            if msg_lower.startswith(prefix):
+                title = msg[len(prefix):].strip().strip('"').strip("'")
+                if not title:
+                    return True, "Please provide a task title. Example: `add task Review PR #42`"
+                task_id = state.add_task(title=title, description=title, owner="fda", priority="medium")
+                return True, f"Task created: **{task_id}**\n  Title: {title}\n  Status: pending"
+
+        # --- Complete task ---
+        for prefix in ["complete task ", "done task ", "finish task ", "close task "]:
+            if msg_lower.startswith(prefix):
+                task_id = msg[len(prefix):].strip()
+                state.update_task(task_id, status="completed")
+                return True, f"Task **{task_id}** marked as completed."
+
+        # --- Journal search ---
+        for prefix in ["search journal ", "journal search ", "search notes ", "find in journal "]:
+            if msg_lower.startswith(prefix):
+                query = msg[len(prefix):].strip()
+                if not query:
+                    return True, "Please provide a search query."
+                from fda.journal.retriever import JournalRetriever
+                retriever = JournalRetriever()
+                results = retriever.retrieve(query_text=query, top_n=5)
+                if not results:
+                    return True, f"No journal entries found for '{query}'."
+                lines = [f"Found {len(results)} result(s) for '{query}':\n"]
+                for r in results:
+                    score = r.get("score", 0)
+                    lines.append(f"  - **{r.get('summary', 'Untitled')}** (score: {score:.3f})")
+                    lines.append(f"    Author: {r.get('author', '?')} | Tags: {', '.join(r.get('tags', []))}")
+                return True, "\n".join(lines)
+
+        # --- Write journal ---
+        for prefix in ["write journal ", "journal write ", "note ", "remember "]:
+            if msg_lower.startswith(prefix):
+                content = msg[len(prefix):].strip()
+                if not content:
+                    return True, "Please provide content for the journal entry."
+                from fda.journal.writer import JournalWriter
+                writer = JournalWriter()
+                summary = content[:80] + ("..." if len(content) > 80 else "")
+                path = writer.write_entry(
+                    author="user",
+                    tags=["chat", "note"],
+                    summary=summary,
+                    content=content,
+                )
+                return True, f"Journal entry saved: {path.name}"
+
+        # --- Show journal entries ---
+        if msg_lower in ("journal", "show journal", "journal entries", "show notes", "notes"):
+            from fda.journal.retriever import JournalRetriever
+            retriever = JournalRetriever()
+            results = retriever.retrieve(query_text="", top_n=10)
+            if not results:
+                return True, "No journal entries yet. Write one with: `note your text here`"
+            lines = [f"Recent journal entries ({len(results)}):\n"]
+            for r in results:
+                lines.append(f"  - **{r.get('summary', 'Untitled')}**")
+                lines.append(f"    Author: {r.get('author', '?')} | Tags: {', '.join(r.get('tags', []))}")
+                lines.append(f"    Created: {r.get('created_at', '?')[:10]}")
+            return True, "\n".join(lines)
+
+        # --- Alerts ---
+        if msg_lower in ("alerts", "show alerts", "my alerts"):
+            alerts = state.get_alerts(acknowledged=False)
+            if not alerts:
+                return True, "No unacknowledged alerts."
+            lines = [f"{len(alerts)} alert(s):\n"]
+            for a in alerts:
+                lines.append(f"  [{a.get('level', '?')}] {a.get('message', '')} (from {a.get('source', '?')})")
+            return True, "\n".join(lines)
+
+        # --- Config / about ---
+        if msg_lower in ("config", "show config", "about", "who am i"):
+            name = state.get_context("user_name") or "Not set"
+            role = state.get_context("user_role") or "Not set"
+            goals = state.get_context("user_goals") or "Not set"
+            onboarded = state.get_context("onboarded")
+            lines = [
+                "FDA System Configuration:\n",
+                f"  User: {name}",
+                f"  Role: {role}",
+                f"  Goals: {goals}",
+                f"  Onboarded: {'Yes' if onboarded else 'No'}",
+                f"  Project root: {str(PROJECT_ROOT)}",
+            ]
+            return True, "\n".join(lines)
+
+        # --- Help ---
+        if msg_lower in ("help", "commands", "what can you do", "?"):
+            return True, """Available commands:
+
+**Status & Info**
+  `status` - System status overview
+  `config` - Show configuration
+  `alerts` - Show unacknowledged alerts
+
+**Tasks**
+  `tasks` - List all tasks
+  `add task <title>` - Create a new task
+  `complete task <id>` - Mark task as done
+
+**Journal**
+  `journal` - Show recent entries
+  `note <text>` - Save a quick note
+  `search journal <query>` - Search journal entries
+
+**Files** (via Librarian)
+  `ls <path>` - List directory contents
+  `find <pattern>` - Find files matching pattern
+  `cat <path>` - Read a file
+
+**General**
+  `help` - Show this help
+  Any other message will be sent to the Claude API (if configured)"""
+
+        # --- File system commands (Librarian capabilities) ---
+        if msg_lower.startswith("ls ") or msg_lower == "ls":
+            import subprocess
+            target = msg[3:].strip() or str(PROJECT_ROOT)
+            try:
+                result = subprocess.run(
+                    ["ls", "-la", target], capture_output=True, text=True, timeout=5
+                )
+                return True, f"Contents of `{target}`:\n```\n{result.stdout}\n```" if result.returncode == 0 else f"Error: {result.stderr}"
+            except Exception as e:
+                return True, f"Error: {e}"
+
+        if msg_lower.startswith("cat "):
+            target = msg[4:].strip()
+            try:
+                p = Path(target)
+                if not p.exists():
+                    return True, f"File not found: {target}"
+                if p.stat().st_size > 10000:
+                    return True, f"File too large ({p.stat().st_size} bytes). Showing first 2000 chars:\n```\n{p.read_text()[:2000]}\n```"
+                return True, f"```\n{p.read_text()}\n```"
+            except Exception as e:
+                return True, f"Error reading file: {e}"
+
+        if msg_lower.startswith("find "):
+            import subprocess
+            pattern = msg[5:].strip()
+            try:
+                result = subprocess.run(
+                    ["find", str(PROJECT_ROOT), "-name", pattern, "-maxdepth", "4"],
+                    capture_output=True, text=True, timeout=5
+                )
+                output = result.stdout.strip()
+                if not output:
+                    return True, f"No files matching '{pattern}' found under {PROJECT_ROOT}"
+                return True, f"Files matching '{pattern}':\n```\n{output}\n```"
+            except Exception as e:
+                return True, f"Error: {e}"
+
+        return False, ""
+
     @app.route("/api/agents/chat", methods=["POST"])
     def agent_chat():
         """Send a message to an agent and get a response."""
@@ -1729,59 +2010,59 @@ def create_setup_app() -> Any:
             if not message:
                 return jsonify({"success": False, "error": "Message is required"})
 
-            # Check if Anthropic API key is configured
+            # Try local command handling first (works without API key)
+            handled, local_response = _handle_local_command(message)
+            if handled:
+                return jsonify({"success": True, "response": local_response, "source": "local"})
+
+            # Fall through to Claude API if available
             api_key = os.environ.get(ANTHROPIC_API_KEY_ENV) or state.get_context("anthropic_api_key")
             if not api_key:
                 return jsonify({
-                    "success": False,
-                    "error": "Anthropic API key not configured. Please set it in the Setup tab."
+                    "success": True,
+                    "response": (
+                        f"I don't have a built-in handler for that, and no Anthropic API key "
+                        f"is configured for AI responses.\n\n"
+                        f"Type `help` to see what I can do locally, or configure an API key in the Setup tab."
+                    ),
+                    "source": "local_fallback",
                 })
 
-            # Route to appropriate agent
-            if agent_name == "fda":
-                try:
-                    from fda.fda_agent import FDAAgent
-                    agent = FDAAgent()
-                    response = agent.ask(message)
-                    return jsonify({"success": True, "response": response})
-                except Exception as e:
-                    logger.exception(f"FDA Agent error: {e}")
-                    return jsonify({"success": False, "error": str(e)})
+            # Route to Claude API
+            try:
+                import anthropic
+                client = anthropic.Anthropic(api_key=api_key)
 
-            elif agent_name == "executor":
-                # Executor agent - for now, return a placeholder
-                # In full implementation, this would use ExecutorAgent
-                try:
-                    import anthropic
-                    client = anthropic.Anthropic(api_key=api_key)
-                    response = client.messages.create(
-                        model="claude-3-haiku-20240307",
-                        max_tokens=1024,
-                        system="You are the Executor Agent, responsible for running tasks and actions. You execute commands and report results. Be concise and action-oriented.",
-                        messages=[{"role": "user", "content": message}]
-                    )
-                    return jsonify({"success": True, "response": response.content[0].text})
-                except Exception as e:
-                    return jsonify({"success": False, "error": str(e)})
+                # Build system prompt based on agent
+                system_prompts = {
+                    "fda": (
+                        "You are FDA, a personal AI assistant. You are warm, concise, and helpful. "
+                        "You have access to the user's tasks, journal, and calendar."
+                    ),
+                    "executor": (
+                        "You are the Executor Agent. You run commands, create files, and take actions. "
+                        "Be concise and action-oriented."
+                    ),
+                    "librarian": (
+                        "You are the Librarian Agent. You manage knowledge, files, and search. "
+                        "Be thorough but concise."
+                    ),
+                }
 
-            elif agent_name == "librarian":
-                # Librarian agent - for now, return a placeholder
-                # In full implementation, this would use LibrarianAgent
-                try:
-                    import anthropic
-                    client = anthropic.Anthropic(api_key=api_key)
-                    response = client.messages.create(
-                        model="claude-3-haiku-20240307",
-                        max_tokens=1024,
-                        system="You are the Librarian Agent, responsible for managing knowledge, files, and data organization. You help find information and organize data. Be helpful and knowledgeable.",
-                        messages=[{"role": "user", "content": message}]
-                    )
-                    return jsonify({"success": True, "response": response.content[0].text})
-                except Exception as e:
-                    return jsonify({"success": False, "error": str(e)})
+                # Add local context to the prompt
+                tasks = state.get_tasks()
+                user_name = state.get_context("user_name") or "User"
+                context_block = f"User: {user_name}\nTasks: {len(tasks)} total"
 
-            else:
-                return jsonify({"success": False, "error": f"Unknown agent: {agent_name}"})
+                response = client.messages.create(
+                    model="claude-3-5-haiku-20241022",
+                    max_tokens=1024,
+                    system=f"{system_prompts.get(agent_name, system_prompts['fda'])}\n\nContext:\n{context_block}",
+                    messages=[{"role": "user", "content": message}],
+                )
+                return jsonify({"success": True, "response": response.content[0].text, "source": "claude"})
+            except Exception as e:
+                return jsonify({"success": False, "error": str(e)})
 
         except Exception as e:
             logger.exception(f"Chat error: {e}")
