@@ -98,6 +98,19 @@ OPENAI_REALTIME_URL: Final[str] = "wss://api.openai.com/v1/realtime"
 # Anthropic configuration
 ANTHROPIC_API_KEY_ENV: Final[str] = "ANTHROPIC_API_KEY"
 
+# File indexer configuration — uses a local embedding model (no API / no cost).
+# Default: multilingual MiniLM (384 dim), supports Korean and 50+ languages.
+FILE_INDEXER_EMBEDDING_MODEL: Final[str] = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+FILE_INDEXER_EMBEDDING_DIM: Final[int] = 384
+FILE_INDEXER_DEFAULT_ROOTS: Final[list[str]] = [
+    "~/Documents",
+    "~/Downloads",
+    "~/Desktop",
+]
+FILE_INDEXER_DAILY_HOUR: Final[int] = 3  # Run at 3 AM by default
+FILE_INDEXER_MAX_FILES: Final[int] = 50000  # Safety cap per run
+FILE_INDEXER_BATCH_SIZE: Final[int] = 64  # Files per embedding batch
+
 # KakaoTalk configuration
 KAKAOTALK_EXPORT_DIR: Final[Path] = Path.home() / "Documents" / "fda-exports" / "kakaotalk"
 KAKAOTALK_POLL_INTERVAL_SECONDS: Final[int] = 60  # Check for new messages every minute

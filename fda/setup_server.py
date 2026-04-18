@@ -12,13 +12,14 @@ Provides a user-friendly HTML interface for configuring:
 import json
 import logging
 import os
+import threading
 from pathlib import Path
 from typing import Any, Optional
 
 import yaml
 
 try:
-    from flask import Flask, jsonify, render_template_string, request
+    from flask import Flask, jsonify, render_template_string, request, send_file
 except ImportError:
     Flask = None
 
@@ -43,30 +44,33 @@ SETUP_PAGE_HTML = """
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>FDA // Command</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Noto+Sans+KR:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <style>
         :root {
-            --amber: #f0a500;
-            --amber-dim: #c48800;
-            --amber-glow: rgba(240, 165, 0, 0.15);
-            --amber-glow-strong: rgba(240, 165, 0, 0.3);
-            --green: #34d399;
-            --green-dim: rgba(52, 211, 153, 0.15);
-            --red: #f87171;
-            --red-dim: rgba(248, 113, 113, 0.15);
-            --blue: #60a5fa;
-            --blue-dim: rgba(96, 165, 250, 0.12);
-            --bg: #0c0c0e;
-            --bg-raised: #141418;
-            --bg-surface: #1a1a20;
-            --bg-hover: #22222a;
-            --border: #2a2a35;
-            --border-light: #35354a;
-            --text: #e8e8ed;
-            --text-dim: #8888a0;
-            --text-faint: #55556a;
+            --amber: #22c55e;
+            --amber-dim: #16a34a;
+            --amber-glow: rgba(34, 197, 94, 0.12);
+            --amber-glow-strong: rgba(34, 197, 94, 0.3);
+            --green: #22c55e;
+            --green-dim: rgba(34, 197, 94, 0.12);
+            --red: #ef4444;
+            --red-dim: rgba(239, 68, 68, 0.15);
+            --blue: #3b82f6;
+            --blue-dim: rgba(59, 130, 246, 0.12);
+            --orange: #f59e0b;
+            --orange-dim: rgba(245, 158, 11, 0.12);
+            --bg: #111319;
+            --bg-raised: #181c25;
+            --bg-surface: #1e232e;
+            --bg-hover: #252a36;
+            --border: #2a3040;
+            --border-light: #354050;
+            --text: #f1f5f9;
+            --text-dim: #94a3b8;
+            --text-faint: #64748b;
             --mono: 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace;
-            --sans: 'Outfit', -apple-system, BlinkMacSystemFont, sans-serif;
+            --sans: 'Noto Sans KR', -apple-system, BlinkMacSystemFont, sans-serif;
         }
 
         * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -118,7 +122,7 @@ SETUP_PAGE_HTML = """
         .logo-mark {
             width: 28px;
             height: 28px;
-            background: var(--amber);
+            background: var(--green);
             border-radius: 6px;
             display: grid;
             place-items: center;
@@ -221,7 +225,7 @@ SETUP_PAGE_HTML = """
         .nav-item.active {
             background: var(--amber-glow);
             color: var(--amber);
-            border-color: rgba(240, 165, 0, 0.2);
+            border-color: rgba(34, 197, 94, 0.2);
             font-weight: 500;
         }
 
@@ -259,7 +263,7 @@ SETUP_PAGE_HTML = """
         }
 
         .nav-item.active .nav-badge {
-            background: rgba(240, 165, 0, 0.2);
+            background: rgba(34, 197, 94, 0.2);
             color: var(--amber);
         }
 
@@ -307,14 +311,16 @@ SETUP_PAGE_HTML = """
         .card {
             background: var(--bg-raised);
             border: 1px solid var(--border);
-            border-radius: 8px;
+            border-radius: 10px;
             padding: 1.25rem;
             margin-bottom: 1rem;
             transition: border-color 0.2s;
+            border-top: 3px solid var(--green);
         }
 
         .card:hover {
             border-color: var(--border-light);
+            border-top-color: var(--green);
         }
 
         .card-header {
@@ -353,11 +359,11 @@ SETUP_PAGE_HTML = """
         }
 
         .status-tile.ok {
-            border-color: rgba(52, 211, 153, 0.25);
+            border-color: rgba(34, 197, 94, 0.25);
         }
 
         .status-tile.err {
-            border-color: rgba(248, 113, 113, 0.25);
+            border-color: rgba(239, 68, 68, 0.25);
         }
 
         .status-indicator {
@@ -369,12 +375,12 @@ SETUP_PAGE_HTML = """
 
         .status-tile.ok .status-indicator {
             background: var(--green);
-            box-shadow: 0 0 6px rgba(52, 211, 153, 0.5);
+            box-shadow: 0 0 6px rgba(34, 197, 94, 0.5);
         }
 
         .status-tile.err .status-indicator {
             background: var(--red);
-            box-shadow: 0 0 6px rgba(248, 113, 113, 0.4);
+            box-shadow: 0 0 6px rgba(239, 68, 68, 0.4);
         }
 
         .status-label {
@@ -394,7 +400,7 @@ SETUP_PAGE_HTML = """
         .config-section {
             background: var(--bg-raised);
             border: 1px solid var(--border);
-            border-radius: 8px;
+            border-radius: 10px;
             margin-bottom: 0.75rem;
             overflow: hidden;
         }
@@ -422,11 +428,11 @@ SETUP_PAGE_HTML = """
             flex-shrink: 0;
         }
 
-        .config-icon.anthropic { background: rgba(218, 165, 107, 0.15); }
+        .config-icon.anthropic { background: rgba(34, 197, 94, 0.12); }
         .config-icon.telegram { background: rgba(96, 165, 250, 0.12); }
         .config-icon.discord { background: rgba(139, 92, 246, 0.12); }
-        .config-icon.openai { background: rgba(52, 211, 153, 0.12); }
-        .config-icon.outlook { background: rgba(248, 113, 113, 0.12); }
+        .config-icon.openai { background: rgba(34, 197, 94, 0.12); }
+        .config-icon.outlook { background: rgba(239, 68, 68, 0.12); }
 
         .device-code-box {
             margin-top: 0.75rem;
@@ -774,13 +780,15 @@ SETUP_PAGE_HTML = """
         .agent-card {
             background: var(--bg-raised);
             border: 1px solid var(--border);
-            border-radius: 8px;
+            border-radius: 10px;
             padding: 1.25rem;
             transition: border-color 0.2s;
+            border-top: 3px solid var(--green);
         }
 
         .agent-card:hover {
             border-color: var(--border-light);
+            border-top-color: var(--green);
         }
 
         .agent-top {
@@ -800,13 +808,13 @@ SETUP_PAGE_HTML = """
             flex-shrink: 0;
         }
 
-        .agent-avatar.orchestrator { background: linear-gradient(135deg, rgba(240, 165, 0, 0.2), rgba(240, 165, 0, 0.05)); border: 1px solid rgba(240, 165, 0, 0.2); }
+        .agent-avatar.orchestrator { background: linear-gradient(135deg, rgba(34,197,94,0.2), rgba(34,197,94,0.05)); border: 1px solid rgba(34,197,94,0.25); }
         .agent-avatar.worker { background: linear-gradient(135deg, rgba(96, 165, 250, 0.15), rgba(96, 165, 250, 0.05)); border: 1px solid rgba(96, 165, 250, 0.2); }
         .agent-avatar.worker-local { background: linear-gradient(135deg, rgba(168, 85, 247, 0.15), rgba(168, 85, 247, 0.05)); border: 1px solid rgba(168, 85, 247, 0.2); }
         .agent-avatar.discord { background: linear-gradient(135deg, rgba(139, 92, 246, 0.15), rgba(139, 92, 246, 0.05)); border: 1px solid rgba(139, 92, 246, 0.2); }
-        .agent-avatar.telegram { background: linear-gradient(135deg, rgba(52, 211, 153, 0.15), rgba(52, 211, 153, 0.05)); border: 1px solid rgba(52, 211, 153, 0.2); }
+        .agent-avatar.telegram { background: linear-gradient(135deg, rgba(34, 197, 94, 0.15), rgba(34, 197, 94, 0.05)); border: 1px solid rgba(34, 197, 94, 0.2); }
         .agent-avatar.kakaotalk { background: linear-gradient(135deg, rgba(250, 224, 50, 0.15), rgba(250, 224, 50, 0.05)); border: 1px solid rgba(250, 224, 50, 0.2); }
-        .agent-avatar.calendar { background: linear-gradient(135deg, rgba(248, 113, 113, 0.15), rgba(248, 113, 113, 0.05)); border: 1px solid rgba(248, 113, 113, 0.2); }
+        .agent-avatar.calendar { background: linear-gradient(135deg, rgba(239, 68, 68, 0.15), rgba(239, 68, 68, 0.05)); border: 1px solid rgba(239, 68, 68, 0.2); }
 
         .agent-info h3 {
             font-size: 0.9rem;
@@ -940,7 +948,7 @@ SETUP_PAGE_HTML = """
         .chat-panel {
             background: var(--bg-raised);
             border: 1px solid var(--border);
-            border-radius: 8px;
+            border-radius: 10px;
             display: flex;
             flex-direction: column;
             overflow: hidden;
@@ -989,6 +997,37 @@ SETUP_PAGE_HTML = """
             border-bottom-left-radius: 2px;
         }
 
+        .chat-msg.agent strong { color: var(--amber); font-weight: 600; }
+        .chat-msg.agent code {
+            background: rgba(34,197,94,0.1);
+            padding: 0.1rem 0.35rem;
+            border-radius: 3px;
+            font-family: var(--mono);
+            font-size: 0.78em;
+        }
+
+        .file-link {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.3rem;
+            padding: 0.2rem 0.55rem;
+            margin: 0.15rem 0;
+            background: rgba(34,197,94,0.08);
+            border: 1px solid rgba(34,197,94,0.25);
+            border-radius: 5px;
+            color: var(--amber);
+            text-decoration: none;
+            font-size: 0.82em;
+            font-weight: 500;
+            transition: all 0.15s;
+            word-break: break-all;
+        }
+        .file-link:hover {
+            background: rgba(34,197,94,0.18);
+            border-color: var(--amber);
+            color: #fff;
+        }
+
         .chat-bottom {
             padding: 0.75rem 1rem;
             border-top: 1px solid var(--border);
@@ -1031,13 +1070,15 @@ SETUP_PAGE_HTML = """
         .journal-card {
             background: var(--bg-raised);
             border: 1px solid var(--border);
-            border-radius: 8px;
+            border-radius: 10px;
             padding: 1.15rem;
             transition: border-color 0.2s;
+            border-left: 3px solid var(--green);
         }
 
         .journal-card:hover {
             border-color: var(--border-light);
+            border-left-color: var(--green);
         }
 
         .journal-top {
@@ -1161,6 +1202,66 @@ SETUP_PAGE_HTML = """
             to { opacity: 1; transform: translateY(0); }
         }
 
+        /* Golden queries */
+        .golden-bar {
+            padding: 0.5rem 1rem;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            gap: 0.4rem;
+            flex-wrap: wrap;
+            align-items: center;
+            min-height: 36px;
+        }
+
+        .golden-bar:empty { display: none; }
+
+        .golden-label {
+            font-family: var(--mono);
+            font-size: 0.55rem;
+            font-weight: 600;
+            letter-spacing: 1.5px;
+            text-transform: uppercase;
+            color: var(--text-faint);
+            margin-right: 0.25rem;
+            flex-shrink: 0;
+        }
+
+        .golden-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.3rem;
+            padding: 0.2rem 0.55rem;
+            border-radius: 50px;
+            border: 1px solid var(--border);
+            background: var(--bg-surface);
+            color: var(--text-dim);
+            font-size: 0.68rem;
+            cursor: pointer;
+            transition: all 0.15s;
+            max-width: 200px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .golden-chip:hover {
+            border-color: var(--green);
+            color: var(--green);
+            background: var(--green-dim);
+        }
+
+        .golden-chip.pinned {
+            border-color: rgba(34, 197, 94, 0.3);
+            background: var(--green-dim);
+            color: var(--green);
+        }
+
+        .golden-chip .chip-count {
+            font-family: var(--mono);
+            font-size: 0.55rem;
+            opacity: 0.6;
+        }
+
         /* Scrollbar */
         .main::-webkit-scrollbar { width: 5px; }
         .main::-webkit-scrollbar-track { background: transparent; }
@@ -1273,15 +1374,15 @@ SETUP_PAGE_HTML = """
                         <div class="card-title">Agent Pipeline</div>
                     </div>
                     <div style="display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; padding: 0.5rem 0;">
-                        <div style="background: var(--amber-glow); border: 1px solid rgba(240,165,0,0.25); border-radius: 5px; padding: 0.4rem 0.75rem; font-family: var(--mono); font-size: 0.72rem; color: var(--amber); font-weight: 600;">KakaoTalk</div>
+                        <div style="background: var(--amber-glow); border: 1px solid rgba(34,197,94,0.25); border-radius: 5px; padding: 0.4rem 0.75rem; font-family: var(--mono); font-size: 0.72rem; color: var(--amber); font-weight: 600;">KakaoTalk</div>
                         <div style="color: var(--text-faint); font-family: var(--mono); font-size: 0.7rem;">&rarr;</div>
-                        <div style="background: var(--amber-glow); border: 1px solid rgba(240,165,0,0.25); border-radius: 5px; padding: 0.4rem 0.75rem; font-family: var(--mono); font-size: 0.72rem; color: var(--amber); font-weight: 600;">Orchestrator</div>
+                        <div style="background: var(--amber-glow); border: 1px solid rgba(34,197,94,0.25); border-radius: 5px; padding: 0.4rem 0.75rem; font-family: var(--mono); font-size: 0.72rem; color: var(--amber); font-weight: 600;">Orchestrator</div>
                         <div style="color: var(--text-faint); font-family: var(--mono); font-size: 0.7rem;">&rarr;</div>
                         <div style="background: var(--blue-dim); border: 1px solid rgba(96,165,250,0.25); border-radius: 5px; padding: 0.4rem 0.75rem; font-family: var(--mono); font-size: 0.72rem; color: var(--blue); font-weight: 600;">Worker (SSH)</div>
                         <div style="color: var(--text-faint); font-family: var(--mono); font-size: 0.7rem;">&rarr;</div>
-                        <div style="background: var(--green-dim); border: 1px solid rgba(52,211,153,0.25); border-radius: 5px; padding: 0.4rem 0.75rem; font-family: var(--mono); font-size: 0.72rem; color: var(--green); font-weight: 600;">Telegram Approval</div>
+                        <div style="background: var(--green-dim); border: 1px solid rgba(34,197,94,0.25); border-radius: 5px; padding: 0.4rem 0.75rem; font-family: var(--mono); font-size: 0.72rem; color: var(--green); font-weight: 600;">Telegram Approval</div>
                         <div style="color: var(--text-faint); font-family: var(--mono); font-size: 0.7rem;">&rarr;</div>
-                        <div style="background: var(--green-dim); border: 1px solid rgba(52,211,153,0.25); border-radius: 5px; padding: 0.4rem 0.75rem; font-family: var(--mono); font-size: 0.72rem; color: var(--green); font-weight: 600;">Deploy</div>
+                        <div style="background: var(--green-dim); border: 1px solid rgba(34,197,94,0.25); border-radius: 5px; padding: 0.4rem 0.75rem; font-family: var(--mono); font-size: 0.72rem; color: var(--green); font-weight: 600;">Deploy</div>
                     </div>
                     <div style="margin-top: 0.5rem; display: flex; gap: 0.5rem; flex-wrap: wrap;">
                         <div style="font-family: var(--mono); font-size: 0.62rem; color: var(--text-faint); background: var(--bg); padding: 0.25rem 0.5rem; border-radius: 3px; border: 1px solid var(--border);">Discord Voice &uarr;</div>
@@ -1339,6 +1440,38 @@ SETUP_PAGE_HTML = """
                             <div id="anthropic-result" class="test-result"></div>
                             <div id="anthropic-message" class="message"></div>
                         </form>
+                    </div>
+                </div>
+
+                <!-- File Index (local semantic search) -->
+                <div class="config-section" id="section-index">
+                    <div class="config-header" onclick="toggleSection('index')">
+                        <div class="config-icon" style="background: linear-gradient(135deg,#22c55e,#0ea5e9); color:#fff;">&#x1F50D;</div>
+                        <div>
+                            <div class="config-name">File Index</div>
+                            <div class="config-desc">Daily semantic index of Documents / Downloads / Desktop — runs locally, free</div>
+                        </div>
+                        <span class="config-status" id="status-index">--</span>
+                        <span class="config-chevron">&#x25BC;</span>
+                    </div>
+                    <div class="config-body">
+                        <div style="font-size:0.72rem;color:var(--text-dim);margin-bottom:0.8rem;line-height:1.6;">
+                            Builds a semantic search index using a local multilingual embedding model
+                            (<code style="background:var(--bg);padding:0.1rem 0.35rem;border-radius:3px;">paraphrase-multilingual-MiniLM-L12-v2</code>,
+                            384-dim, supports Korean/English/50+ languages). No API key, no internet, no cost. First run
+                            downloads ~100MB of model weights.
+                        </div>
+                        <div style="display:flex;align-items:center;gap:1rem;margin-bottom:0.6rem;">
+                            <div style="font-size:0.82rem;font-weight:500;">Index status</div>
+                            <span id="index-status-badge" style="font-family:var(--mono);font-size:0.68rem;color:var(--text-faint);">--</span>
+                        </div>
+                        <div id="index-stats" style="font-size:0.72rem;color:var(--text-dim);margin-bottom:0.6rem;line-height:1.6;">Loading...</div>
+                        <div class="form-actions">
+                            <button type="button" class="btn btn-sm" onclick="refreshIndexStats()">Refresh Stats</button>
+                            <button type="button" class="btn btn-sm btn-amber" id="btn-run-index" onclick="runIndex(false)">Index Now</button>
+                            <button type="button" class="btn btn-sm" onclick="runIndex(true)">Force Full Reindex</button>
+                        </div>
+                        <div id="index-progress" style="margin-top:0.6rem;font-family:var(--mono);font-size:0.66rem;color:var(--text-faint);max-height:120px;overflow-y:auto;"></div>
                     </div>
                 </div>
 
@@ -1657,6 +1790,7 @@ SETUP_PAGE_HTML = """
                     </div>
                     <div class="chat-panel">
                         <div class="chat-top" id="chat-header">// FDA</div>
+                        <div class="golden-bar" id="golden-bar"></div>
                         <div class="chat-messages" id="chat-messages">
                             <div class="chat-empty">Start a conversation</div>
                         </div>
@@ -1698,7 +1832,11 @@ SETUP_PAGE_HTML = """
         updateClock();
 
         // Init
-        document.addEventListener('DOMContentLoaded', loadStatus);
+        document.addEventListener('DOMContentLoaded', function() {
+            loadStatus();
+            loadGoldenQueries();
+            refreshIndexStats();
+        });
 
         async function loadStatus() {
             try {
@@ -1789,6 +1927,83 @@ SETUP_PAGE_HTML = """
             }
         }
 
+        // --- File Index ---
+        async function refreshIndexStats() {
+            try {
+                const r = await fetch('/api/index/stats');
+                const d = await r.json();
+                if (!d.success) return;
+                const el = document.getElementById('index-stats');
+                const badge = document.getElementById('index-status-badge');
+                const statusEl = document.getElementById('status-index');
+                const total = d.total || 0;
+                if (statusEl) {
+                    statusEl.textContent = total > 0 ? total + ' files' : 'Not indexed';
+                    statusEl.style.color = total > 0 ? 'var(--amber)' : 'var(--text-faint)';
+                }
+                let html = 'Indexed files: <strong style="color:var(--amber);">' + total + '</strong>';
+                if (d.by_extension && d.by_extension.length) {
+                    html += ' &middot; ' + d.by_extension.slice(0,5).map(function(r) {
+                        return (r.extension || 'none') + ' (' + r.count + ')';
+                    }).join(', ');
+                }
+                if (d.last_run) {
+                    const lr = d.last_run;
+                    badge.textContent = 'last run ' + (lr.finished_at || lr.started_at);
+                    if (lr.error) badge.textContent += ' — error: ' + lr.error;
+                } else {
+                    badge.textContent = 'never run';
+                }
+                el.innerHTML = html;
+            } catch (e) { /* ignore */ }
+        }
+
+        let _indexPollTimer = null;
+        async function runIndex(force) {
+            const btn = document.getElementById('btn-run-index');
+            const prog = document.getElementById('index-progress');
+            prog.textContent = 'Starting indexer...';
+            btn.disabled = true;
+            try {
+                const r = await fetch('/api/index/run', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({force: !!force})
+                });
+                const res = await r.json();
+                if (!res.success) {
+                    prog.textContent = 'Error: ' + res.error;
+                    btn.disabled = false;
+                    return;
+                }
+                if (_indexPollTimer) clearInterval(_indexPollTimer);
+                _indexPollTimer = setInterval(pollIndexProgress, 1500);
+            } catch (e) {
+                prog.textContent = 'Error: ' + e.message;
+                btn.disabled = false;
+            }
+        }
+
+        async function pollIndexProgress() {
+            try {
+                const r = await fetch('/api/index/progress');
+                const d = await r.json();
+                const prog = document.getElementById('index-progress');
+                if (d.progress && d.progress.length) {
+                    prog.innerHTML = d.progress.slice(-15).map(function(l) {
+                        return esc(l);
+                    }).join('<br>');
+                    prog.scrollTop = prog.scrollHeight;
+                }
+                if (!d.running) {
+                    clearInterval(_indexPollTimer);
+                    _indexPollTimer = null;
+                    document.getElementById('btn-run-index').disabled = false;
+                    refreshIndexStats();
+                }
+            } catch (e) { /* ignore */ }
+        }
+
         async function testConnection(service) {
             const rd = document.getElementById(service + '-result');
             rd.className = 'test-result';
@@ -1824,7 +2039,7 @@ SETUP_PAGE_HTML = """
                 const res = await r.json();
                 if (res.url) {
                     rd.className = 'test-result success';
-                    rd.innerHTML = 'Invite: <a href="' + res.url + '" target="_blank" style="color: var(--amber);">' + res.url + '</a>';
+                    rd.innerHTML = 'Invite: <a href="' + res.url + '" target="_blank" style="color: var(--green);">' + res.url + '</a>';
                 } else {
                     rd.className = 'test-result error';
                     rd.textContent = res.error || 'Failed';
@@ -2051,14 +2266,85 @@ SETUP_PAGE_HTML = """
             event.currentTarget.classList.add('selected');
             const names = { fda: 'FDA', worker: 'Worker', worker_local: 'Local Worker' };
             document.getElementById('chat-header').textContent = '// ' + (names[agent] || agent);
+            const inp = document.getElementById('chat-input');
+            if (agent === 'worker_local') {
+                inp.placeholder = '/organize ~/path | /analyze ~/path task | /ls ~/path | /help';
+            } else {
+                inp.placeholder = 'Send a message...';
+            }
             renderChat();
+            loadGoldenQueries();
+        }
+
+        // Golden queries
+        async function loadGoldenQueries() {
+            const bar = document.getElementById('golden-bar');
+            if (!bar) return;
+            try {
+                const r = await fetch('/api/queries?limit=8');
+                const d = await r.json();
+                if (!d.success) { bar.innerHTML = ''; return; }
+                const all = d.frequent || [];
+                if (!all.length) { bar.innerHTML = ''; return; }
+                bar.innerHTML = '<span class="golden-label">Frequent</span>' +
+                    all.map(q => {
+                        const label = q.query.length > 35 ? q.query.substring(0, 35) + '...' : q.query;
+                        const pinCls = q.pinned ? ' pinned' : '';
+                        return '<span class="golden-chip' + pinCls + '" ' +
+                            'title="' + esc(q.query) + ' (' + q.hit_count + 'x)" ' +
+                            'onclick="useGoldenQuery(' + JSON.stringify(q.query) + ', ' + JSON.stringify(q.agent) + ')">' +
+                            esc(label) +
+                            (q.hit_count > 1 ? ' <span class="chip-count">' + q.hit_count + '</span>' : '') +
+                            '</span>';
+                    }).join('');
+            } catch (e) { bar.innerHTML = ''; }
+        }
+
+        function useGoldenQuery(query, agent) {
+            if (agent !== currentAgent) {
+                // Switch to the right agent first
+                const btns = document.querySelectorAll('.chat-agent-btn');
+                const agents = ['fda', 'worker', 'worker_local'];
+                const idx = agents.indexOf(agent);
+                if (idx >= 0 && btns[idx]) btns[idx].click();
+            }
+            document.getElementById('chat-input').value = query;
+            document.getElementById('chat-input').focus();
+        }
+
+        function linkifyPaths(html) {
+            // Detect absolute file paths like /Users/... and make them clickable
+            return html.replace(
+                /(\/Users\/[^\s<&,)]+)/g,
+                function(match) {
+                    const fname = match.split('/').pop();
+                    const ext = fname.split('.').pop().toLowerCase();
+                    const icon = {html:'&#x1F310;', pdf:'&#x1F4C4;', py:'&#x1F40D;', js:'&#x26A1;', ts:'&#x26A1;',
+                                  json:'&#x1F4CB;', csv:'&#x1F4CA;', md:'&#x1F4DD;', txt:'&#x1F4DD;'}[ext] || '&#x1F4C1;';
+                    return '<a class="file-link" href="/api/files/view?path=' + encodeURIComponent(match) +
+                           '" target="_blank" title="' + match + '">' + icon + ' ' + fname + '</a>';
+                }
+            );
+        }
+
+        function formatChat(text) {
+            let html = esc(text);
+            // Convert **bold** markers
+            html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+            // Convert `code` markers
+            html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+            // Linkify file paths
+            html = linkifyPaths(html);
+            // Convert newlines to breaks
+            html = html.replace(/\\n/g, '<br>');
+            return html;
         }
 
         function renderChat() {
             const c = document.getElementById('chat-messages');
             const h = chatHistories[currentAgent] || [];
             if (!h.length) { c.innerHTML = '<div class="chat-empty">Start a conversation</div>'; return; }
-            c.innerHTML = h.map(m => '<div class="chat-msg ' + m.role + '">' + esc(m.content) + '</div>').join('');
+            c.innerHTML = h.map(m => '<div class="chat-msg ' + m.role + '">' + formatChat(m.content) + '</div>').join('');
             c.scrollTop = c.scrollHeight;
         }
 
@@ -2093,6 +2379,7 @@ SETUP_PAGE_HTML = """
                 td.remove();
                 chatHistories[currentAgent].push({role:'agent', content: res.success ? res.response : ('Error: ' + (res.error || 'Failed'))});
                 renderChat();
+                loadGoldenQueries();
             } catch (e) {
                 td.remove();
                 chatHistories[currentAgent].push({role:'agent', content:'Error: ' + e.message});
@@ -2328,6 +2615,81 @@ def create_setup_app() -> Any:
 
         state.set_context("anthropic_api_key", key)
         return jsonify({"success": True, "message": "Anthropic API key saved"})
+
+    @app.route("/api/index/stats")
+    def get_index_stats():
+        """Return file indexer stats."""
+        try:
+            stats = state.get_file_embeddings_stats()
+            from fda.config import FILE_INDEXER_EMBEDDING_MODEL
+            stats["model"] = FILE_INDEXER_EMBEDDING_MODEL
+            return jsonify({"success": True, **stats})
+        except Exception as e:
+            return jsonify({"success": False, "error": str(e)})
+
+    _indexer_lock = threading.Lock()
+    _indexer_state = {"running": False, "progress": [], "last_stats": None}
+
+    @app.route("/api/index/run", methods=["POST"])
+    def run_index():
+        """Trigger a file index run (in background)."""
+        with _indexer_lock:
+            if _indexer_state["running"]:
+                return jsonify({"success": False, "error": "Indexer already running"})
+            _indexer_state["running"] = True
+            _indexer_state["progress"] = []
+
+        data = request.get_json() or {}
+        force = bool(data.get("force"))
+
+        def worker():
+            try:
+                from fda.file_indexer import FileIndexer
+                indexer = FileIndexer(state)
+                def cb(msg):
+                    _indexer_state["progress"].append(msg)
+                    if len(_indexer_state["progress"]) > 50:
+                        _indexer_state["progress"] = _indexer_state["progress"][-50:]
+                stats = indexer.run(force=force, progress_cb=cb)
+                _indexer_state["last_stats"] = stats.to_dict()
+                _indexer_state["progress"].append(
+                    f"Done: scanned={stats.scanned} embedded={stats.embedded} "
+                    f"skipped={stats.skipped} deleted={stats.deleted}"
+                )
+            except Exception as e:
+                logger.exception("Indexer run failed")
+                _indexer_state["progress"].append(f"Error: {e}")
+            finally:
+                _indexer_state["running"] = False
+
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        return jsonify({"success": True, "message": "Indexer started"})
+
+    @app.route("/api/index/progress")
+    def get_index_progress():
+        """Stream of recent progress lines for the running indexer."""
+        return jsonify({
+            "success": True,
+            "running": _indexer_state["running"],
+            "progress": list(_indexer_state["progress"]),
+            "last_stats": _indexer_state["last_stats"],
+        })
+
+    @app.route("/api/index/search")
+    def search_index():
+        """Semantic search against the file index."""
+        query = request.args.get("q", "").strip()
+        k = int(request.args.get("k", 10))
+        if not query:
+            return jsonify({"success": False, "error": "Missing q parameter"})
+        try:
+            from fda.file_indexer import FileIndexer
+            indexer = FileIndexer(state)
+            results = indexer.search(query, k=k)
+            return jsonify({"success": True, "query": query, "results": results})
+        except Exception as e:
+            return jsonify({"success": False, "error": str(e)})
 
     @app.route("/api/config/telegram", methods=["POST"])
     def save_telegram_config():
@@ -2786,6 +3148,14 @@ def create_setup_app() -> Any:
             if not message:
                 return jsonify({"success": False, "error": "Message is required"})
 
+            # Record query for golden queries cache
+            # Skip utility commands like /help, /ls
+            if not message.startswith(("/help", "/ls")):
+                try:
+                    state.record_query(message, agent=agent_name)
+                except Exception:
+                    pass  # Don't fail the request if caching fails
+
             # Route to appropriate agent
             if agent_name == "fda":
                 try:
@@ -2813,16 +3183,122 @@ def create_setup_app() -> Any:
 
             elif agent_name == "worker_local":
                 try:
+                    from fda.local_worker_agent import LocalWorkerAgent
+
+                    stripped = message.strip()
+
+                    # /help — show available commands
+                    if stripped.lower() in ("/help", "help"):
+                        return jsonify({"success": True, "response": (
+                            "Local Worker commands:\n\n"
+                            "/organize <path> [instructions]\n"
+                            "  Sort files into a clean folder structure\n"
+                            "  e.g. /organize ~/Downloads\n"
+                            "  e.g. /organize ~/Desktop sort by file type\n\n"
+                            "/analyze <path> <task>\n"
+                            "  Explore a codebase and analyze/fix code\n"
+                            "  e.g. /analyze ~/Projects/myapp find unused imports\n\n"
+                            "/ls <path>\n"
+                            "  Quick directory listing\n"
+                            "  e.g. /ls ~/Documents\n\n"
+                            "Or just type a question — the agent will try to help."
+                        )})
+
+                    # /organize <path> [instructions]
+                    if stripped.startswith("/organize"):
+                        args = stripped[len("/organize"):].strip()
+                        if not args:
+                            return jsonify({"success": True, "response": (
+                                "Usage: /organize <path> [instructions]\n\n"
+                                "Examples:\n"
+                                "  /organize ~/Downloads\n"
+                                "  /organize ~/Desktop sort by file type\n"
+                                "  /organize ~/Documents/projects group related files"
+                            )})
+                        parts = args.split(None, 1)
+                        target = str(Path(parts[0]).expanduser().resolve())
+                        instructions = parts[1] if len(parts) > 1 else ""
+
+                        worker = LocalWorkerAgent(projects=[target])
+                        result = worker.organize_files(
+                            target_path=target,
+                            instructions=instructions,
+                        )
+                        if result.get("success"):
+                            moves = result.get("moves", [])
+                            summary = result.get("summary", "Done.")
+                            response = summary
+                            if moves:
+                                response += f"\n\nMoved {len(moves)} files."
+                        else:
+                            response = f"Error: {result.get('error', 'Unknown error')}"
+                        return jsonify({"success": True, "response": response})
+
+                    # /analyze <path> <task>
+                    if stripped.startswith("/analyze"):
+                        args = stripped[len("/analyze"):].strip()
+                        if not args:
+                            return jsonify({"success": True, "response": (
+                                "Usage: /analyze <path> <task>\n\n"
+                                "Examples:\n"
+                                "  /analyze ~/Projects/myapp find unused imports\n"
+                                "  /analyze ~/Documents/agenthub/fda-system explain the agent pipeline"
+                            )})
+                        parts = args.split(None, 1)
+                        project_path = str(Path(parts[0]).expanduser().resolve())
+                        task = parts[1] if len(parts) > 1 else "Analyze this project"
+
+                        worker = LocalWorkerAgent(projects=[project_path])
+                        result = worker.analyze_and_fix(
+                            project_path=project_path,
+                            task_brief=task,
+                        )
+                        if result.get("success"):
+                            response = result.get("analysis", result.get("explanation", "Done."))
+                        else:
+                            response = f"Error: {result.get('error', 'Unknown error')}"
+                        return jsonify({"success": True, "response": response})
+
+                    # /ls <path> — quick listing
+                    if stripped.startswith("/ls"):
+                        args = stripped[len("/ls"):].strip()
+                        target = Path(args or "~").expanduser().resolve()
+                        if not target.is_dir():
+                            return jsonify({"success": True, "response": f"Not a directory: {target}"})
+                        try:
+                            entries = sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+                            lines = []
+                            for e in entries[:50]:
+                                suffix = "/" if e.is_dir() else ""
+                                lines.append(f"  {e.name}{suffix}")
+                            response = f"{target}/\n" + "\n".join(lines)
+                            if len(list(target.iterdir())) > 50:
+                                response += f"\n  ... and {len(list(target.iterdir())) - 50} more"
+                        except PermissionError:
+                            response = f"Permission denied: {target}"
+                        return jsonify({"success": True, "response": response})
+
+                    # Plain text — use Claude CLI for general Q&A
                     from fda.claude_backend import get_claude_backend
                     backend = get_claude_backend()
                     response = backend.complete(
-                        system="You are the Local Worker Agent for Datacore's FDA system. You analyze and modify codebases on the local Mac Mini filesystem. You work with local projects, not remote VMs. Be concise and technical.",
+                        system=(
+                            "You are the Local Worker Agent for Datacore's FDA system. "
+                            "You work with local files on this machine.\n\n"
+                            "If the user wants to organize files or analyze code, "
+                            "tell them to use these commands:\n"
+                            "  /organize <path> [instructions] — sort files\n"
+                            "  /analyze <path> <task> — explore/fix code\n"
+                            "  /ls <path> — list a directory\n"
+                            "  /help — show all commands"
+                        ),
                         messages=[{"role": "user", "content": message}],
-                        model="claude-3-5-haiku-20241022",
+                        model="claude-haiku-4-5-20251001",
                         max_tokens=1024,
                     )
                     return jsonify({"success": True, "response": response})
                 except Exception as e:
+                    logger.exception(f"Local Worker error: {e}")
                     return jsonify({"success": False, "error": str(e)})
 
             else:
@@ -2831,6 +3307,89 @@ def create_setup_app() -> Any:
         except Exception as e:
             logger.exception(f"Chat error: {e}")
             return jsonify({"success": False, "error": str(e)})
+
+    # ============================================
+    # Golden Queries API
+    # ============================================
+
+    @app.route("/api/queries")
+    def get_queries():
+        """Get golden queries (frequent + recent)."""
+        agent = request.args.get("agent")
+        limit = int(request.args.get("limit", 10))
+        try:
+            frequent = state.get_golden_queries(limit=limit, agent=agent)
+            recent = state.get_recent_queries(limit=5, agent=agent)
+            return jsonify({
+                "success": True,
+                "frequent": frequent,
+                "recent": recent,
+            })
+        except Exception as e:
+            return jsonify({"success": False, "error": str(e)})
+
+    @app.route("/api/queries/pin", methods=["POST"])
+    def pin_query():
+        """Pin or unpin a golden query."""
+        data = request.get_json()
+        query_id = data.get("id")
+        pinned = data.get("pinned", True)
+        if not query_id:
+            return jsonify({"success": False, "error": "id is required"})
+        try:
+            state.pin_query(int(query_id), pinned=pinned)
+            return jsonify({"success": True})
+        except Exception as e:
+            return jsonify({"success": False, "error": str(e)})
+
+    @app.route("/api/queries/delete", methods=["POST"])
+    def delete_query():
+        """Delete a golden query."""
+        data = request.get_json()
+        query_id = data.get("id")
+        if not query_id:
+            return jsonify({"success": False, "error": "id is required"})
+        try:
+            state.delete_query(int(query_id))
+            return jsonify({"success": True})
+        except Exception as e:
+            return jsonify({"success": False, "error": str(e)})
+
+    # ============================================
+    # File Serving API
+    # ============================================
+
+    @app.route("/api/files/view")
+    def view_file():
+        """Serve a local file for preview. Only serves files under the user's home directory."""
+        import mimetypes
+        file_path = request.args.get("path", "")
+        if not file_path:
+            return "Missing path parameter", 400
+
+        home = os.path.expanduser("~")
+        resolved = os.path.realpath(file_path)
+
+        # Security: only serve files under the user's home directory
+        if not resolved.startswith(home + "/"):
+            return "Access denied", 403
+        if not os.path.isfile(resolved):
+            return "File not found", 404
+
+        mime_type, _ = mimetypes.guess_type(resolved)
+        mime_type = mime_type or "application/octet-stream"
+
+        # For HTML files, serve inline so they render in the browser
+        if mime_type == "text/html":
+            return send_file(resolved, mimetype=mime_type)
+        # For PDFs, images — serve inline
+        if mime_type.startswith(("application/pdf", "image/")):
+            return send_file(resolved, mimetype=mime_type)
+        # For text files, serve as plain text
+        if mime_type.startswith("text/"):
+            return send_file(resolved, mimetype=mime_type)
+        # Everything else — trigger download
+        return send_file(resolved, as_attachment=True)
 
     # ============================================
     # Journal API

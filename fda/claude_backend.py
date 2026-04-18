@@ -231,6 +231,65 @@ class ClaudeCodeCLIBackend(ClaudeBackend):
                 parts.append(f"[Previous assistant response]\n{content}")
         return "\n\n".join(parts)
 
+    def complete_with_tools(
+        self,
+        *,
+        system: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        tool_executor: Callable[[str, dict[str, Any]], str],
+        model: str = "",
+        max_tokens: int = 4096,
+        max_iterations: int = 5,
+        timeout: Optional[float] = None,
+        **kwargs,
+    ) -> str:
+        """Run tool-use loop via the Anthropic API.
+
+        The CLI backend (``claude --print``) doesn't support tool-use natively,
+        so we delegate to an ``AnthropicAPIBackend`` for tool-use calls.
+        If no API key is available, falls back to a plain completion (no tools).
+        """
+        api_backend = self._get_api_backend_for_tools()
+        if api_backend is None:
+            logger.warning(
+                "Tool-use requested but no ANTHROPIC_API_KEY set — "
+                "falling back to plain completion (tools will be ignored)"
+            )
+            return self.complete(
+                system=system, messages=messages, model=model, max_tokens=max_tokens,
+            )
+        return api_backend.complete_with_tools(
+            system=system,
+            messages=messages,
+            tools=tools,
+            tool_executor=tool_executor,
+            model=model,
+            max_tokens=max_tokens,
+            max_iterations=max_iterations,
+            timeout=timeout,
+            **kwargs,
+        )
+
+    def _get_api_backend_for_tools(self) -> Optional["AnthropicAPIBackend"]:
+        """Get or create an API backend for tool-use calls."""
+        if not hasattr(self, "_api_backend"):
+            from fda.config import ANTHROPIC_API_KEY_ENV
+            from fda.state.project_state import ProjectState
+
+            api_key = os.environ.get(ANTHROPIC_API_KEY_ENV)
+            if not api_key:
+                try:
+                    state = ProjectState()
+                    api_key = state.get_context("anthropic_api_key")
+                except Exception:
+                    pass
+            if api_key:
+                self._api_backend: Optional[AnthropicAPIBackend] = AnthropicAPIBackend(api_key=api_key)
+            else:
+                self._api_backend = None
+        return self._api_backend
+
     @staticmethod
     def is_available() -> bool:
         """Check if the Claude Code CLI is installed and on PATH."""

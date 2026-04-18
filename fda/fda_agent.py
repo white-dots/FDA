@@ -1535,12 +1535,27 @@ Be specific and actionable in your recommendations."""
 
         # If we got a peer result, include it in the prompt
         if peer_result:
-            enhanced_question = f"""{question}
+            peer_json = json.dumps(peer_result, indent=2, ensure_ascii=False)[:2000]
+            if peer_result.get("success"):
+                enhanced_question = f"""{question}
 
-[I asked my peer agents to help with this. Here's what they found:]
-{json.dumps(peer_result, indent=2)[:2000]}
+[File search results:]
+{peer_json}
 
-Please summarize and present this information naturally to the user."""
+Present these results naturally to the user.
+IMPORTANT: Always include the FULL ABSOLUTE PATH for each file (e.g. /Users/.../file.html).
+Never shorten or use relative paths — the UI turns full paths into clickable links.
+Group files by location and highlight the most relevant ones."""
+            else:
+                enhanced_question = f"""{question}
+
+[File search results:]
+{peer_json}
+
+The search did not find matching files. Tell the user what was searched and suggest:
+1. Check the exact spelling or try a different keyword
+2. Provide a specific directory path to search in
+Do NOT suggest using slash commands. Be helpful and conversational."""
         else:
             enhanced_question = question
 
@@ -1797,11 +1812,18 @@ Answer helpfully and conversationally. Be concise but thorough."""
         # Extract explicit path from the user's question (e.g. /Users/.../Smartstore)
         explicit_path = self._extract_path_from_question(question)
         if not explicit_path:
-            # Fall back to previously-stored active project path
+            # Only use stored path if it seems relevant to the question.
+            # If the question names a specific subject (e.g. "lion_chemtech"), don't
+            # constrain the search to an unrelated stored path.
             stored_path = self.state.get_context("active_project_path")
             if stored_path and os.path.exists(stored_path):
-                explicit_path = stored_path
-                logger.info(f"[FDA] Using stored active project path: {explicit_path}")
+                # Check if the stored path name appears in the question
+                stored_name = os.path.basename(stored_path).lower()
+                if stored_name and stored_name in question.lower():
+                    explicit_path = stored_path
+                    logger.info(f"[FDA] Using stored active project path (matches question): {explicit_path}")
+                else:
+                    logger.info(f"[FDA] Stored path '{stored_path}' doesn't match question, searching broadly")
         if explicit_path:
             logger.info(f"[FDA] User specified explicit path: {explicit_path}")
 
@@ -1843,16 +1865,15 @@ Answer helpfully and conversationally. Be concise but thorough."""
         """
         Search the filesystem directly as a fallback when Librarian can't find files.
 
-        If an explicit_path is provided (extracted from the user's question),
-        search ONLY within that path. Otherwise, uses an LLM call to extract
-        search terms and searches the home directory.
+        Uses macOS Spotlight (mdfind) for fast indexed search, with find as fallback.
+        Always returns a result dict so the caller can tell the user what was searched.
 
         Args:
             question: The user's question about files.
             explicit_path: An explicit path the user referenced in the question.
 
         Returns:
-            Search results dict, or None if nothing found.
+            Search results dict (always non-None for librarian intent).
         """
         import subprocess
 
@@ -1896,40 +1917,128 @@ Answer helpfully and conversationally. Be concise but thorough."""
                     "summary": f"Found file: {explicit_path}",
                 }
 
-            # No explicit path - extract search term via LLM
+            # Strategy 0: Try semantic search via local embeddings first.
+            # This catches conceptual queries like "AX proposal" or "사자 화학"
+            # even when the user's words don't appear literally in the filename.
+            # Only runs if the index has been built (has any embeddings).
+            try:
+                from fda.file_indexer import FileIndexer
+                # Skip if the index is empty (avoid loading a 100MB model for nothing)
+                idx_stats = self.state.get_file_embeddings_stats()
+                if idx_stats.get("total", 0) > 0:
+                    indexer = FileIndexer(self.state)
+                    semantic_hits = indexer.search(question, k=20)
+                    # Only use semantic results if at least one score is clearly relevant.
+                    # MiniLM cosine scores for strong matches are typically > 0.50.
+                    if semantic_hits and semantic_hits[0]["score"] > 0.50:
+                        strong = [h for h in semantic_hits if h["score"] > 0.40]
+                        logger.info(
+                            f"[FDA] Semantic search returned {len(strong)} strong matches "
+                            f"(top score: {semantic_hits[0]['score']:.2f})"
+                        )
+                        return {
+                            "success": True,
+                            "search_term": question[:80],
+                            "files_found": [h["path"] for h in strong[:30]],
+                            "count": len(strong),
+                            "summary": f"Semantic search found {len(strong)} relevant file(s)",
+                            "method": "semantic",
+                        }
+            except Exception as e:
+                logger.debug(f"[FDA] Semantic search skipped: {e}")
+
+            # Extract search term(s) via LLM — ask for multiple keywords
             extract_prompt = (
-                "Extract the filename, file pattern, or search keyword from this question. "
-                "Reply with ONLY the search term (e.g., 'linkedin', '*.py', 'resume.pdf'). "
+                "Extract the filename, file pattern, or search keywords from this question. "
+                "Reply with ONLY the search terms separated by commas. "
+                "Always include the most specific/unique term first. "
+                "For example: 'lion_chemtech, proposal' or 'resume.pdf' or 'smartstore, api'. "
                 "No explanation.\n\n"
                 f"Question: {question[:300]}\n\n"
-                "Search term:"
+                "Search terms:"
             )
-            search_term = self.chat(
-                extract_prompt, include_history=False, max_tokens=30, temperature=0.0
+            raw_terms = self.chat(
+                extract_prompt, include_history=False, max_tokens=50, temperature=0.0
             ).strip().strip("'\"")
 
-            if not search_term:
-                return None
+            if not raw_terms:
+                return {
+                    "success": False,
+                    "search_term": "",
+                    "files_found": [],
+                    "count": 0,
+                    "summary": "Could not extract a search term from the question.",
+                }
 
-            logger.info(f"[FDA] Filesystem search for: {search_term}")
+            # Parse multiple search terms
+            terms = [t.strip().strip("'\"") for t in raw_terms.split(",") if t.strip()]
+            primary_term = terms[0] if terms else raw_terms
+            logger.info(f"[FDA] Filesystem search terms: {terms}")
 
-            # Search from the user's home directory with reasonable depth
             home = os.path.expanduser("~")
             found_files = []
-            try:
-                result = subprocess.run(
-                    ["find", home, "-maxdepth", "5",
-                     "-iname", f"*{search_term}*",
-                     "-not", "-path", "*/.*",
-                     "-not", "-path", "*/node_modules/*",
-                     "-not", "-path", "*/__pycache__/*",
-                     "-not", "-path", "*/.venv/*"],
-                    capture_output=True, text=True, timeout=10,
-                )
-                if result.stdout.strip():
-                    found_files = result.stdout.strip().split("\n")
-            except (subprocess.TimeoutExpired, Exception) as e:
-                logger.warning(f"[FDA] find command failed: {e}")
+
+            # Strategy 1: macOS Spotlight (mdfind) — instant indexed search
+            for term in terms:
+                if found_files:
+                    break
+                try:
+                    result = subprocess.run(
+                        ["mdfind", "-name", term],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    if result.stdout.strip():
+                        found_files = [
+                            f for f in result.stdout.strip().split("\n")
+                            if f.startswith(home)
+                            and "/." not in f.split(home, 1)[-1][:50]
+                        ]
+                        if found_files:
+                            logger.info(f"[FDA] mdfind found {len(found_files)} files for '{term}'")
+                except (subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
+                    logger.debug(f"[FDA] mdfind failed for '{term}': {e}")
+
+            # Strategy 2: Spotlight content search — finds files containing the term
+            if not found_files:
+                try:
+                    result = subprocess.run(
+                        ["mdfind", primary_term],
+                        capture_output=True, text=True, timeout=8,
+                    )
+                    if result.stdout.strip():
+                        found_files = [
+                            f for f in result.stdout.strip().split("\n")
+                            if f.startswith(home)
+                            and "/." not in f.split(home, 1)[-1][:50]
+                            and not any(skip in f for skip in [
+                                "/node_modules/", "/__pycache__/", "/.venv/",
+                                "/Library/", "/venv/",
+                            ])
+                        ]
+                        if found_files:
+                            logger.info(f"[FDA] mdfind content search found {len(found_files)} files")
+                except (subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
+                    logger.debug(f"[FDA] mdfind content search failed: {e}")
+
+            # Strategy 3: find command fallback
+            if not found_files:
+                for term in terms:
+                    if found_files:
+                        break
+                    try:
+                        result = subprocess.run(
+                            ["find", home, "-maxdepth", "5",
+                             "-iname", f"*{term}*",
+                             "-not", "-path", "*/.*",
+                             "-not", "-path", "*/node_modules/*",
+                             "-not", "-path", "*/__pycache__/*",
+                             "-not", "-path", "*/.venv/*"],
+                            capture_output=True, text=True, timeout=15,
+                        )
+                        if result.stdout.strip():
+                            found_files = result.stdout.strip().split("\n")
+                    except (subprocess.TimeoutExpired, Exception) as e:
+                        logger.warning(f"[FDA] find command failed for '{term}': {e}")
 
             # Deduplicate while preserving order
             found_files = list(dict.fromkeys(found_files))
@@ -1937,15 +2046,21 @@ Answer helpfully and conversationally. Be concise but thorough."""
             if found_files:
                 return {
                     "success": True,
-                    "search_term": search_term,
-                    "files_found": found_files[:20],
+                    "search_term": primary_term,
+                    "files_found": found_files[:30],
                     "count": len(found_files),
-                    "summary": f"Found {len(found_files)} file(s) matching '{search_term}'",
+                    "summary": f"Found {len(found_files)} file(s) matching '{primary_term}'",
                 }
 
-            # No files found - return None so the caller can try other approaches
-            logger.info(f"[FDA] No files matching '{search_term}' found in filesystem")
-            return None
+            # Nothing found — still return a result so the caller knows we searched
+            logger.info(f"[FDA] No files matching '{primary_term}' found in filesystem")
+            return {
+                "success": False,
+                "search_term": primary_term,
+                "files_found": [],
+                "count": 0,
+                "summary": f"Searched the entire home directory for '{primary_term}' but found no matching files.",
+            }
 
         except Exception as e:
             logger.warning(f"[FDA] Direct filesystem search failed: {e}")

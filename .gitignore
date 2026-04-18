@@ -38,10 +38,18 @@ env/
 *.sqlite
 *.sqlite3
 state.db
+state.db-shm
+state.db-wal
+*.db-shm
+*.db-wal
 message_bus.json
 journal/*.md
 !journal/.gitkeep
 logs/*.log
+
+# Local Claude Code / preview config
+.claude/launch.json
+.claude/settings.local.json
 
 # Secrets and tokens
 .env

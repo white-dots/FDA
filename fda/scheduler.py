@@ -89,6 +89,58 @@ class Scheduler:
             "schedule_func": schedule_next,
         }
 
+    def register_daily_task(
+        self,
+        name: str,
+        time: str,
+        callback: Callable[[], None],
+    ) -> None:
+        """
+        Register any named daily task at a specific time.
+
+        Args:
+            name: Unique task name (used as timer key).
+            time: Time in HH:MM format (24-hour).
+            callback: Function to call at the scheduled time.
+        """
+        hour, minute = map(int, time.split(":"))
+
+        def schedule_next():
+            if not self._running:
+                return
+
+            now = datetime.now()
+            target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if target <= now:
+                target += timedelta(days=1)
+            delay = (target - now).total_seconds()
+
+            def run_and_reschedule():
+                if not self._running:
+                    return
+                try:
+                    callback()
+                except Exception as e:
+                    logger.error(f"Error in daily task '{name}': {e}")
+                schedule_next()
+
+            with self._lock:
+                if name in self.timers:
+                    self.timers[name].cancel()
+                timer = threading.Timer(delay, run_and_reschedule)
+                timer.daemon = True
+                self.timers[name] = timer
+                if self._running:
+                    timer.start()
+                    logger.info(f"Daily task '{name}' scheduled for {target}")
+
+        self.tasks[name] = {
+            "type": "daily",
+            "time": time,
+            "callback": callback,
+            "schedule_func": schedule_next,
+        }
+
     def register_calendar_watcher(
         self,
         interval_min: int = DEFAULT_CALENDAR_CHECK_INTERVAL_MINUTES,

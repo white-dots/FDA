@@ -1528,6 +1528,41 @@ ORGANIZATION PRINCIPLES:
     # Event loop
     # ------------------------------------------------------------------
 
+    def _start_file_indexer_schedule(self) -> None:
+        """
+        Start the daily file indexer schedule.
+
+        Runs the indexer once shortly after startup (10 min delay), then
+        daily at the configured hour (default 3 AM). Uses a local embedding
+        model (no API key required).
+        """
+        if not self.state:
+            return
+        try:
+            from fda.config import FILE_INDEXER_DAILY_HOUR
+            from fda.file_indexer import FileIndexer
+            from fda.scheduler import Scheduler
+        except ImportError as e:
+            logger.warning(f"[worker_local] cannot start file indexer: {e}")
+            return
+
+        def run_indexer() -> None:
+            try:
+                logger.info("[worker_local] Running scheduled file indexer...")
+                indexer = FileIndexer(self.state)
+                stats = indexer.run()
+                logger.info(f"[worker_local] Indexer finished: {stats.to_dict()}")
+            except Exception as e:
+                logger.error(f"[worker_local] Indexer run failed: {e}", exc_info=True)
+
+        self._indexer_scheduler = Scheduler()
+        daily_time = f"{FILE_INDEXER_DAILY_HOUR:02d}:00"
+        self._indexer_scheduler.register_daily_task("file_indexer", daily_time, run_indexer)
+        # Also trigger one run 10 minutes after startup so the index is warm
+        self._indexer_scheduler.register_one_time("file_indexer_startup", run_indexer, 600)
+        self._indexer_scheduler.run_in_background()
+        logger.info(f"[worker_local] File indexer scheduled daily at {daily_time}")
+
     def run_event_loop(self) -> None:
         """
         Main event loop -- listen for task and deploy requests.
@@ -1539,6 +1574,9 @@ ORGANIZATION PRINCIPLES:
 
         if self.state:
             self.state.update_agent_status("worker_local", "running")
+
+        # Start the file indexer scheduler (daily run + one delayed startup run)
+        self._start_file_indexer_schedule()
 
         while True:
             try:

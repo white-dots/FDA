@@ -1243,6 +1243,67 @@ def handle_projects(args: argparse.Namespace) -> int:
     return 0
 
 
+def handle_organize(args: argparse.Namespace) -> int:
+    """Organize files in a local directory."""
+    from fda.local_worker_agent import LocalWorkerAgent
+
+    target_path = str(Path(args.path).expanduser().resolve())
+    instructions = " ".join(args.instructions) if args.instructions else ""
+
+    if not Path(target_path).is_dir():
+        print(f"Error: Not a directory: {target_path}", file=sys.stderr)
+        return 1
+
+    if not args.force:
+        print(f"Will organize: {target_path}")
+        if instructions:
+            print(f"Instructions: {instructions}")
+        print()
+        confirm = input("Proceed? [y/N] ").strip().lower()
+        if confirm not in ("y", "yes"):
+            print("Cancelled.")
+            return 0
+
+    def progress(msg: str) -> None:
+        print(f"  {msg}")
+
+    # Allow organizing any path (pass target as project root)
+    worker = LocalWorkerAgent(projects=[target_path])
+    result = worker.organize_files(
+        target_path=target_path,
+        instructions=instructions,
+        progress_callback=progress,
+    )
+
+    if not result.get("success"):
+        print(f"\nError: {result.get('error', 'Unknown error')}", file=sys.stderr)
+        return 1
+
+    moves = result.get("moves", [])
+    deletions = result.get("deletions", [])
+    dirs_created = result.get("dirs_created", [])
+    repos_skipped = result.get("repos_skipped", [])
+
+    print(f"\nDone!")
+    if dirs_created:
+        print(f"  Directories created: {len(dirs_created)}")
+    if moves:
+        print(f"  Files moved: {len(moves)}")
+        for m in moves[:10]:
+            print(f"    {m.get('source', '?')} -> {m.get('destination', '?')}")
+        if len(moves) > 10:
+            print(f"    ... and {len(moves) - 10} more")
+    if deletions:
+        print(f"  Junk files deleted: {len(deletions)}")
+    if repos_skipped:
+        print(f"  Git repos skipped: {len(repos_skipped)}")
+
+    if result.get("summary"):
+        print(f"\nSummary:\n{result['summary']}")
+
+    return 0
+
+
 def handle_setup_server(args: argparse.Namespace) -> int:
     """Start the web-based setup server."""
     try:
@@ -1408,6 +1469,55 @@ def handle_setup_deps(args: argparse.Namespace) -> int:
         print(f"  - Override with: export FDA_ROOT=/your/path")
 
     return 0
+
+
+def handle_index(args: argparse.Namespace) -> int:
+    """Build or query the semantic file index."""
+    from fda.state.project_state import ProjectState
+    from fda.file_indexer import FileIndexer
+
+    state = ProjectState()
+
+    if args.stats:
+        stats = state.get_file_embeddings_stats()
+        print("File Index Stats")
+        print("=" * 40)
+        print(f"Total embedded files: {stats['total']}")
+        print("\nBy extension:")
+        for row in stats["by_extension"]:
+            print(f"  {row['extension'] or '(none)':10s}  {row['count']}")
+        if stats["last_run"]:
+            lr = stats["last_run"]
+            print(f"\nLast run:  started {lr['started_at']}, finished {lr.get('finished_at') or 'in progress'}")
+            print(f"  scanned={lr['files_scanned']}  embedded={lr['files_embedded']}  "
+                  f"skipped={lr['files_skipped']}  deleted={lr['files_deleted']}")
+            if lr.get("error"):
+                print(f"  error: {lr['error']}")
+        return 0
+
+    indexer = FileIndexer(state)
+
+    if args.search:
+        query = " ".join(args.search)
+        print(f"Searching: {query}")
+        results = indexer.search(query, k=args.k)
+        if not results:
+            print("No results. The index may be empty — run `fda index` first.")
+            return 1
+        for i, hit in enumerate(results, 1):
+            print(f"{i:2d}. [{hit['score']:.3f}] {hit['path']}")
+        return 0
+
+    def progress(msg: str) -> None:
+        print(f"  {msg}")
+
+    print(f"Running file indexer (force={args.force})...")
+    stats = indexer.run(force=args.force, progress_cb=progress)
+    print("\nDone.")
+    print(f"  scanned={stats.scanned}  embedded={stats.embedded}  "
+          f"skipped={stats.skipped}  deleted={stats.deleted}  errors={stats.errors}")
+    print(f"  elapsed: {stats.elapsed_seconds:.1f}s")
+    return 0 if stats.errors == 0 else 1
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -1828,6 +1938,45 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="List all discovered projects with their stats",
     )
     projects_parser.set_defaults(func=handle_projects)
+
+    # -- organize command --
+    organize_parser = subparsers.add_parser(
+        "organize",
+        help="Organize files in a local directory",
+    )
+    organize_parser.add_argument("path", help="Directory to organize")
+    organize_parser.add_argument(
+        "instructions", nargs="*", default=[],
+        help="Optional instructions (e.g. 'sort by file type')",
+    )
+    organize_parser.add_argument(
+        "--force", action="store_true",
+        help="Skip confirmation prompt",
+    )
+    organize_parser.set_defaults(func=handle_organize)
+
+    # -- index command --
+    index_parser = subparsers.add_parser(
+        "index",
+        help="Build or update the semantic file index (Gemini embeddings)",
+    )
+    index_parser.add_argument(
+        "--force", action="store_true",
+        help="Re-embed all files, even unchanged ones",
+    )
+    index_parser.add_argument(
+        "--stats", action="store_true",
+        help="Show index stats instead of running",
+    )
+    index_parser.add_argument(
+        "--search", nargs="+", metavar="QUERY",
+        help="Search the index for a query (e.g. --search AX proposal)",
+    )
+    index_parser.add_argument(
+        "-k", type=int, default=10,
+        help="Number of results for --search (default: 10)",
+    )
+    index_parser.set_defaults(func=handle_index)
 
     args = parser.parse_args(argv)
 

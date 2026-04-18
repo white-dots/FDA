@@ -278,6 +278,50 @@ class ProjectState:
             )
         """)
 
+        # Golden queries — cache frequent & recent user queries globally
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS golden_queries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                query TEXT NOT NULL,
+                agent TEXT NOT NULL DEFAULT 'fda',
+                hit_count INTEGER DEFAULT 1,
+                pinned INTEGER DEFAULT 0,
+                last_used TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(query, agent)
+            )
+        """)
+
+        # File embeddings table - vector index for semantic file search
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS file_embeddings (
+                path TEXT PRIMARY KEY,
+                filename TEXT NOT NULL,
+                parent_dir TEXT NOT NULL,
+                extension TEXT,
+                size INTEGER DEFAULT 0,
+                mtime REAL DEFAULT 0,
+                embedding BLOB NOT NULL,
+                embedding_text TEXT,
+                model TEXT DEFAULT 'gemini-embedding-001',
+                indexed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Indexer metadata table - tracks last run time, stats
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS indexer_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                finished_at TIMESTAMP,
+                files_scanned INTEGER DEFAULT 0,
+                files_embedded INTEGER DEFAULT 0,
+                files_skipped INTEGER DEFAULT 0,
+                files_deleted INTEGER DEFAULT 0,
+                error TEXT
+            )
+        """)
+
         # Create indexes for common queries
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_tasks_owner ON tasks(owner)")
@@ -302,6 +346,12 @@ class ProjectState:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_project_keywords_project ON project_keywords(project_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_file_relevance_client ON file_relevance(client_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_file_relevance_count ON file_relevance(access_count DESC)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_golden_queries_hits ON golden_queries(hit_count DESC)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_golden_queries_recent ON golden_queries(last_used DESC)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_golden_queries_agent ON golden_queries(agent)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_file_embeddings_mtime ON file_embeddings(mtime)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_file_embeddings_parent ON file_embeddings(parent_dir)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_file_embeddings_ext ON file_embeddings(extension)")
 
         conn.commit()
 
@@ -320,9 +370,16 @@ class ProjectState:
         if self.connection is None:
             self.connection = sqlite3.connect(
                 str(self.db_path),
-                check_same_thread=False
+                check_same_thread=False,
+                timeout=30.0,
             )
             self.connection.row_factory = sqlite3.Row
+            # Enable WAL mode for concurrent readers/writers across processes
+            try:
+                self.connection.execute("PRAGMA journal_mode=WAL")
+                self.connection.execute("PRAGMA busy_timeout=30000")
+            except sqlite3.OperationalError:
+                pass
         return self.connection
 
     def set_context(self, key: str, value: Any) -> None:
@@ -2013,6 +2070,236 @@ class ProjectState:
             (client_id, limit),
         )
         return [(row["file_path"], row["access_count"]) for row in cursor.fetchall()]
+
+    # ------------------------------------------------------------------
+    # Golden Queries — cache frequent & recent user queries
+    # ------------------------------------------------------------------
+
+    def record_query(self, query: str, agent: str = "fda") -> None:
+        """Record a user query, incrementing hit_count if it already exists."""
+        normalized = query.strip()
+        if not normalized or len(normalized) < 3:
+            return
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO golden_queries (query, agent, hit_count, last_used, created_at)
+            VALUES (?, ?, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ON CONFLICT(query, agent) DO UPDATE SET
+                hit_count = hit_count + 1,
+                last_used = CURRENT_TIMESTAMP
+            """,
+            (normalized, agent),
+        )
+        conn.commit()
+
+    def get_golden_queries(
+        self, limit: int = 10, agent: Optional[str] = None
+    ) -> list[dict[str, Any]]:
+        """Get top queries sorted by frequency, then recency."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        if agent:
+            cursor.execute(
+                """
+                SELECT id, query, agent, hit_count, pinned, last_used, created_at
+                FROM golden_queries
+                WHERE agent = ?
+                ORDER BY pinned DESC, hit_count DESC, last_used DESC
+                LIMIT ?
+                """,
+                (agent, limit),
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT id, query, agent, hit_count, pinned, last_used, created_at
+                FROM golden_queries
+                ORDER BY pinned DESC, hit_count DESC, last_used DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_recent_queries(
+        self, limit: int = 5, agent: Optional[str] = None
+    ) -> list[dict[str, Any]]:
+        """Get most recent queries."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        if agent:
+            cursor.execute(
+                """
+                SELECT id, query, agent, hit_count, pinned, last_used
+                FROM golden_queries
+                WHERE agent = ?
+                ORDER BY last_used DESC
+                LIMIT ?
+                """,
+                (agent, limit),
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT id, query, agent, hit_count, pinned, last_used
+                FROM golden_queries
+                ORDER BY last_used DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+        return [dict(row) for row in cursor.fetchall()]
+
+    def pin_query(self, query_id: int, pinned: bool = True) -> None:
+        """Pin or unpin a golden query."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE golden_queries SET pinned = ? WHERE id = ?",
+            (1 if pinned else 0, query_id),
+        )
+        conn.commit()
+
+    def delete_query(self, query_id: int) -> None:
+        """Delete a golden query."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM golden_queries WHERE id = ?", (query_id,))
+        conn.commit()
+
+    # =========================================================================
+    # File Embeddings — vector index for semantic file search
+    # =========================================================================
+
+    def upsert_file_embedding(
+        self,
+        path: str,
+        filename: str,
+        parent_dir: str,
+        extension: str,
+        size: int,
+        mtime: float,
+        embedding: bytes,
+        embedding_text: str,
+        model: str = "gemini-embedding-001",
+    ) -> None:
+        """Insert or update a file embedding. Embedding is stored as BLOB (numpy float32 bytes)."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO file_embeddings
+                (path, filename, parent_dir, extension, size, mtime, embedding, embedding_text, model, indexed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(path) DO UPDATE SET
+                filename = excluded.filename,
+                parent_dir = excluded.parent_dir,
+                extension = excluded.extension,
+                size = excluded.size,
+                mtime = excluded.mtime,
+                embedding = excluded.embedding,
+                embedding_text = excluded.embedding_text,
+                model = excluded.model,
+                indexed_at = CURRENT_TIMESTAMP
+            """,
+            (path, filename, parent_dir, extension, size, mtime, embedding, embedding_text, model),
+        )
+        conn.commit()
+
+    def get_file_embedding_mtime(self, path: str) -> Optional[float]:
+        """Get the stored mtime for a file, or None if not indexed."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT mtime FROM file_embeddings WHERE path = ?", (path,))
+        row = cursor.fetchone()
+        return row["mtime"] if row else None
+
+    def get_all_file_embeddings(self, limit: int = 200000) -> list[dict[str, Any]]:
+        """
+        Get all file embeddings for nearest-neighbor search.
+
+        Returns list of dicts with path, filename, parent_dir, extension, embedding (bytes).
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT path, filename, parent_dir, extension, size, mtime, embedding FROM file_embeddings LIMIT ?",
+            (limit,),
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_existing_file_paths(self) -> set[str]:
+        """Get the set of all indexed file paths (for detecting deletions)."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT path FROM file_embeddings")
+        return {row["path"] for row in cursor.fetchall()}
+
+    def delete_file_embeddings(self, paths: list[str]) -> int:
+        """Delete embeddings for the given paths. Returns count deleted."""
+        if not paths:
+            return 0
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        placeholders = ",".join("?" * len(paths))
+        cursor.execute(f"DELETE FROM file_embeddings WHERE path IN ({placeholders})", paths)
+        conn.commit()
+        return cursor.rowcount
+
+    def get_file_embeddings_stats(self) -> dict[str, Any]:
+        """Get indexing stats: total count, by extension, last run."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) as total FROM file_embeddings")
+        total = cursor.fetchone()["total"]
+        cursor.execute(
+            "SELECT extension, COUNT(*) as count FROM file_embeddings "
+            "GROUP BY extension ORDER BY count DESC LIMIT 10"
+        )
+        by_ext = [dict(row) for row in cursor.fetchall()]
+        cursor.execute(
+            "SELECT * FROM indexer_runs ORDER BY started_at DESC LIMIT 1"
+        )
+        last_run_row = cursor.fetchone()
+        last_run = dict(last_run_row) if last_run_row else None
+        return {"total": total, "by_extension": by_ext, "last_run": last_run}
+
+    def record_indexer_run_start(self) -> int:
+        """Start a new indexer run, return its id."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO indexer_runs (started_at) VALUES (CURRENT_TIMESTAMP)")
+        conn.commit()
+        return cursor.lastrowid
+
+    def record_indexer_run_finish(
+        self,
+        run_id: int,
+        files_scanned: int = 0,
+        files_embedded: int = 0,
+        files_skipped: int = 0,
+        files_deleted: int = 0,
+        error: Optional[str] = None,
+    ) -> None:
+        """Finish an indexer run with stats."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE indexer_runs SET
+                finished_at = CURRENT_TIMESTAMP,
+                files_scanned = ?,
+                files_embedded = ?,
+                files_skipped = ?,
+                files_deleted = ?,
+                error = ?
+            WHERE id = ?
+            """,
+            (files_scanned, files_embedded, files_skipped, files_deleted, error, run_id),
+        )
+        conn.commit()
 
     def close(self) -> None:
         """Close the database connection."""
