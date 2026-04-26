@@ -68,3 +68,4 @@ Thumbs.db
 htmlcov/
 .tox/
 .nox/
+.venv-test/
