@@ -119,9 +119,10 @@ references it.
 For the agentic organizer to drive a future AI search experience, these
 capabilities do not yet exist anywhere in the repo:
 
-- **Structured per-file output** — the 12 metadata fields the user requires
+- **Structured per-file output** — the required taxonomy and content fields
   (department, document_type, business_category, confidentiality, summary,
-  keywords, etc.) are not produced today.
+  keywords, body_excerpt, title, language, etc. — full set in §6.1) are not
+  produced today.
 - **Schema validation** — no pydantic / jsonschema usage; nothing enforces that
   classifier output matches a strict shape or controlled vocabulary.
 - **Persistent classification store** — there is no metadata table keyed by
@@ -154,16 +155,31 @@ test directory only.
 │                         (.txt/.md/.csv direct read; .pdf/.docx via   │
 │                         optional libs; binary → empty body)          │
 │  4. organize            CALL organize_files() UNMODIFIED             │
-│                         capture {moves, summary, deletions, ...}     │
-│  5. classify_strict     NEW component — one strict-JSON Claude call  │
-│                         per file, given content + organizer dest     │
-│  6. derive_sp_path      compute suggested_sharepoint_path from       │
+│                         capture {moves, summary, deletions,          │
+│                         dirs_created, repos_skipped}                 │
+│  5. resolve_outcome     per-sha256, classify the organizer action:   │
+│                          • moved          → file is at moves[i].to   │
+│                          • unchanged      → file stayed put          │
+│                          • skipped_repo   → inside a git repo;       │
+│                                              organizer never touched │
+│                          • deleted_junk   → in deletions list        │
+│                                              (only .DS_Store etc.)   │
+│                         drop deleted_junk and skipped_repo from      │
+│                         further classification                       │
+│  6. classify_strict     NEW component — one strict-JSON Claude call  │
+│                         per remaining file, given content + the      │
 │                         organizer's destination folder               │
-│  7. validate            pydantic v2 strict parse against schema      │
-│  8. persist             upsert into metadata.db keyed by sha256      │
-│  9. index_for_search    refresh FTS5 virtual table                   │
-│                                                                      │
-│  10. report             classifier_runs row: counts + organizer      │
+│  7. derive_sp_path      compute suggested_sharepoint_path from       │
+│                         organizer's destination folder               │
+│  8. validate            pydantic v2 strict parse against schema      │
+│  9. persist             single transaction upsert into metadata.db   │
+│                         keyed by sha256: documents row +             │
+│                         document_keywords rows + FTS refresh         │
+│ 10. record_failures     any file that failed extraction, classify,   │
+│                         or validation gets a row in                  │
+│                         classifier_run_files (does NOT block other   │
+│                         files — partial runs are first-class)        │
+│ 11. report              classifier_runs row: counts + organizer      │
 │                         summary + duration                           │
 └──────────────────────────────────────────────────────────────────────┘
 ```
@@ -172,12 +188,25 @@ Key properties:
 
 - **Step 4 is unchanged**. We treat `organize_files()` as a black box and read
   its return value.
-- **Step 5 is the only Claude call this layer adds.** It is a separate
+- **Step 6 is the only Claude call this layer adds.** It is a separate
   strict-output prompt, not a modification of the organizer's tool loop.
 - **SHA-256 is computed in step 2**, before the organizer moves anything. Every
   later step keys on that hash, so a move never breaks identity.
-- **Steps 3 and 5 are both per-file** and can be parallelized in implementation
-  if needed.
+- **Outcome is captured per-sha256 in step 5.** Each persisted record carries
+  both `original_local_path` (pre-move) and `current_local_path` (post-move,
+  same as original when `unchanged`), plus an explicit `organizer_action`
+  enum so retrieval and later chunking can find the file as it stands now.
+- **Junk-deleted files (`.DS_Store`, `Thumbs.db`, etc.) get no `documents`
+  row.** They are recorded in `classifier_run_files` only, with action
+  `deleted_junk`, so the audit log knows they existed.
+- **Repo-skipped files get no `documents` row** for the same reason — the
+  organizer's hard constraint is to never touch git repos, so we have no
+  reliable post-move identity for them.
+- **Per-file failures do not abort the run.** Steps 3, 6, 8 are wrapped so a
+  single failing file is logged to `classifier_run_files` and the pipeline
+  continues. The run is reported as `partial` if any file failed.
+- **Steps 3 and 6 are both per-file** and can be parallelized in
+  implementation if needed.
 
 ## 6. Strict classifier output schema
 
@@ -192,31 +221,53 @@ ClassificationRecord {
   # identity
   file_name:                str        # e.g. "q3_revenue_report.xlsx"
   original_local_path:      str        # absolute path BEFORE the organizer moved it
+  current_local_path:       str        # absolute path AFTER the organizer ran;
+                                       # equals original_local_path when
+                                       # organizer_action == "unchanged"
+  organizer_action:         enum       # moved | unchanged
+                                       # (skipped_repo and deleted_junk files
+                                       # do not produce a ClassificationRecord;
+                                       # see §5 step 5)
   sha256:                   str        # 64-char hex; primary key
   size_bytes:               int
-  mime_type:                str        # from `file --mime-type`
-  language:                 str        # ISO 639-1: "en" | "ko" | ...
+  mime_type:                str        # primary: stdlib mimetypes.guess_type;
+                                       # fallback: `file --mime-type` if the
+                                       # CLI is available (optional)
+  language:                 str        # ISO 639-1 lowercase ("en", "ko", ...)
+                                       # or "und" if detection failed
 
   # the user's required taxonomy fields (controlled vocabulary)
   department:               enum       # see §6.3
   document_type:            enum       # see §6.3
   business_category:        enum       # see §6.3
   confidentiality:          enum       # public | internal | confidential | restricted
+                                       # (no "unknown" — see §6.3 default policy)
 
   # generated content fields (drive keyword + semantic search)
   title:                    str        # doc-internal title, falls back to file_name
   summary:                  str        # 1–3 sentence abstract; main FTS field
-  keywords:                 list[str]  # 5–15 terms; non-empty
+  keywords:                 list[str]  # 3–15 terms; canonical list
+  keywords_concat:          str        # space-joined keywords; denormalized
+                                       # mirror written atomically with
+                                       # keywords; powers FTS without a
+                                       # join (see §7.2)
   body_excerpt:             str        # first ~2000 chars of extracted text;
-                                       # empty for binaries
-  reason:                   str        # classifier rationale; aids debugging
+                                       # empty string for binaries / size-0 files
+  reason:                   str        # classifier rationale; for audit only;
+                                       # NOT included in the FTS index (see §7.2)
 
-  # routing
-  suggested_sharepoint_path: str       # e.g. "Sales/2026/Q1/Reports/q3_revenue_report.xlsx"
-                                       # derived from organizer's chosen destination
+  # routing — name kept per the original requirement; this value is the
+  # forward-looking canonical path that becomes the SharePoint path in
+  # Phase 3. v1 mapping rule: "<Department>/<BusinessCategory>/<file_name>"
+  # using Title-Cased vocabulary values.
+  suggested_sharepoint_path: str       # e.g. "Sales/Revenue/q3_revenue_report.xlsx"
 
   # quality
   confidence:               float      # ∈ [0.0, 1.0]
+
+  # confidentiality severity rank — denormalized from confidentiality so the
+  # API can do "max sensitivity ≤ X" range filters; see §7.2 mapping
+  confidentiality_rank:     int        # 1=public, 2=internal, 3=confidential, 4=restricted
 
   # timestamps
   file_modified_at:         datetime   # source file mtime
@@ -260,23 +311,54 @@ is breaking.
 - `document_type`: `report | contract | invoice | policy | proposal | presentation | spreadsheet | email | memo | other`
 - `business_category`: `revenue | compliance | personnel | product | strategy | partnership | vendor | customer | unknown`
 - `confidentiality`: `public | internal | confidential | restricted`
+- `organizer_action` (set by the pipeline, not the classifier): `moved | unchanged`
 
-The classifier must return `unknown` rather than guess when the file content
-does not support a confident assignment. `confidence` should reflect this.
+**Default policy when the classifier is uncertain:**
+
+- For `department`, `document_type`, `business_category`: return `unknown` /
+  `other`. `confidence` must reflect the uncertainty.
+- For `confidentiality`: there is **no `unknown` value**. A security label
+  must always be definite. When the file content does not support a confident
+  assignment, the classifier must default to **`restricted`** (the most
+  restrictive label) and record the uncertainty in `confidence`. Failing
+  closed on confidentiality is intentional: an item mistakenly labeled
+  `restricted` is recoverable; an item mistakenly labeled `public` is not.
 
 ### 6.4 Validation rules (enforced by pydantic)
 
 - `sha256` matches `^[0-9a-f]{64}$`.
 - `confidence ∈ [0.0, 1.0]`.
-- `keywords` length ≥ 1.
-- `summary` length between 20 and 800 characters.
+- `confidentiality_rank ∈ {1, 2, 3, 4}` and matches `confidentiality`
+  (1=public, 2=internal, 3=confidential, 4=restricted). The schema computes
+  this from `confidentiality` automatically; if the two disagree, validation
+  raises.
+- `keywords` length **between 3 and 15** inclusive. Each keyword is a
+  non-empty trimmed string ≤ 64 characters.
+- `keywords_concat` equals `" ".join(keywords)` exactly. Validator-computed,
+  not classifier-supplied; if the classifier returns it inconsistently with
+  `keywords`, validation raises.
+- `summary` length **between 5 and 800 characters**. The lower bound is
+  intentionally permissive so that empty / binary / extremely small files
+  can still receive a short factual summary (e.g., `"Empty file."`,
+  `"Binary blob; no text extracted."`). The classifier should still write a
+  useful sentence even when no body text is available, drawing on filename
+  and path.
 - `body_excerpt` is truncated by step 3 to a soft target of ~2000 characters
-  with a hard cap of 4000 characters; values exceeding the cap fail validation.
-- All enum fields strictly match the controlled vocabulary above; unknown
-  values raise.
+  with a hard cap of 4000 characters; values exceeding the cap fail
+  validation. Empty string is valid (binaries / zero-byte files).
+- `language` matches `^[a-z]{2}$` (ISO 639-1 lowercase) or equals `"und"`
+  (undetermined) when detection failed. Detection failure is non-fatal.
+- `mime_type` is a non-empty MIME-type-shaped string (`type/subtype`).
+- All other enum fields strictly match the controlled vocabularies in §6.3;
+  any value not listed there raises.
+- `original_local_path` and `current_local_path` are non-empty absolute
+  paths. When `organizer_action == "unchanged"`, they must be equal.
 - `suggested_sharepoint_path` is a forward-slash POSIX-style relative path,
-  no leading slash, no `..`.
-- Phase 2 fields are accepted as `None` only.
+  no leading slash, no `..`, no empty path segments. Must not start with a
+  drive letter or `~`.
+- Phase 2 fields (`embedding_card_text`, `embedding`, `embedding_model`,
+  `entities`) are accepted as `None` only. Phase 3 SharePoint fields are
+  accepted as `None` only.
 
 ## 7. Local metadata storage
 
@@ -287,32 +369,63 @@ the `ProjectState` database to keep document metadata uncontaminated by
 journal/task/KPI state and to make the future migration to PostgreSQL
 straightforward (a one-DB dump → load).
 
+**Path is overridable.** The store reads the env var `FDA_METADATA_DB` and
+falls back to `~/.fda/metadata.db`. The pytest suite always sets
+`FDA_METADATA_DB` to a `tmp_path`-scoped file via fixture; no test ever
+opens the user's real metadata DB.
+
 ### 7.2 Tables
 
 ```sql
 -- Primary metadata, one row per unique file content (keyed by sha256).
 CREATE TABLE documents (
-  sha256                     TEXT PRIMARY KEY,
+  sha256                     TEXT PRIMARY KEY
+                             CHECK (sha256 GLOB '[0-9a-f]*' AND length(sha256) = 64),
   file_name                  TEXT NOT NULL,
   original_local_path        TEXT NOT NULL,
-  parent_dir                 TEXT NOT NULL,         -- denormalized for filtering
-  size_bytes                 INTEGER NOT NULL,
+  current_local_path         TEXT NOT NULL,
+  parent_dir                 TEXT NOT NULL,         -- denormalized for filtering;
+                                                    -- equals dirname(current_local_path)
+  organizer_action           TEXT NOT NULL
+                             CHECK (organizer_action IN ('moved', 'unchanged')),
+  size_bytes                 INTEGER NOT NULL CHECK (size_bytes >= 0),
   mime_type                  TEXT NOT NULL,
-  language                   TEXT NOT NULL,
+  language                   TEXT NOT NULL
+                             CHECK (language = 'und' OR (language GLOB '[a-z][a-z]')),
 
-  department                 TEXT NOT NULL,
-  document_type              TEXT NOT NULL,
-  business_category          TEXT NOT NULL,
-  confidentiality            TEXT NOT NULL,
+  department                 TEXT NOT NULL
+                             CHECK (department IN
+                               ('sales','finance','hr','legal','engineering',
+                                'operations','marketing','executive','unknown')),
+  document_type              TEXT NOT NULL
+                             CHECK (document_type IN
+                               ('report','contract','invoice','policy','proposal',
+                                'presentation','spreadsheet','email','memo','other')),
+  business_category          TEXT NOT NULL
+                             CHECK (business_category IN
+                               ('revenue','compliance','personnel','product','strategy',
+                                'partnership','vendor','customer','unknown')),
+  confidentiality            TEXT NOT NULL
+                             CHECK (confidentiality IN
+                               ('public','internal','confidential','restricted')),
+  confidentiality_rank       INTEGER NOT NULL
+                             CHECK (confidentiality_rank BETWEEN 1 AND 4),
 
   title                      TEXT NOT NULL,
-  summary                    TEXT NOT NULL,
-  body_excerpt               TEXT NOT NULL,
+  summary                    TEXT NOT NULL
+                             CHECK (length(summary) BETWEEN 5 AND 800),
+  body_excerpt               TEXT NOT NULL
+                             CHECK (length(body_excerpt) <= 4000),
+  -- Denormalized space-joined keyword list. Written atomically with the
+  -- document_keywords rows in a single transaction. Powers FTS without a
+  -- join, so the FTS triggers only need to fire on `documents`.
+  keywords_concat            TEXT NOT NULL,
   reason                     TEXT NOT NULL,
 
   suggested_sharepoint_path  TEXT NOT NULL,
 
-  confidence                 REAL NOT NULL,
+  confidence                 REAL NOT NULL
+                             CHECK (confidence BETWEEN 0.0 AND 1.0),
 
   file_modified_at           TIMESTAMP NOT NULL,
   classified_at              TIMESTAMP NOT NULL,
@@ -331,15 +444,18 @@ CREATE TABLE documents (
   final_sharepoint_path      TEXT
 );
 
-CREATE INDEX idx_documents_department         ON documents(department);
-CREATE INDEX idx_documents_document_type      ON documents(document_type);
-CREATE INDEX idx_documents_business_category  ON documents(business_category);
-CREATE INDEX idx_documents_confidentiality    ON documents(confidentiality);
-CREATE INDEX idx_documents_parent_dir         ON documents(parent_dir);
-CREATE INDEX idx_documents_modified_at        ON documents(file_modified_at);
+CREATE INDEX idx_documents_department          ON documents(department);
+CREATE INDEX idx_documents_document_type       ON documents(document_type);
+CREATE INDEX idx_documents_business_category   ON documents(business_category);
+CREATE INDEX idx_documents_confidentiality     ON documents(confidentiality);
+CREATE INDEX idx_documents_confidentiality_rk  ON documents(confidentiality_rank);
+CREATE INDEX idx_documents_parent_dir          ON documents(parent_dir);
+CREATE INDEX idx_documents_modified_at         ON documents(file_modified_at);
+CREATE INDEX idx_documents_confidence          ON documents(confidence);
 
--- Keywords are split out so we can index them, count them, and surface them
--- as facets without parsing JSON on every query.
+-- Keywords as a normalized table for facet/filter queries (e.g., "show me
+-- all docs tagged with `compliance`"). The denormalized keywords_concat on
+-- `documents` is the FTS-facing copy; both are written in one transaction.
 CREATE TABLE document_keywords (
   sha256   TEXT NOT NULL REFERENCES documents(sha256) ON DELETE CASCADE,
   keyword  TEXT NOT NULL,
@@ -347,48 +463,96 @@ CREATE TABLE document_keywords (
 );
 CREATE INDEX idx_keywords_keyword ON document_keywords(keyword);
 
--- Audit log of classifier pipeline runs.
+-- Audit log of pipeline runs (one row per run).
 CREATE TABLE classifier_runs (
   run_id              TEXT PRIMARY KEY,
   target_dir          TEXT NOT NULL,
   started_at          TIMESTAMP NOT NULL,
   finished_at         TIMESTAMP,
+  status              TEXT NOT NULL DEFAULT 'running'
+                      CHECK (status IN ('running','ok','partial','failed')),
   files_seen          INTEGER DEFAULT 0,
   files_classified    INTEGER DEFAULT 0,
   files_failed        INTEGER DEFAULT 0,
+  files_skipped_repo  INTEGER DEFAULT 0,
+  files_deleted_junk  INTEGER DEFAULT 0,
   organizer_summary   TEXT,
   error               TEXT
 );
 
+-- Per-file events for a run: every file the pipeline saw, with its outcome.
+-- Includes files that did NOT make it into `documents` (skipped_repo,
+-- deleted_junk, classify_failed, validate_failed). Lets us debug partial
+-- runs and quantify drop-off.
+CREATE TABLE classifier_run_files (
+  run_id     TEXT NOT NULL REFERENCES classifier_runs(run_id) ON DELETE CASCADE,
+  file_path  TEXT NOT NULL,                        -- pre-organizer path
+  sha256     TEXT,                                 -- NULL if fingerprinting failed
+  outcome    TEXT NOT NULL
+             CHECK (outcome IN ('classified','skipped_repo','deleted_junk',
+                                'extract_failed','classify_failed',
+                                'validate_failed')),
+  error      TEXT,
+  PRIMARY KEY (run_id, file_path)
+);
+
 -- Keyword search index — Phase 1 retrieval target.
+-- External-content FTS5 tied to `documents`. Storage cost is the index only
+-- (no duplicated text); content is read from `documents` at query time.
+-- `reason` is intentionally NOT in the FTS columns — it is stored in
+-- `documents` for audit but excluded from search to avoid debug rationale
+-- polluting user queries.
 CREATE VIRTUAL TABLE documents_fts USING fts5(
-  sha256       UNINDEXED,
   file_name,
   title,
   summary,
   body_excerpt,
   keywords_concat,
-  reason,
-  tokenize = 'unicode61 remove_diacritics 2'
+  content='documents',
+  content_rowid='rowid',
+  tokenize='unicode61 remove_diacritics 2'
 );
 ```
 
-`documents_fts` is kept in sync via simple triggers (insert/update/delete on
-`documents` rebuilds the FTS row for that sha256). `keywords_concat` is the
-space-joined keyword list, materialized at write time.
+**FTS sync model.** Because `documents_fts` is external-content, it is kept
+in sync by triggers on `documents` only (insert / update of any indexed
+column / delete). `document_keywords` is never written without also
+rewriting `documents.keywords_concat` in the same transaction (this is a
+hard contract of the `upsert_document(record)` API in the storage module),
+so keyword changes always reach FTS via the `documents` triggers.
 
-### 7.3 Phase 2 reservation — `document_chunks` (not built in v1)
+**Confidentiality rank semantics.** `confidentiality_rank` is the integer
+encoding of `confidentiality`: `public=1 < internal=2 < confidential=3 <
+restricted=4`. The API filter `confidentiality_max="internal"` is
+implemented as `confidentiality_rank <= 2`. The rank is derived from
+`confidentiality` at write time; the schema enforces consistency via a
+CHECK + the pydantic validator.
 
-The plan reserves a sibling table for sub-document retrieval. It is **not
-created** in v1 to avoid empty schema noise:
+**`parent_dir` query form.** Prefix filters use
+`parent_dir LIKE :prefix || '%'` with default BINARY collation; paths are
+case-sensitive on macOS/Linux. The `idx_documents_parent_dir` B-tree index
+is usable for any `LIKE` whose pattern has no leading wildcard.
+
+### 7.3 Phase 2 sibling — `document_chunks` (illustrative; not built in v1)
+
+The plan describes a sibling table for sub-document retrieval. It is **not
+created** in v1. The shape below is **illustrative** — the final column set
+will be locked in when Phase 2 begins, and is expected to gain at least a
+chunk-content hash and a tokenizer/version fingerprint so re-chunking with a
+different splitter can be audited:
 
 ```sql
--- Phase 2 only — DO NOT create in v1. Listed for design continuity.
+-- Phase 2 only — illustrative shape; final columns locked in Phase 2 plan.
 CREATE TABLE document_chunks (
   sha256        TEXT NOT NULL REFERENCES documents(sha256) ON DELETE CASCADE,
   chunk_index   INTEGER NOT NULL,
   chunk_text    TEXT NOT NULL,
   chunk_offset  INTEGER NOT NULL,
+  -- expected additions in Phase 2:
+  --   chunk_hash       TEXT       -- sha256 of chunk_text
+  --   tokenizer        TEXT       -- e.g. "tiktoken-cl100k_base"
+  --   tokenizer_version TEXT
+  --   source_text_len  INTEGER
   embedding     BLOB,
   PRIMARY KEY (sha256, chunk_index)
 );
@@ -449,11 +613,12 @@ Retrieval is staged across three phases to match the system's growth.
 The v1 retrieval surface combines:
 
 1. **Structured filters** on `department`, `document_type`,
-   `business_category`, `confidentiality`, `parent_dir`, `file_modified_at`.
-   These are exact and cheap.
+   `business_category`, `confidentiality_rank` (via `confidentiality_max`),
+   `parent_dir`, `file_modified_at`, `confidence`. These are exact and cheap.
 2. **FTS5 keyword search** over `file_name`, `title`, `summary`,
-   `body_excerpt`, `keywords_concat`, `reason`. This handles literal-phrase
-   queries (the user's exact-words case).
+   `body_excerpt`, `keywords_concat`. This handles literal-phrase queries
+   (the user's exact-words case). `reason` is **not** in the FTS index; it
+   is stored for audit only.
 3. **Ranking** by FTS5 BM25 score, tiebroken by `confidence` then
    `file_modified_at DESC`.
 
@@ -461,16 +626,26 @@ API shape (a thin Python module — implementation Phase 1):
 
 ```python
 search(
-    query: str | None,                    # FTS5 query; None means filter-only
+    query: str | None = None,             # FTS5 query; None means filter-only
     department: list[str] | None = None,
     document_type: list[str] | None = None,
     business_category: list[str] | None = None,
-    confidentiality_max: str | None = None,
-    parent_dir_prefix: str | None = None,
+    confidentiality_max: str | None = None,  # one of public|internal|
+                                              # confidential|restricted; matches
+                                              # rows with confidentiality_rank
+                                              # <= rank(confidentiality_max)
+    parent_dir_prefix: str | None = None, # SQL: parent_dir LIKE prefix || '%'
+                                          # (BINARY collation; case-sensitive)
     modified_after: datetime | None = None,
+    confidence_min: float | None = None,  # rows with confidence >= value
     limit: int = 50,
 ) -> list[ClassificationRecord]
 ```
+
+The returned `ClassificationRecord` reconstructs `keywords` from
+`document_keywords` (ordered by insertion order, which mirrors the
+classifier's emission order); `keywords_concat` is taken from the
+`documents` row directly.
 
 CLI form (Phase 1 deliverable):
 
@@ -488,8 +663,11 @@ Phase 2 turns on three reserved capabilities:
    `embedding_card_text`. Vector similarity is run in-process against the
    same SQLite DB until corpus size forces a move to pgvector.
 2. **Hybrid retrieval** — merge FTS5 BM25 ranks with embedding cosine ranks
-   (e.g., reciprocal-rank fusion) so the same query handles both literal and
-   semantic phrasing.
+   using **reciprocal-rank fusion (RRF)** as the default. RRF is chosen
+   because it operates on ranks, not raw scores, so it avoids the
+   normalization problem of mixing BM25 (unbounded) and cosine (bounded
+   [-1, 1]) directly. The fusion constant `k` (typically 60) is the only
+   tuneable.
 3. **Folder pre-filter (two-stage)** — when `folders` is materialized, route
    every query through `search_folders(query)` first to narrow to the top-K
    folder paths, then run file-level retrieval scoped to those folders. This
@@ -540,9 +718,10 @@ When SharePoint phase begins (a separate plan), the pieces below activate:
   - `documents.final_sharepoint_path`
   - Same set on the `folders` table (when materialized in Phase 2).
 - **Mapping**: a small module translates a v1 `suggested_sharepoint_path`
-  into a real SharePoint drive/folder pair (e.g.,
-  `"Sales/2026/Q1/Reports/..."` → site `Sales`, drive `Documents`,
-  folder `2026/Q1/Reports/...`).
+  (which in v1 follows the canonical `"<Department>/<BusinessCategory>/
+  <file_name>"` rule, see §6.1) into a real SharePoint drive/folder pair
+  (e.g., `"Sales/Revenue/q3_revenue_report.xlsx"` → site `Sales`, drive
+  `Documents`, folder `Revenue/`).
 - **Upload**: a separate Microsoft Graph client (using the existing `msal`
   dependency) handles file upload, then writes back the assigned IDs and URL.
 - **Sync**: a reconciliation step compares local `sha256` to the remote
@@ -574,7 +753,7 @@ produced a per-task plan.
 |---|------|--------|------------|
 | T1 | Define `ClassificationRecord` pydantic v2 schema and controlled vocabularies. | `fda/metadata/schema.py` | — |
 | T2 | Create `metadata.db` storage module: schema bootstrap, upsert, FTS5 triggers, audit log. | `fda/metadata/store.py` | T1 |
-| T3 | Text-extraction utility per extension (.txt/.md/.csv direct; .pdf/.docx via optional libs; binary → empty). Truncates to `body_excerpt` size. | `fda/metadata/extract.py` | — |
+| T3 | Text-extraction utility per extension (.txt/.md/.csv direct; .pdf/.docx via optional libs; binary → empty). Truncates to `body_excerpt` size. Optional libraries (`pypdf`, `python-docx`, etc.) must be `try/except`-imported and gated behind capability checks; the test suite must pass with **none** of them installed (binary extractors fall back to empty body in that case). | `fda/metadata/extract.py` | — |
 | T4 | Strict-output classifier component: one Claude call per file with strict JSON prompt; parses through pydantic. Includes a fake `Classifier` for tests. | `fda/metadata/classifier.py` | T1, T3 |
 | T5 | Pipeline runner: discover → fingerprint → extract → call `organize_files()` (unmodified) → classify → derive SP path → validate → persist. | `fda/metadata/pipeline.py` | T2, T3, T4 |
 | T6 | Retrieval API: `search(...)` with filters + FTS5 query. | `fda/metadata/search.py` | T2 |
@@ -601,7 +780,7 @@ authored by hand.
 
 ### 11.1 Fixture set
 
-A small mixed set, ~10 files, all clearly fake:
+A small mixed set, ~12 files, all clearly fake:
 
 ```
 tests/fixtures/sample_docs/
@@ -613,42 +792,92 @@ tests/fixtures/sample_docs/
   fake_engineering_postmortem.md     (~1.5KB, ops/eng postmortem with
                                        error-rate language — used by
                                        semantic-search recall test stub)
+  fake_korean_memo.md                (~600 bytes, Korean-language memo;
+                                       exercises non-English language path)
   fake_meeting_notes_exec.txt        (~400 bytes, executive)
   fake_vendor_contract_draft.txt     (~800 bytes, partnership)
+  fake_large_report.txt              (~50KB, exercises body_excerpt truncation)
   empty_file.txt                     (0 bytes, edge case)
   binary_blob.bin                    (random bytes, edge case)
 ```
 
 None of these reference real companies, people, or systems.
 
+**Behavior for edge fixtures:**
+
+- `empty_file.txt` and `binary_blob.bin` produce a `documents` row when the
+  organizer leaves them in place; `body_excerpt = ""`, summary may be a
+  short sentinel (e.g., `"Empty file."`), and `confidence` should be low.
+- The `body_excerpt` of `fake_large_report.txt` must be truncated to ≤ the
+  hard cap; the test asserts the recorded length.
+- `fake_korean_memo.md` should produce `language="ko"` when detection
+  succeeds, or `language="und"` if the detector is absent — both are valid;
+  the test accepts either.
+
 ### 11.2 Test cases
 
 **Unit — schema (`test_metadata_schema.py`):**
 
 - valid record parses; required fields enforced; enum values strict.
-- invalid sha256, confidence out of range, empty keywords list all raise.
-- Phase 2 fields default to `None` and accept only `None` in v1.
+- invalid sha256, confidence out of range, keywords list outside 3–15 all raise.
+- `keywords_concat` mismatch with `keywords` raises.
+- `confidentiality_rank` derived correctly from `confidentiality`; mismatch raises.
+- `current_local_path != original_local_path` while `organizer_action=="unchanged"` raises.
+- `language` accepts `"en"`/`"ko"`/`"und"`; rejects `"EN"`, `"eng"`, `""`.
+- Phase 2 / Phase 3 fields default to `None` and accept only `None` in v1.
+- Confidentiality default: when the classifier returns `restricted` with
+  `confidence=0.1`, the record validates (we do not require a special
+  "uncertain" marker; confidence carries that information).
 
 **Unit — store (`test_metadata_store.py`):**
 
 - insert + retrieve by sha256.
-- `documents_fts` is updated on insert/update/delete (trigger correctness).
-- filter queries (`department=`, `confidentiality_max=`, `parent_dir_prefix=`).
+- `documents_fts` is updated on insert / update / delete (trigger correctness).
+- filter queries (`department=`, `confidentiality_max=`,
+  `parent_dir_prefix=`, `confidence_min=`).
+- `confidentiality_max="internal"` returns only rows with rank ≤ 2.
+- `parent_dir_prefix="/tmp/foo"` returns rows whose `parent_dir` begins with
+  exactly that prefix; case-sensitive.
+- CHECK constraints: a direct `INSERT` with an out-of-range `confidence`,
+  an unknown enum value, or a malformed `sha256` is rejected by SQLite
+  before pydantic ever sees it.
+- **Idempotency:** running the same upsert twice with identical input is a
+  no-op for `documents_fts` row count and produces no duplicate rows in
+  `document_keywords`.
 
 **Unit — extractor (`test_metadata_extract.py`):**
 
 - .txt and .md extract correctly.
 - empty file returns empty body_excerpt.
 - binary blob returns empty body_excerpt without raising.
-- excerpt truncation respects max length.
+- **Large file** (`fake_large_report.txt`): excerpt is truncated to ≤ the
+  hard cap; the truncation does not split a UTF-8 codepoint mid-byte.
+- **Optional-extractor absence:** when `pypdf` / `python-docx` are not
+  installed, requesting extraction of a `.pdf` or `.docx` returns empty
+  body_excerpt and does not raise.
 
 **Unit — pipeline with fake classifier (`test_metadata_pipeline_fake.py`):**
 
 - Substitute a `FakeClassifier` returning canned strict JSON.
 - Substitute a no-op `organize_files` (returns empty `moves`) so this test
   does not require a real Claude backend.
-- Asserts: every fixture file produces one row; SHA-256 stable; FTS query for
-  a known keyword returns the expected row(s).
+- Asserts: every fixture file produces one `documents` row;
+  `organizer_action == "unchanged"` for all of them; SHA-256 stable; FTS
+  query for a known keyword returns the expected row(s).
+- **Idempotency on re-run:** running the pipeline twice over the same
+  fixture dir yields the same row count, the same sha256 keys, and an
+  unchanged `documents_fts` size. `classifier_runs` gains one row per run.
+- **Per-file failure isolation:** point one file at a `FakeClassifier` that
+  raises; assert the run finishes with status `partial`, the failing file
+  has a `classifier_run_files` row with `outcome="classify_failed"`, and
+  every other file is classified normally.
+
+**Unit — language detection (`test_metadata_language.py`):**
+
+- English fixture → `language="en"`.
+- Korean fixture → `language="ko"` (or `"und"` if detector missing).
+- Detector raising on input does not abort the file; record validates with
+  `language="und"`.
 
 **End-to-end (`test_metadata_pipeline_e2e.py`):**
 
@@ -657,21 +886,37 @@ None of these reference real companies, people, or systems.
   the default test run; an opt-in env flag may enable it for local manual
   verification only.
 - Runs the full pipeline against `sample_docs/` copied into a `tmp_path`.
+- `FDA_METADATA_DB` is set to a `tmp_path`-scoped DB by fixture; the user's
+  real metadata DB is never touched.
 - Asserts:
-  - All 12 Phase-1 fields populated for every non-empty file.
+  - **All required Phase 1 fields** populated for every classified file
+    (the per-row column set in §6.1, excluding Phase 2/3 reservations).
   - Controlled-vocabulary fields all valid.
   - `suggested_sharepoint_path` is a clean POSIX relative path.
   - FTS query `"revenue"` matches the finance fixture.
   - FTS query `"error rate"` matches the postmortem fixture.
-  - `classifier_runs` has one row with non-zero `files_classified`.
+  - `classifier_runs` has one row with non-zero `files_classified` and
+    status `ok` or `partial`.
+  - `classifier_run_files` has exactly one row per fixture file (including
+    the empty / binary / repo-skipped / junk-deleted cases, with the
+    appropriate `outcome` value).
   - **No file was moved outside `tmp_path`.**
-  - Phase 2 columns are all `NULL`.
+  - Phase 2 and Phase 3 columns are all `NULL`.
 
-**Search-recall stubs (`test_metadata_search.py`):**
+**Concurrency (`test_metadata_concurrency.py`):**
+
+- Two pipeline runs against the same `tmp_path` DB, started concurrently
+  with different sha256 input sets, both complete without raising and
+  produce the union of rows. SQLite WAL mode is used for the test DB.
+- Two writers attempting to upsert the same sha256 simultaneously
+  serialize cleanly (the second wins; row count is 1).
+
+**Search-recall (`test_metadata_search.py`):**
 
 - Filter-only queries return the right rows.
 - FTS5 queries with `AND`, `OR`, phrase, and prefix all work.
-- Confidence-threshold filter works.
+- `confidence_min=0.7` filter excludes lower-confidence rows.
+- `confidentiality_max="internal"` excludes confidential / restricted rows.
 
 **Integrity:**
 
@@ -719,3 +964,25 @@ These are intentionally not decided here; they belong in the per-task plan:
   `mime_type`, `size_bytes`, `file_modified_at` to make keyword search useful
   out of the box; `embedding`, `embedding_card_text`, `entities`, and the
   SharePoint columns are reserved as nullable for Phase 2/3.
+- **D8. Confidentiality fails closed.** No `unknown` value exists for
+  `confidentiality`. When the classifier is uncertain it must default to
+  `restricted` (the most-restrictive label) and reflect uncertainty in
+  `confidence`. Mistakenly labeling a public file `restricted` is
+  recoverable; the inverse is not.
+- **D9. Schema carries both pre- and post-organizer paths.** Each record
+  stores `original_local_path` (pre-move) and `current_local_path`
+  (post-move) plus an explicit `organizer_action` enum. Files that the
+  organizer skips (inside git repos) or deletes (junk) get a row in
+  `classifier_run_files` only — never in `documents`.
+- **D10. FTS5 is external-content** (`content='documents'`) and excludes
+  `reason`. Triggers fire only on `documents`; `keywords_concat` is
+  denormalized onto `documents` and written atomically with
+  `document_keywords` so keyword changes always reach FTS.
+- **D11. Confidentiality is comparable via rank.** A denormalized
+  `confidentiality_rank ∈ {1..4}` is stored alongside the string label so
+  `confidentiality_max` filters use integer comparison, not lexicographic.
+- **D12. Per-file failures are first-class.** A `classifier_run_files`
+  table records the outcome of every file the pipeline touched
+  (`classified | skipped_repo | deleted_junk | extract_failed |
+  classify_failed | validate_failed`). Single-file failures do not abort
+  a run; the run reports `partial` status.
