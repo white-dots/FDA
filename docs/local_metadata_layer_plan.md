@@ -7,16 +7,21 @@
 
 ## 1. Goal
 
-Add a **local metadata and retrieval layer** that wraps the existing agentic
-file-organization classifier (`LocalWorkerAgent.organize_files`) so that, for
-every file the organizer touches, we capture a strict, schema-validated
-classification record and persist it to a queryable local store. The store is
-designed to support both keyword search now and AI semantic search later,
-without coupling either of them to the organizer's source code.
+We already have an "organizer" agent (`LocalWorkerAgent.organize_files`) that
+sorts files into folders by purpose. What we **don't** have is a record of
+*what* each file is — its department, type, summary, keywords, etc.
 
-The layer is built **from scratch**. It does not extend or replace the existing
-path-only file indexer (`fda/file_indexer.py`) or the librarian agent
-(`fda/librarian_agent.py`); those are treated as background context only.
+This plan adds a thin layer around that organizer. For every file the
+organizer touches, we:
+
+1. Ask a separate Claude call to classify it into a strict schema.
+2. Save that classification into a small local SQLite database.
+3. Make it searchable — keyword search now, AI semantic search later.
+
+The new layer wraps the organizer; it does not change it. It is also
+**built from scratch** — the existing path-only indexer
+(`fda/file_indexer.py`) and the librarian agent (`fda/librarian_agent.py`)
+are not used as a foundation. They are background context only.
 
 ## 2. Scope & non-goals
 
@@ -46,20 +51,21 @@ path-only file indexer (`fda/file_indexer.py`) or the librarian agent
 
 Location: `fda/local_worker_agent.py:986–1115`.
 
-This is the existing classifier referenced by this plan. It is an **agentic
-Claude tool-loop** that organizes a target directory by file purpose:
+This is the "classifier" we wrap. It's a **Claude tool-loop**: Claude is
+given a directory and a small toolbox, and it organizes the directory by
+file purpose. It works like a careful intern with a checklist:
 
-- System prompt (`ORGANIZE_SYSTEM_PROMPT`, line 986) describes the workflow:
-  list directory → inspect each file → group by purpose → create folders →
-  move files.
-- Tools (`_FILE_ORGANIZE_TOOLS`, line 171): `list_directory`, `get_file_info`,
-  `read_file`, `move_file`, `create_directory`, `delete_file`, `run_command`.
-- Guardrails (hard-enforced in the tool implementations):
-  - Never touch a path inside a git repository
-    (`_is_inside_git_repo`, line 1149).
-  - Never delete arbitrary files. Only `_JUNK_FILES` (line 305) or zero-byte
-    files may be removed.
-  - All paths must resolve inside the target directory.
+- **Workflow** (from `ORGANIZE_SYSTEM_PROMPT`, line 986):
+  list the directory → inspect each file → group files by purpose →
+  create folders → move files into them.
+- **Tools** Claude can use (`_FILE_ORGANIZE_TOOLS`, line 171):
+  `list_directory`, `get_file_info`, `read_file`, `move_file`,
+  `create_directory`, `delete_file`, `run_command`.
+- **Hard rules** built into the tool implementations (Claude cannot bypass):
+  - Never touch anything inside a git repo (`_is_inside_git_repo`, line 1149).
+  - Never delete arbitrary files — only well-known junk like `.DS_Store`
+    (`_JUNK_FILES`, line 305) or zero-byte files.
+  - Never operate outside the target directory.
 
 Return shape:
 
@@ -75,37 +81,39 @@ Return shape:
 }
 ```
 
-**The destination folder is the implicit classification today.** The organizer
-does not currently emit structured per-file metadata such as department,
-document type, business category, confidentiality, summary, or keywords.
+**Today, the only "classification" is the destination folder Claude picks.**
+There is no structured per-file output — no department, document type,
+business category, confidentiality label, summary, or keywords. That is
+exactly the gap this plan fills.
 
 ### 3.2 Existing indexer / retrieval — background only, **not suitable to build on**
 
 Location: `fda/file_indexer.py` (366 lines) and `fda/librarian_agent.py`
 (2423 lines).
 
-`file_indexer.py` builds a **path-and-filename-only** semantic index using
-`fastembed` embeddings stored in SQLite via `ProjectState`. It indexes the
-filename, parent-dir tokens, and extension — not file content. It does not
-classify files into departments, document types, or any structured taxonomy.
-It walks user directories (Documents, Downloads, Desktop) by configuration and
-does not gate on git repos.
+What they do today, briefly:
 
-`librarian_agent.py` wraps `file_indexer` for search and adds project-knowledge
-features (route discovery, code analysis, journal management). It also has no
-classification fields.
+- `file_indexer.py` embeds **only the filename and path tokens** of files
+  it walks (Documents, Downloads, Desktop). It never reads file contents
+  and never knows what a file is *about*.
+- `librarian_agent.py` is a wrapper around `file_indexer` plus extra
+  project-knowledge features. Same limitation — no content, no taxonomy.
 
-This plan **explicitly does not build on these modules**. Reasons:
+We are not building on them. The reasons, plainly:
 
-- They embed only filename and path tokens, not file content.
-- They have no classification schema, no controlled vocabulary, no validation.
-- They share state with `ProjectState`, which mixes journal/task/KPI concerns
-  unrelated to document metadata.
-- They walk real local user directories — incompatible with this plan's
-  synthetic-fixtures-only constraint.
+- **They never look inside files.** Filename and path tokens are not enough
+  for keyword or semantic search over real document content.
+- **They have no schema.** No department, no document type, no validation —
+  nothing to retrieve against.
+- **They share storage with `ProjectState`,** which is a grab-bag of journal,
+  task, and KPI data. Mixing document metadata into that store would couple
+  two unrelated concerns.
+- **They walk the user's real folders.** This plan is synthetic-fixtures-only,
+  so we can't reuse code that's wired into live user directories.
 
-The new metadata layer is a separate, parallel system with its own SQLite DB
-(`metadata.db`), its own schema, and its own pipeline entrypoint.
+The new layer is its own thing — its own SQLite file (`metadata.db`), its
+own schema, its own entrypoint. The two systems can coexist; they just
+don't share code.
 
 ### 3.3 KakaoTalk message classifier — explicitly excluded
 
@@ -116,33 +124,43 @@ references it.
 
 ## 4. What is missing
 
-For the agentic organizer to drive a future AI search experience, these
-capabilities do not yet exist anywhere in the repo:
+To turn the organizer into something a future AI search agent can call, we
+need the following pieces — none of which exist yet:
 
-- **Structured per-file output** — the required taxonomy and content fields
-  (department, document_type, business_category, confidentiality, summary,
-  keywords, body_excerpt, title, language, etc. — full set in §6.1) are not
-  produced today.
-- **Schema validation** — no pydantic / jsonschema usage; nothing enforces that
-  classifier output matches a strict shape or controlled vocabulary.
-- **Persistent classification store** — there is no metadata table keyed by
-  content hash. SQLite is used for project state, not document metadata.
-- **Keyword search over classification fields** — no FTS5 over summary,
-  keywords, or filename. The existing indexer uses cosine similarity over
-  filename embeddings only.
-- **A way to derive a SharePoint-bound path** — the organizer's chosen
-  destination folder must eventually map to a SharePoint folder; nothing
-  computes or records that mapping.
-- **Identity stability across moves** — files are identified by current path;
-  there is no SHA-256 keying that survives the organizer moving them.
-- **Phase-2 reservations** — no place in the schema for embeddings, text
-  chunks, or SharePoint IDs to be added later without migrations.
+- **A structured output shape per file.** Today the organizer only picks a
+  folder. We need it (or a wrapper) to also produce department,
+  document_type, business_category, confidentiality, summary, keywords,
+  title, language, body_excerpt, etc. The full list is in §6.1.
+- **Validation.** Without pydantic or jsonschema, there is nothing stopping
+  a malformed classification from being saved. We need strict parsing.
+- **Somewhere to put the results.** No table exists for document metadata.
+  The `ProjectState` SQLite file is for journal/task data, not this.
+- **Keyword search.** The existing indexer is filename-only embeddings. There
+  is no FTS5 (SQLite full-text search) over summaries, keywords, or titles.
+- **A future SharePoint path.** Eventually each file will live in SharePoint
+  at a specific path. Nothing today computes that path or stores it.
+- **A stable file ID.** Files are identified by their current path, which
+  breaks the moment the organizer moves them. We need a SHA-256 hash so
+  identity survives moves.
+- **Room to grow.** When Phase 2 adds embeddings and text chunks, and Phase 3
+  adds SharePoint IDs, we don't want a schema migration. Those columns
+  should be reserved as nullable from day one.
 
 ## 5. Proposed local-only pipeline (from scratch)
 
-The pipeline wraps the existing organizer; **it does not modify it**. Each
-stage is isolated, idempotent on SHA-256, and runs against a synthetic
-test directory only.
+The pipeline runs in 11 small steps. The organizer is one of those steps;
+the rest are bookkeeping around it. Nothing in this pipeline changes the
+organizer — it just wraps it.
+
+A few principles to keep in mind while reading the diagram below:
+
+- **SHA-256 is the file's identity.** We compute it *before* the organizer
+  runs, so even if the organizer moves a file, we still know which file is
+  which.
+- **Idempotent.** Running the pipeline twice over the same directory is safe
+  — the same files produce the same rows.
+- **Local-only.** It only ever runs against a synthetic test directory, not
+  the user's real folders.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
@@ -186,33 +204,41 @@ test directory only.
 
 Key properties:
 
-- **Step 4 is unchanged**. We treat `organize_files()` as a black box and read
-  its return value.
-- **Step 6 is the only Claude call this layer adds.** It is a separate
-  strict-output prompt, not a modification of the organizer's tool loop.
-- **SHA-256 is computed in step 2**, before the organizer moves anything. Every
-  later step keys on that hash, so a move never breaks identity.
-- **Outcome is captured per-sha256 in step 5.** Each persisted record carries
-  both `original_local_path` (pre-move) and `current_local_path` (post-move,
-  same as original when `unchanged`), plus an explicit `organizer_action`
-  enum so retrieval and later chunking can find the file as it stands now.
-- **Junk-deleted files (`.DS_Store`, `Thumbs.db`, etc.) get no `documents`
-  row.** They are recorded in `classifier_run_files` only, with action
-  `deleted_junk`, so the audit log knows they existed.
-- **Repo-skipped files get no `documents` row** for the same reason — the
-  organizer's hard constraint is to never touch git repos, so we have no
-  reliable post-move identity for them.
-- **Per-file failures do not abort the run.** Steps 3, 6, 8 are wrapped so a
-  single failing file is logged to `classifier_run_files` and the pipeline
-  continues. The run is reported as `partial` if any file failed.
-- **Steps 3 and 6 are both per-file** and can be parallelized in
-  implementation if needed.
+- **Step 4 — the organizer — is untouched.** We just call it and read what
+  it returns. No edits to its prompt, its tools, or its behavior.
+- **Step 6 is the one new Claude call.** It's a separate strict-JSON prompt
+  that runs *after* the organizer is done. The organizer's loop and the
+  classifier's call don't talk to each other.
+- **SHA-256 lets us survive moves.** Computed in step 2 (before any moves),
+  used as the key for everything afterwards. Even if the organizer moves a
+  file across folders, we still know it's the same file.
+- **Each record knows where the file used to be and where it is now.** Step 5
+  produces both `original_local_path` (pre-move) and `current_local_path`
+  (post-move), plus an `organizer_action` enum saying which one happened.
+  That way, search results can point at the file's current location.
+- **Junk files get logged but not classified.** When the organizer deletes a
+  `.DS_Store` or `Thumbs.db`, it's gone — there's nothing left to classify.
+  We just write an audit row to `classifier_run_files` with action
+  `deleted_junk`.
+- **Files inside git repos get logged but not classified.** Same idea: the
+  organizer refuses to touch git repos, so we have no post-move identity
+  for them. Audit row only.
+- **One bad file doesn't kill the run.** Steps 3, 6, and 8 each catch their
+  own errors. A failing file becomes a row in `classifier_run_files`; the
+  rest of the run continues. The run's overall status becomes `partial` if
+  anything failed.
+- **Steps 3 and 6 are per-file**, so they can be parallelized later if speed
+  matters.
 
 ## 6. Strict classifier output schema
 
-The strict classifier (step 6 in §5) returns a JSON object that pydantic v2
-must parse without errors. The schema below is the v1 shape. Phase 2 columns
-are reserved as nullable from day one to avoid migrations later.
+The classifier (step 6 in §5) returns one JSON object per file. Pydantic v2
+parses it; if any field is missing, malformed, or out of range, we reject
+it instead of saving garbage.
+
+The shape below is for v1. Phase 2 (embeddings, chunks) and Phase 3
+(SharePoint) fields are listed too, but they are reserved as nullable —
+they exist in the table from day one, populated later, with no migration.
 
 ### 6.1 Phase 1 fields — required for v1
 
@@ -309,8 +335,9 @@ flat `documents` row.
 
 ### 6.3 Controlled vocabularies (v1 starter set)
 
-Vocabularies are intentionally small for v1; adding values is cheap, removing
-is breaking.
+The classifier can only return values from these short lists. We keep the
+lists small on purpose: adding a value later is easy, removing one is a
+breaking change for any code that already filters on it.
 
 - `department`: `sales | finance | hr | legal | engineering | operations | marketing | executive | unknown`
 - `document_type`: `report | contract | invoice | policy | proposal | presentation | spreadsheet | email | memo | other`
@@ -318,83 +345,87 @@ is breaking.
 - `confidentiality`: `public | internal | confidential | restricted`
 - `organizer_action` (set by the pipeline, not the classifier): `moved | unchanged`
 
-**Default policy when the classifier is uncertain:**
+**What happens when the classifier isn't sure:**
 
-- For `department`, `document_type`, `business_category`: return `unknown` /
-  `other`. `confidence` must reflect the uncertainty.
-- For `confidentiality`: there is **no `unknown` value**. A security label
-  must always be definite. When the file content does not support a confident
-  assignment, the classifier must default to **`restricted`** (the most
-  restrictive label) and record the uncertainty in `confidence`. Failing
-  closed on confidentiality is intentional: an item mistakenly labeled
-  `restricted` is recoverable; an item mistakenly labeled `public` is not.
+- For `department`, `document_type`, `business_category` — return
+  `unknown` or `other`, and lower `confidence` accordingly.
+- For `confidentiality` — there is no `unknown` value, on purpose. A
+  security label has to be definite. If the classifier can't tell, it
+  must label the file `restricted` (the most restrictive option) and
+  record its uncertainty in `confidence`.
 
-**How downstream consumers tell "definitely restricted" from "uncertain
-fail-closed":** the only signal is `confidence`. The schema does not encode
-this distinction in a separate field — `confidence` already represents the
-underlying signal, and adding a parallel "uncertain" flag would split the
-contract. Concretely:
+Why fail closed on confidentiality? Because the cost of being wrong is
+asymmetric. A public file accidentally labeled `restricted` just means
+someone asks for access — recoverable. A confidential file accidentally
+labeled `public` is a leak — not recoverable.
 
-- Search callers that want to exclude fail-closed records use the
-  `confidence_min` API parameter (§8.1).
-- UI surfaces should display the `confidence` value on any `restricted`
-  result so a human reviewer can re-classify if needed.
-- Automated routing (e.g., the future SharePoint upload phase) should
-  treat any `restricted` record below an organization-defined confidence
-  threshold as needing human review, not as a blocked file.
+**Telling "definitely restricted" from "I don't know, so I said
+restricted":** the only signal is `confidence`. We deliberately don't
+add a separate "uncertain" flag, because `confidence` already carries
+that information and a second flag would just split the contract. In
+practice:
+
+- Callers who want to filter out fail-closed records use `confidence_min`
+  on the search API (§8.1).
+- UI should always show `confidence` next to a `restricted` result so a
+  human can spot low-confidence ones and re-classify.
+- Automated routing (e.g., future SharePoint uploads) should treat
+  `restricted` + low confidence as "send to human review," not as
+  permanently blocked.
 
 ### 6.4 Validation rules (enforced by pydantic)
 
-- `sha256` matches `^[0-9a-f]{64}$`.
-- `confidence ∈ [0.0, 1.0]`.
-- `confidentiality_rank ∈ {1, 2, 3, 4}` and matches `confidentiality`
-  (1=public, 2=internal, 3=confidential, 4=restricted). The schema computes
-  this from `confidentiality` automatically; if the two disagree, validation
-  raises.
-- `keywords` length **between 3 and 15** inclusive. Each keyword is a
-  non-empty trimmed string ≤ 64 characters and **must not contain
-  whitespace** (so that `keywords_concat = " ".join(keywords)` round-trips
-  losslessly via `split(' ')`). Multi-word phrases must use `_` or `-` as a
-  separator (e.g., `"error_rate"`, `"q3-revenue"`).
-- `keywords_concat` equals `" ".join(keywords)` exactly. Validator-computed,
-  not classifier-supplied; if the classifier returns it inconsistently with
-  `keywords`, validation raises.
-- `summary` length **between 5 and 800 characters**. The lower bound is
-  intentionally permissive so that empty / binary / extremely small files
-  can still receive a short factual summary (e.g., `"Empty file."`,
-  `"Binary blob; no text extracted."`). The classifier should still write a
-  useful sentence even when no body text is available, drawing on filename
-  and path.
-- `body_excerpt` is truncated by step 3 to a soft target of ~2000 characters
-  with a hard cap of 4000 characters; values exceeding the cap fail
-  validation. Empty string is valid (binaries / zero-byte files).
-- `language` matches `^[a-z]{2}$` (ISO 639-1 lowercase) or equals `"und"`
-  (undetermined) when detection failed. Detection failure is non-fatal.
-- `mime_type` is a non-empty MIME-type-shaped string (`type/subtype`).
-- All other enum fields strictly match the controlled vocabularies in §6.3;
-  any value not listed there raises.
-- `original_local_path` and `current_local_path` are non-empty absolute
-  paths. When `organizer_action == "unchanged"`, they must be equal.
-- `suggested_sharepoint_path` is a forward-slash POSIX-style relative path,
-  no leading slash, no `..`, no empty path segments. Must not start with a
-  drive letter or `~`.
-- Phase 2 fields (`embedding_card_text`, `embedding`, `embedding_model`,
-  `entities`) are accepted as `None` only. Phase 3 SharePoint fields are
-  accepted as `None` only.
+These rules are checked the moment the classifier output is parsed. If any
+of them fail, the file is logged as `validate_failed` and skipped — no
+partial rows ever reach the database.
+
+- **`sha256`**: 64-char lowercase hex (`^[0-9a-f]{64}$`).
+- **`confidence`**: a number between 0.0 and 1.0 inclusive.
+- **`confidentiality_rank`**: must be 1, 2, 3, or 4, and must match
+  `confidentiality` (1=public, 2=internal, 3=confidential, 4=restricted).
+  The validator computes the rank from the label automatically; if the
+  classifier sends an inconsistent pair, validation fails.
+- **`keywords`**: a list of 3–15 items. Each keyword is a non-empty string
+  up to 64 characters, with no whitespace inside it. (No whitespace is the
+  trick that lets `keywords_concat = " ".join(keywords)` round-trip
+  cleanly via `split(' ')`.) Multi-word terms use `_` or `-` instead —
+  e.g., `"error_rate"`, `"q3-revenue"`.
+- **`keywords_concat`**: must equal `" ".join(keywords)` exactly. The
+  validator computes this; the classifier doesn't have to supply it.
+- **`summary`**: 5 to 800 characters. The low end is intentionally
+  permissive so binary or empty files can still get a one-sentence summary
+  like `"Empty file."` or `"Binary blob; no text extracted."`.
+- **`body_excerpt`**: truncated by step 3 to ~2000 characters target,
+  4000 hard cap. Empty string is valid (binaries, zero-byte files).
+- **`language`**: two lowercase letters (e.g. `"en"`, `"ko"`), or `"und"`
+  when detection failed. Detection failing is fine; sending `"EN"` or
+  `"eng"` is not.
+- **`mime_type`**: a string shaped like `type/subtype`, never empty.
+- **All enum fields** must use the values listed in §6.3. Anything else
+  fails.
+- **`original_local_path` and `current_local_path`**: non-empty absolute
+  paths. If `organizer_action == "unchanged"`, they must be the same path.
+- **`suggested_sharepoint_path`**: a relative path with forward slashes,
+  no leading `/`, no `..`, no empty segments, no drive letter, no `~`.
+- **Phase 2 / Phase 3 fields**: accepted only as `None` in v1. Anything
+  else is rejected.
 
 ## 7. Local metadata storage
 
 ### 7.1 Database location and isolation
 
-A new SQLite database file at `~/.fda/metadata.db`. This is **separate from**
-the `ProjectState` database to keep document metadata uncontaminated by
-journal/task/KPI state and to make the future migration to PostgreSQL
-straightforward (a one-DB dump → load).
+The store is one SQLite file at `~/.fda/metadata.db`. We deliberately
+**don't** reuse `ProjectState`'s SQLite file — keeping document metadata
+in its own database means:
 
-**Path is overridable.** The store reads the env var `FDA_METADATA_DB` and
-falls back to `~/.fda/metadata.db`. The pytest suite always sets
-`FDA_METADATA_DB` to a `tmp_path`-scoped file via fixture; no test ever
-opens the user's real metadata DB.
+- It can't be polluted by journal/task/KPI rows.
+- When we eventually migrate to PostgreSQL, it's a single dump→load,
+  not a tangle of cross-table dependencies.
+
+**Tests never touch the real DB.** The store reads an env var
+`FDA_METADATA_DB` first and only falls back to `~/.fda/metadata.db` if
+it's unset. The pytest fixture always points it at a fresh `tmp_path`
+file, so no test can ever open the user's real metadata database.
 
 ### 7.2 Tables
 
@@ -555,36 +586,42 @@ CREATE VIRTUAL TABLE documents_fts USING fts5(
 );
 ```
 
-**FTS sync model.** Because `documents_fts` is external-content, it is kept
-in sync by triggers on `documents` only (insert / update of any indexed
-column / delete). `document_keywords` is never written without also
-rewriting `documents.keywords_concat` in the same transaction (this is a
-hard contract of the `upsert_document(record)` API in the storage module),
-so keyword changes always reach FTS via the `documents` triggers.
+**How FTS stays in sync.** `documents_fts` is "external-content," meaning
+it stores the search index but reads the actual text from `documents`.
+Triggers on `documents` (insert / update of any indexed column / delete)
+keep the index current. We never write to `document_keywords` without
+also rewriting `documents.keywords_concat` in the same transaction —
+that's a contract of the `upsert_document(record)` API in the storage
+module. Result: keyword changes always reach the FTS index via the
+`documents` triggers, no matter how the upsert is called.
 
-**Confidentiality rank semantics.** `confidentiality_rank` is the integer
-encoding of `confidentiality`: `public=1 < internal=2 < confidential=3 <
-restricted=4`. The API filter `confidentiality_max="internal"` is
-implemented as `confidentiality_rank <= 2`. The rank is derived from
-`confidentiality` at write time; the schema enforces consistency via a
-CHECK + the pydantic validator.
+**Why a separate `confidentiality_rank` column.** Comparing labels as
+strings is wrong (`"public" > "confidential"` alphabetically, but
+semantically the opposite). So we store an integer rank alongside the
+label: `public=1 < internal=2 < confidential=3 < restricted=4`. The API
+filter `confidentiality_max="internal"` becomes
+`confidentiality_rank <= 2` — fast, correct, index-friendly. The schema
+forces the rank and label to agree (paired CHECK constraint + pydantic
+validator).
 
-**`parent_dir` query form.** Prefix filters use
-`parent_dir GLOB :prefix || '*'`, **not** `LIKE`. SQLite's `LIKE` is
-case-insensitive for ASCII by default regardless of column collation,
-which would break path matching on case-variant inputs. SQLite's `GLOB`
-is always case-sensitive and is index-usable for any pattern whose
-leading characters are literal (no wildcard at the start). The
-`idx_documents_parent_dir` B-tree index satisfies that condition for
-the `:prefix || '*'` query.
+**Why `GLOB` instead of `LIKE` for path prefixes.** This trips people up:
+SQLite's `LIKE` is **case-insensitive for ASCII by default**, regardless
+of how the column is declared. So `parent_dir LIKE '/tmp/Foo%'` would
+also match `/tmp/foo/...`, which is wrong on a case-sensitive filesystem.
+`GLOB` is always case-sensitive, and SQLite can use a B-tree index for
+`GLOB :prefix || '*'` as long as the prefix has no leading wildcard —
+which ours doesn't. So `parent_dir GLOB :prefix || '*'` is correct
+*and* fast.
 
 ### 7.3 Phase 2 sibling — `document_chunks` (illustrative; not built in v1)
 
-The plan describes a sibling table for sub-document retrieval. It is **not
-created** in v1. The shape below is **illustrative** — the final column set
-will be locked in when Phase 2 begins, and is expected to gain at least a
-chunk-content hash and a tokenizer/version fingerprint so re-chunking with a
-different splitter can be audited:
+When Phase 2 turns on semantic search, we'll need a sibling table that holds
+text chunks (so the AI agent can read just the relevant passages instead
+of the whole file). This table is **not created in v1.** The shape below
+is just a sketch; the final column set is decided when Phase 2 starts.
+We expect to add at least a per-chunk content hash and a tokenizer
+version fingerprint, so we can tell whether a chunk needs re-chunking
+when we change the splitter:
 
 ```sql
 -- Phase 2 only — illustrative shape; final columns locked in Phase 2 plan.
@@ -605,8 +642,13 @@ CREATE TABLE document_chunks (
 
 ### 7.4 Phase 2 reservation — `folders` (not built in v1)
 
-Folder-level metadata is **deferred to Phase 2**. In v1 we compute folder views
-on the fly via aggregation:
+Eventually we'll want metadata at the folder level too — "show me what's
+in this folder" or "which folders contain finance documents?" — so an AI
+agent can pre-filter to a few folders before searching files.
+
+For v1, **we don't materialize a folders table.** We compute folder views
+on the fly via SQL aggregation. This is plenty fast for small corpora and
+saves us from re-running an aggregation job every time a file moves.
 
 ```sql
 -- Example v1 folder view (no folders table needed). MAX is taken over
@@ -656,29 +698,31 @@ CREATE TABLE folders (
 CREATE VIRTUAL TABLE folders_fts USING fts5(folder_path, summary, keywords);
 ```
 
-Reasoning for deferral: a folder row is just an aggregation of its files'
-metadata. Materializing it up front means a second write on every file move,
-plus a recompute job when files churn — complexity worth paying only when
-on-the-fly aggregation is too slow. Reserving the schema design now means no
-migration pain when we flip it on.
+Why defer? A folder row is just a summary of its files' rows. If we
+materialize it now, every file change forces a second write, and we need
+a recompute job to keep stale folder rows fresh. That's complexity
+worth paying *only* when on-the-fly aggregation gets too slow. Sketching
+the schema now means we have no migration pain when we do flip it on.
 
 ## 8. Retrieval / search approach
 
-Retrieval is staged across three phases to match the system's growth.
+Search grows in three phases. We start simple (keyword + filters), add
+semantic search later, and SharePoint-aware retrieval after that.
 
 ### 8.1 Phase 1 — keyword search + structured filters (this plan)
 
-The v1 retrieval surface combines:
+For v1, search is the combination of three things:
 
-1. **Structured filters** on `department`, `document_type`,
-   `business_category`, `confidentiality_rank` (via `confidentiality_max`),
-   `parent_dir`, `file_modified_at`, `confidence`. These are exact and cheap.
-2. **FTS5 keyword search** over `file_name`, `title`, `summary`,
-   `body_excerpt`, `keywords_concat`. This handles literal-phrase queries
-   (the user's exact-words case). `reason` is **not** in the FTS index; it
-   is stored for audit only.
-3. **Ranking** by FTS5 BM25 score, tiebroken by `confidence` then
-   `file_modified_at DESC`.
+1. **Structured filters** — exact-match SQL `WHERE` clauses on
+   `department`, `document_type`, `business_category`,
+   `confidentiality_rank` (via `confidentiality_max`), `parent_dir`,
+   `file_modified_at`, and `confidence`. Cheap, indexed, predictable.
+2. **Keyword search** via FTS5 over `file_name`, `title`, `summary`,
+   `body_excerpt`, and `keywords_concat`. This is what handles the
+   "find files with the word *invoice*" case. `reason` is *not* in the
+   FTS index — it's audit-only and would just clutter results.
+3. **Ranking** — FTS5's built-in BM25 score, with ties broken first by
+   `confidence`, then by `file_modified_at DESC`.
 
 API shape (a thin Python module — implementation Phase 1):
 
@@ -700,13 +744,13 @@ search(
 ) -> list[ClassificationRecord]
 ```
 
-**Keyword reconstruction.** `ClassificationRecord.keywords` is rehydrated by
-splitting `documents.keywords_concat` on a single space. The
-`keywords_concat` column is the canonical, ordered source — the
-classifier's emission order is preserved there because it is written
-verbatim. The `document_keywords` table is **not** used for keyword
-ordering; it exists only for filter / facet queries (e.g., "show me every
-document tagged `compliance`").
+**How we get the keyword list back.** When a search returns a row, we
+rebuild the `keywords` list by splitting `keywords_concat` on a single
+space. Why not read from `document_keywords`? Because `document_keywords`
+is a set — order isn't preserved there. `keywords_concat` is the
+canonical ordered copy, written verbatim from the classifier's output.
+`document_keywords` is only used for facet/filter queries like "show me
+everything tagged `compliance`."
 
 CLI form (Phase 1 deliverable):
 
@@ -718,22 +762,23 @@ fda metadata stats
 
 ### 8.2 Phase 2 — semantic search + folder pre-filter (deferred)
 
-Phase 2 turns on three reserved capabilities:
+Phase 2 turns on three things that are sketched in v1's schema but unused:
 
-1. **File-level embeddings** — populate `documents.embedding` and
-   `embedding_card_text`. Vector similarity is run in-process against the
-   same SQLite DB until corpus size forces a move to pgvector.
-2. **Hybrid retrieval** — merge FTS5 BM25 ranks with embedding cosine ranks
-   using **reciprocal-rank fusion (RRF)** as the default. RRF is chosen
-   because it operates on ranks, not raw scores, so it avoids the
-   normalization problem of mixing BM25 (unbounded) and cosine (bounded
-   [-1, 1]) directly. The default fusion constant is **`k = 60`** (the
-   value originally proposed by Cormack et al.); implementations may
-   override only via configuration, not silently.
-3. **Folder pre-filter (two-stage)** — when `folders` is materialized, route
-   every query through `search_folders(query)` first to narrow to the top-K
-   folder paths, then run file-level retrieval scoped to those folders. This
-   cuts the AI agent's token cost on large corpora.
+1. **Per-file embeddings.** Fill in `documents.embedding` and
+   `embedding_card_text`. We run cosine similarity in Python against the
+   same SQLite database; if the corpus outgrows that, we migrate to
+   pgvector.
+2. **Hybrid ranking** — combine BM25 (the keyword score) with cosine
+   similarity (the semantic score) using **reciprocal-rank fusion (RRF)**.
+   RRF works on *ranks*, not raw scores, which sidesteps the awkward
+   problem of mixing BM25 (unbounded) and cosine ([-1, 1]) directly.
+   Default fusion constant: **`k = 60`** (Cormack et al.). Anyone
+   overriding it must do so via config, not by silently changing code.
+3. **Folder pre-filter** — once the `folders` table exists, every query
+   runs through `search_folders(query)` first to pick the top-K folders,
+   then does file-level retrieval only within those folders. This cuts
+   token cost dramatically on large corpora because the AI agent can
+   ignore most of the tree.
 
 Phase 2 retrieval flow:
 
@@ -766,11 +811,11 @@ Once SharePoint sync is wired up, retrieval gains:
 
 ## 9. Future SharePoint integration — **OUT OF SCOPE** for this plan
 
-> ⚠ Everything in this section is **deferred**. No SharePoint or Microsoft
-> Graph code is part of v1. The schema and pipeline are designed so SharePoint
-> can be turned on later without breaking changes.
+> ⚠ Everything in this section is **deferred**. v1 has no SharePoint code,
+> no Microsoft Graph calls, no upload, nothing. The schema is just designed
+> so we can add it later without breaking what already works.
 
-When SharePoint phase begins (a separate plan), the pieces below activate:
+When the SharePoint phase begins (in its own plan), here's what comes online:
 
 - **Schema**: the nullable columns reserved in §6.2 and §7.2 are populated:
   - `documents.sharepoint_site_id`
@@ -789,14 +834,14 @@ When SharePoint phase begins (a separate plan), the pieces below activate:
 - **Sync**: a reconciliation step compares local `sha256` to the remote
   `quickXorHash` / `sha1Hash` to detect drift.
 
-What this plan **does** do to make Phase 3 painless:
+What v1 **does** do, just to keep Phase 3 painless:
 
-- All SharePoint columns exist in the v1 schema as nullable. No migration is
-  needed when Phase 3 starts.
-- `suggested_sharepoint_path` is computed and stored in v1, so the mapping
-  module has consistent input.
-- The metadata DB is isolated from `ProjectState`, so a future SharePoint
-  worker can read/write it without coupling to journal/task code.
+- The SharePoint columns already exist as nullable. Phase 3 will fill them
+  in — no migration needed.
+- `suggested_sharepoint_path` is already being computed and stored, so when
+  the mapping module shows up it has a consistent input format to work with.
+- The metadata DB is its own file, separate from `ProjectState`. A future
+  SharePoint worker can read and write it without touching journal/task data.
 
 What this plan **does not** do:
 
@@ -807,9 +852,10 @@ What this plan **does not** do:
 
 ## 10. Implementation tasks
 
-Sequenced, small, each landable in a single PR. Implementation begins **only
-after this plan is approved** and only once the writing-plans skill has
-produced a per-task plan.
+The work breaks into 8 small tasks, each one landable as a single PR. We
+**don't start implementing yet** — these tasks become real only after this
+plan is approved and the writing-plans skill produces a per-task plan with
+acceptance criteria.
 
 | # | Task | Module | Depends on |
 |---|------|--------|------------|
@@ -836,13 +882,14 @@ T5 wires them up; T6 can land in parallel with T5; T7 lands last.
 
 ## 11. Testing plan — synthetic / sample files only
 
-**Hard rule:** no test, fixture, or development run touches a real local user
-directory. All inputs live under `tests/fixtures/sample_docs/` and are
-authored by hand.
+**The hard rule:** no test, no fixture, no development run is allowed to
+touch the user's real folders. Every input file is hand-authored and
+lives under `tests/fixtures/sample_docs/`.
 
 ### 11.1 Fixture set
 
-A small mixed set, ~12 files, all clearly fake:
+A small, deliberately mixed set of about 12 files, all obviously fake (no
+real names, no real companies):
 
 ```
 tests/fixtures/sample_docs/
@@ -865,33 +912,34 @@ tests/fixtures/sample_docs/
 
 None of these reference real companies, people, or systems.
 
-**Behavior for edge fixtures:**
+**What we expect to happen for the edge fixtures:**
 
-- `empty_file.txt` and `binary_blob.bin` produce a `documents` row when the
-  organizer leaves them in place; `body_excerpt = ""`, summary may be a
-  short sentinel (e.g., `"Empty file."`), and `confidence` should be low.
-- The `body_excerpt` of `fake_large_report.txt` must be truncated to ≤ the
-  hard cap; the test asserts the recorded length.
-- `fake_korean_memo.md` should produce `language="ko"` when detection
-  succeeds, or `language="und"` if the detector is absent — both are valid;
-  the test accepts either.
+- **`empty_file.txt` and `binary_blob.bin`** — these still get a row in
+  `documents` (the organizer doesn't delete them). `body_excerpt` is the
+  empty string. `summary` is a short factual sentinel like `"Empty file."`.
+  `confidence` should be low.
+- **`fake_large_report.txt`** — the test confirms `body_excerpt` was
+  truncated to at most the hard cap.
+- **`fake_korean_memo.md`** — `language` should be `"ko"` if the detector
+  is installed, `"und"` if it isn't. Both are valid; the test accepts either.
 
-**Synthesized at test time (NOT checked into `sample_docs/`):**
+**Files we synthesize at test time** (not checked into `sample_docs/`):
 
-These cases require directory entries that should not live in a tracked
-fixture set. The pytest fixture creates them inside `tmp_path` after
-copying `sample_docs/`:
+A couple of edge cases are awkward to keep in a tracked fixture directory
+(you don't want a `.git/` folder living inside `tests/fixtures/`). The
+pytest fixture creates them inside `tmp_path` *after* copying the
+sample_docs:
 
-- `tmp_path/fake_repo/.git/HEAD` and `tmp_path/fake_repo/code.py` — exercises
-  the organizer's `_is_inside_git_repo` guardrail. The pipeline must record
-  the file with `outcome="skipped_repo"` in `classifier_run_files` and
-  produce **no** `documents` row for it.
-- `tmp_path/.DS_Store` — a junk filename. The organizer is allowed to delete
-  this; the pipeline must record `outcome="deleted_junk"` and produce no
-  `documents` row.
+- **`tmp_path/fake_repo/.git/HEAD` + `tmp_path/fake_repo/code.py`** —
+  exercises the organizer's "never touch git repos" guardrail. The pipeline
+  must record this file with `outcome="skipped_repo"` and produce **no**
+  `documents` row for it.
+- **`tmp_path/.DS_Store`** — a junk filename. The organizer is allowed to
+  delete it. The pipeline must record `outcome="deleted_junk"` and again
+  produce no `documents` row.
 
-Both are required for the E2E `classifier_run_files` assertions in §11.2 to
-have anything to match against.
+Without these two synthesized files, the E2E test in §11.2 has nothing
+to match its `classifier_run_files` assertions against.
 
 ### 11.2 Test cases
 
@@ -1018,16 +1066,20 @@ have anything to match against.
 
 ## 12. Open questions deferred to writing-plans
 
-These are intentionally not decided here; they belong in the per-task plan:
+These are intentionally **not** decided in this plan. They belong in the
+per-task plan, where we'll have the fixtures in front of us:
 
-- Choice of PDF/Word extractor (`pypdf` vs `pdfminer.six`; `python-docx`
-  presence) — depends on which produces the cleanest text on the fixture set.
-- Exact prompt wording for the strict classifier — best iterated against
-  the fixtures during T4.
-- CLI flag shape and output format (table vs JSON) — minor, decided in T7.
-- Whether to expose the metadata search via the existing MCP server
-  (`fda/mcp_server.py`) as a new tool — likely yes, but a separate task
-  after Phase 1 ships.
+- **Which PDF / Word extractor?** `pypdf` vs `pdfminer.six`, with or
+  without `python-docx`. Best decided by trying each one against the
+  fixture set and seeing which produces the cleanest text.
+- **The exact strict-classifier prompt.** Prompt wording is much easier
+  to iterate on once we have real classifier outputs to compare against
+  expected results — that's a T4 concern.
+- **CLI flag shape and output format** (table vs JSON) — small details
+  that get worked out in T7.
+- **Should metadata search be exposed via the MCP server**
+  (`fda/mcp_server.py`) as an additional tool? Probably yes, but that's
+  a follow-on task once Phase 1 has shipped.
 
 ---
 
