@@ -210,9 +210,9 @@ Key properties:
 
 ## 6. Strict classifier output schema
 
-The strict classifier (step 5) returns a JSON object that pydantic v2 must
-parse without errors. The schema below is the v1 shape. Phase 2 columns are
-reserved as nullable from day one to avoid migrations later.
+The strict classifier (step 6 in §5) returns a JSON object that pydantic v2
+must parse without errors. The schema below is the v1 shape. Phase 2 columns
+are reserved as nullable from day one to avoid migrations later.
 
 ### 6.1 Phase 1 fields — required for v1
 
@@ -231,8 +231,13 @@ ClassificationRecord {
   sha256:                   str        # 64-char hex; primary key
   size_bytes:               int
   mime_type:                str        # primary: stdlib mimetypes.guess_type;
-                                       # fallback: `file --mime-type` if the
-                                       # CLI is available (optional)
+                                       # fallback 1: `file --mime-type` if the
+                                       #             CLI is available (optional);
+                                       # fallback 2: "application/octet-stream"
+                                       #             (IANA "unknown binary" sentinel
+                                       #             — guarantees the field is
+                                       #             always a non-empty MIME-shaped
+                                       #             string for validation)
   language:                 str        # ISO 639-1 lowercase ("en", "ko", ...)
                                        # or "und" if detection failed
 
@@ -324,6 +329,20 @@ is breaking.
   closed on confidentiality is intentional: an item mistakenly labeled
   `restricted` is recoverable; an item mistakenly labeled `public` is not.
 
+**How downstream consumers tell "definitely restricted" from "uncertain
+fail-closed":** the only signal is `confidence`. The schema does not encode
+this distinction in a separate field — `confidence` already represents the
+underlying signal, and adding a parallel "uncertain" flag would split the
+contract. Concretely:
+
+- Search callers that want to exclude fail-closed records use the
+  `confidence_min` API parameter (§8.1).
+- UI surfaces should display the `confidence` value on any `restricted`
+  result so a human reviewer can re-classify if needed.
+- Automated routing (e.g., the future SharePoint upload phase) should
+  treat any `restricted` record below an organization-defined confidence
+  threshold as needing human review, not as a blocked file.
+
 ### 6.4 Validation rules (enforced by pydantic)
 
 - `sha256` matches `^[0-9a-f]{64}$`.
@@ -333,7 +352,10 @@ is breaking.
   this from `confidentiality` automatically; if the two disagree, validation
   raises.
 - `keywords` length **between 3 and 15** inclusive. Each keyword is a
-  non-empty trimmed string ≤ 64 characters.
+  non-empty trimmed string ≤ 64 characters and **must not contain
+  whitespace** (so that `keywords_concat = " ".join(keywords)` round-trips
+  losslessly via `split(' ')`). Multi-word phrases must use `_` or `-` as a
+  separator (e.g., `"error_rate"`, `"q3-revenue"`).
 - `keywords_concat` equals `" ".join(keywords)` exactly. Validator-computed,
   not classifier-supplied; if the classifier returns it inconsistently with
   `keywords`, validation raises.
@@ -380,7 +402,12 @@ opens the user's real metadata DB.
 -- Primary metadata, one row per unique file content (keyed by sha256).
 CREATE TABLE documents (
   sha256                     TEXT PRIMARY KEY
-                             CHECK (sha256 GLOB '[0-9a-f]*' AND length(sha256) = 64),
+                             -- length=64 AND every character is a lowercase
+                             -- hex digit. SQLite GLOB does not support
+                             -- "match N times" so we negate: forbid any
+                             -- non-hex character.
+                             CHECK (length(sha256) = 64
+                                    AND sha256 NOT GLOB '*[^0-9a-f]*'),
   file_name                  TEXT NOT NULL,
   original_local_path        TEXT NOT NULL,
   current_local_path         TEXT NOT NULL,
@@ -410,6 +437,14 @@ CREATE TABLE documents (
                                ('public','internal','confidential','restricted')),
   confidentiality_rank       INTEGER NOT NULL
                              CHECK (confidentiality_rank BETWEEN 1 AND 4),
+  -- Paired CHECK: rank must match label. Rejects rows like
+  -- ('public', 4) at the SQLite layer, not just in pydantic.
+  CONSTRAINT confidentiality_label_rank_consistent CHECK (
+    (confidentiality = 'public'       AND confidentiality_rank = 1) OR
+    (confidentiality = 'internal'     AND confidentiality_rank = 2) OR
+    (confidentiality = 'confidential' AND confidentiality_rank = 3) OR
+    (confidentiality = 'restricted'   AND confidentiality_rank = 4)
+  ),
 
   title                      TEXT NOT NULL,
   summary                    TEXT NOT NULL
@@ -471,11 +506,11 @@ CREATE TABLE classifier_runs (
   finished_at         TIMESTAMP,
   status              TEXT NOT NULL DEFAULT 'running'
                       CHECK (status IN ('running','ok','partial','failed')),
-  files_seen          INTEGER DEFAULT 0,
-  files_classified    INTEGER DEFAULT 0,
-  files_failed        INTEGER DEFAULT 0,
-  files_skipped_repo  INTEGER DEFAULT 0,
-  files_deleted_junk  INTEGER DEFAULT 0,
+  files_seen          INTEGER NOT NULL DEFAULT 0 CHECK (files_seen          >= 0),
+  files_classified    INTEGER NOT NULL DEFAULT 0 CHECK (files_classified    >= 0),
+  files_failed        INTEGER NOT NULL DEFAULT 0 CHECK (files_failed        >= 0),
+  files_skipped_repo  INTEGER NOT NULL DEFAULT 0 CHECK (files_skipped_repo  >= 0),
+  files_deleted_junk  INTEGER NOT NULL DEFAULT 0 CHECK (files_deleted_junk  >= 0),
   organizer_summary   TEXT,
   error               TEXT
 );
@@ -485,14 +520,20 @@ CREATE TABLE classifier_runs (
 -- deleted_junk, classify_failed, validate_failed). Lets us debug partial
 -- runs and quantify drop-off.
 CREATE TABLE classifier_run_files (
-  run_id     TEXT NOT NULL REFERENCES classifier_runs(run_id) ON DELETE CASCADE,
-  file_path  TEXT NOT NULL,                        -- pre-organizer path
-  sha256     TEXT,                                 -- NULL if fingerprinting failed
-  outcome    TEXT NOT NULL
-             CHECK (outcome IN ('classified','skipped_repo','deleted_junk',
-                                'extract_failed','classify_failed',
-                                'validate_failed')),
-  error      TEXT,
+  run_id              TEXT NOT NULL REFERENCES classifier_runs(run_id) ON DELETE CASCADE,
+  file_path           TEXT NOT NULL,             -- pre-organizer path (always present)
+  current_local_path  TEXT,                      -- post-organizer path; NULL when
+                                                 -- the file was never moved or was
+                                                 -- deleted_junk / skipped_repo
+  organizer_action    TEXT
+                      CHECK (organizer_action IS NULL OR organizer_action IN
+                             ('moved','unchanged','skipped_repo','deleted_junk')),
+  sha256              TEXT,                      -- NULL if fingerprinting failed
+  outcome             TEXT NOT NULL
+                      CHECK (outcome IN ('classified','skipped_repo','deleted_junk',
+                                         'extract_failed','classify_failed',
+                                         'validate_failed')),
+  error               TEXT,
   PRIMARY KEY (run_id, file_path)
 );
 
@@ -529,9 +570,13 @@ implemented as `confidentiality_rank <= 2`. The rank is derived from
 CHECK + the pydantic validator.
 
 **`parent_dir` query form.** Prefix filters use
-`parent_dir LIKE :prefix || '%'` with default BINARY collation; paths are
-case-sensitive on macOS/Linux. The `idx_documents_parent_dir` B-tree index
-is usable for any `LIKE` whose pattern has no leading wildcard.
+`parent_dir GLOB :prefix || '*'`, **not** `LIKE`. SQLite's `LIKE` is
+case-insensitive for ASCII by default regardless of column collation,
+which would break path matching on case-variant inputs. SQLite's `GLOB`
+is always case-sensitive and is index-usable for any pattern whose
+leading characters are literal (no wildcard at the start). The
+`idx_documents_parent_dir` B-tree index satisfies that condition for
+the `:prefix || '*'` query.
 
 ### 7.3 Phase 2 sibling — `document_chunks` (illustrative; not built in v1)
 
@@ -564,12 +609,21 @@ Folder-level metadata is **deferred to Phase 2**. In v1 we compute folder views
 on the fly via aggregation:
 
 ```sql
--- Example v1 folder view (no folders table needed):
+-- Example v1 folder view (no folders table needed). MAX is taken over
+-- confidentiality_rank (integer), NOT confidentiality (string), to avoid
+-- lexicographic ordering bugs (e.g., 'public' > 'confidential' as strings).
+-- The label is recovered by joining back through a CASE.
 SELECT
   parent_dir,
-  COUNT(*)                                  AS file_count,
-  GROUP_CONCAT(DISTINCT department)         AS departments_present,
-  MAX(confidentiality)                      AS max_confidentiality
+  COUNT(*)                                            AS file_count,
+  GROUP_CONCAT(DISTINCT department)                   AS departments_present,
+  MAX(confidentiality_rank)                           AS max_confidentiality_rank,
+  CASE MAX(confidentiality_rank)
+       WHEN 1 THEN 'public'
+       WHEN 2 THEN 'internal'
+       WHEN 3 THEN 'confidential'
+       WHEN 4 THEN 'restricted'
+  END                                                 AS max_confidentiality
 FROM documents
 GROUP BY parent_dir;
 ```
@@ -584,7 +638,11 @@ CREATE TABLE folders (
   file_count                  INTEGER NOT NULL,
   dominant_department         TEXT,
   dominant_business_category  TEXT,
-  confidentiality_max         TEXT,
+  -- Stored as INTEGER, not TEXT, so range queries and rollups behave
+  -- correctly. The label is derived from the rank when needed.
+  confidentiality_max_rank    INTEGER
+                              CHECK (confidentiality_max_rank IS NULL
+                                     OR confidentiality_max_rank BETWEEN 1 AND 4),
   summary                     TEXT,
   keywords                    TEXT,
   embedding                   BLOB,
@@ -634,18 +692,21 @@ search(
                                               # confidential|restricted; matches
                                               # rows with confidentiality_rank
                                               # <= rank(confidentiality_max)
-    parent_dir_prefix: str | None = None, # SQL: parent_dir LIKE prefix || '%'
-                                          # (BINARY collation; case-sensitive)
+    parent_dir_prefix: str | None = None, # SQL: parent_dir GLOB prefix || '*'
+                                          # (always case-sensitive, index-usable)
     modified_after: datetime | None = None,
     confidence_min: float | None = None,  # rows with confidence >= value
     limit: int = 50,
 ) -> list[ClassificationRecord]
 ```
 
-The returned `ClassificationRecord` reconstructs `keywords` from
-`document_keywords` (ordered by insertion order, which mirrors the
-classifier's emission order); `keywords_concat` is taken from the
-`documents` row directly.
+**Keyword reconstruction.** `ClassificationRecord.keywords` is rehydrated by
+splitting `documents.keywords_concat` on a single space. The
+`keywords_concat` column is the canonical, ordered source — the
+classifier's emission order is preserved there because it is written
+verbatim. The `document_keywords` table is **not** used for keyword
+ordering; it exists only for filter / facet queries (e.g., "show me every
+document tagged `compliance`").
 
 CLI form (Phase 1 deliverable):
 
@@ -666,8 +727,9 @@ Phase 2 turns on three reserved capabilities:
    using **reciprocal-rank fusion (RRF)** as the default. RRF is chosen
    because it operates on ranks, not raw scores, so it avoids the
    normalization problem of mixing BM25 (unbounded) and cosine (bounded
-   [-1, 1]) directly. The fusion constant `k` (typically 60) is the only
-   tuneable.
+   [-1, 1]) directly. The default fusion constant is **`k = 60`** (the
+   value originally proposed by Cormack et al.); implementations may
+   override only via configuration, not silently.
 3. **Folder pre-filter (two-stage)** — when `folders` is materialized, route
    every query through `search_folders(query)` first to narrow to the top-K
    folder paths, then run file-level retrieval scoped to those folders. This
@@ -755,7 +817,7 @@ produced a per-task plan.
 | T2 | Create `metadata.db` storage module: schema bootstrap, upsert, FTS5 triggers, audit log. | `fda/metadata/store.py` | T1 |
 | T3 | Text-extraction utility per extension (.txt/.md/.csv direct; .pdf/.docx via optional libs; binary → empty). Truncates to `body_excerpt` size. Optional libraries (`pypdf`, `python-docx`, etc.) must be `try/except`-imported and gated behind capability checks; the test suite must pass with **none** of them installed (binary extractors fall back to empty body in that case). | `fda/metadata/extract.py` | — |
 | T4 | Strict-output classifier component: one Claude call per file with strict JSON prompt; parses through pydantic. Includes a fake `Classifier` for tests. | `fda/metadata/classifier.py` | T1, T3 |
-| T5 | Pipeline runner: discover → fingerprint → extract → call `organize_files()` (unmodified) → classify → derive SP path → validate → persist. | `fda/metadata/pipeline.py` | T2, T3, T4 |
+| T5 | Pipeline runner: discover → fingerprint → extract → call `organize_files()` (unmodified) → **resolve_outcome** (route `skipped_repo`/`deleted_junk` to audit-only) → classify → derive SP path → validate → persist (single transaction) → **record_failures** (per-file outcomes into `classifier_run_files`, run never aborts on a single bad file) → report. Matches §5 step list exactly. | `fda/metadata/pipeline.py` | T2, T3, T4 |
 | T6 | Retrieval API: `search(...)` with filters + FTS5 query. | `fda/metadata/search.py` | T2 |
 | T7 | CLI subcommand: `fda metadata classify <dir>`, `fda metadata search`, `fda metadata stats`. | `fda/cli.py` (additive) | T5, T6 |
 | T8 | Test suite: schema unit tests, store unit tests, fake-classifier pipeline test, end-to-end test on synthetic fixtures. | `tests/test_metadata_*.py` | all |
@@ -813,6 +875,23 @@ None of these reference real companies, people, or systems.
 - `fake_korean_memo.md` should produce `language="ko"` when detection
   succeeds, or `language="und"` if the detector is absent — both are valid;
   the test accepts either.
+
+**Synthesized at test time (NOT checked into `sample_docs/`):**
+
+These cases require directory entries that should not live in a tracked
+fixture set. The pytest fixture creates them inside `tmp_path` after
+copying `sample_docs/`:
+
+- `tmp_path/fake_repo/.git/HEAD` and `tmp_path/fake_repo/code.py` — exercises
+  the organizer's `_is_inside_git_repo` guardrail. The pipeline must record
+  the file with `outcome="skipped_repo"` in `classifier_run_files` and
+  produce **no** `documents` row for it.
+- `tmp_path/.DS_Store` — a junk filename. The organizer is allowed to delete
+  this; the pipeline must record `outcome="deleted_junk"` and produce no
+  `documents` row.
+
+Both are required for the E2E `classifier_run_files` assertions in §11.2 to
+have anything to match against.
 
 ### 11.2 Test cases
 
@@ -917,6 +996,13 @@ None of these reference real companies, people, or systems.
 - FTS5 queries with `AND`, `OR`, phrase, and prefix all work.
 - `confidence_min=0.7` filter excludes lower-confidence rows.
 - `confidentiality_max="internal"` excludes confidential / restricted rows.
+- `parent_dir_prefix="/tmp/foo/Bar"` matches `/tmp/foo/Bar/...` rows but
+  **not** `/tmp/foo/bar/...` rows (verifies GLOB case-sensitivity).
+- `suggested_sharepoint_path` for every classified fixture matches the
+  canonical pattern `^[A-Z][A-Za-z]+/[A-Z][A-Za-z]+/[^/]+$`
+  (Title-Cased department / business-category / file_name; no extra path
+  segments). This locks the v1 mapping rule in §6.1 so the future Phase 3
+  mapping module has a stable input format.
 
 **Integrity:**
 
