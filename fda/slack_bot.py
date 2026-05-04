@@ -224,10 +224,9 @@ class SlackBotAgent(BaseAgent):
         if event.get("bot_id") or event.get("subtype"):
             return
 
-        # Channel filter — only respond in the configured channel
+        # Respond in any channel/DM the bot is invited to.
+        # Slack OAuth scopes already restrict where events arrive.
         channel = event.get("channel", "")
-        if self.channel_id and channel != self.channel_id:
-            return
 
         text = event.get("text", "").strip()
         if not text:
