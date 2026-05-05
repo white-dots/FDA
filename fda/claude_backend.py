@@ -265,16 +265,22 @@ class ClaudeCodeCLIBackend(ClaudeBackend):
             return self.complete(
                 system=system, messages=messages, model=model, max_tokens=max_tokens,
             )
+        forward_kwargs: dict[str, Any] = dict(kwargs)
+        # Only forward `model` when explicitly set; otherwise let the API
+        # backend apply its own default. The CLI shim's `model=""` default
+        # would otherwise clobber the API backend's default and produce a
+        # 400 from Anthropic ("model: String should have at least 1 character").
+        if model:
+            forward_kwargs["model"] = model
         return api_backend.complete_with_tools(
             system=system,
             messages=messages,
             tools=tools,
             tool_executor=tool_executor,
-            model=model,
             max_tokens=max_tokens,
             max_iterations=max_iterations,
             timeout=timeout,
-            **kwargs,
+            **forward_kwargs,
         )
 
     def _get_api_backend_for_tools(self) -> Optional["AnthropicAPIBackend"]:
