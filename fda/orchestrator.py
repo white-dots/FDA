@@ -1263,6 +1263,7 @@ Be specific and actionable. The developer needs to know exactly what to change.
         dirs_created = result.get("dirs_created", [])
         discrepancies = result.get("discrepancies", [])
         leftover_empty_dirs = result.get("leftover_empty_dirs", [])
+        failures = result.get("failures", [])
         summary = result.get("summary", "")
         error = result.get("error")
 
@@ -1282,6 +1283,21 @@ Be specific and actionable. The developer needs to know exactly what to change.
         if dirs_created:
             dir_lines = "\n".join(f"- `{d}`" for d in dirs_created)
             parts.append(f"## Directories Created\n{dir_lines}")
+
+        if failures:
+            fail_lines = []
+            for f in failures:
+                src = Path(f.get("source") or f.get("destination") or "?").name
+                dest = f.get("destination") or ""
+                err = f.get("error") or "unknown error"
+                if dest:
+                    fail_lines.append(f"- `{src}` → `{dest}` ({err})")
+                else:
+                    fail_lines.append(f"- `{src}` ({err})")
+            parts.append(
+                f"## Couldn't Complete ({len(failures)})\n"
+                + "\n".join(fail_lines)
+            )
 
         if deletions:
             del_lines = "\n".join(

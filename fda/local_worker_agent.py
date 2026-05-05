@@ -167,18 +167,30 @@ def _plan_result_to_dict(result) -> dict[str, Any]:
     """Translate a fda.organize.PlanResult into the back-compat dict shape.
 
     Back-compat keys: success, summary, moves, deletions, dirs_created,
-    repos_skipped. Additive: per-move `reason`, plus `discrepancies` and
-    `leftover_empty_dirs`.
+    repos_skipped. Additive: per-move `reason`, plus `discrepancies`,
+    `leftover_empty_dirs`, and `failures` (one entry per failed outcome
+    so the orchestrator can render the spec's `## Couldn't Complete`
+    section).
     """
     from fda.organize.models import OperationKind
 
     moves: list[dict[str, str]] = []
     deletions: list[dict[str, str]] = []
     dirs_created: list[str] = []
+    failures: list[dict[str, str]] = []
     for outcome in result.outcomes:
+        op = outcome.operation
+        if outcome.status == "failed":
+            failures.append({
+                "kind": op.kind.value,
+                "source": op.source or "",
+                "destination": op.destination or "",
+                "reason": op.reason,
+                "error": outcome.error or "",
+            })
+            continue
         if outcome.status not in ("applied", "rescued", "skipped"):
             continue
-        op = outcome.operation
         if op.kind == OperationKind.MOVE:
             moves.append({
                 "from": op.source,
@@ -204,6 +216,7 @@ def _plan_result_to_dict(result) -> dict[str, Any]:
         "repos_skipped": list(result.repos_skipped),
         "discrepancies": list(result.discrepancies),
         "leftover_empty_dirs": list(result.leftover_empty_dirs),
+        "failures": failures,
     }
 
 

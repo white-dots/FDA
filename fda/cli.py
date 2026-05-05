@@ -1290,7 +1290,7 @@ def handle_organize(args: argparse.Namespace) -> int:
     if moves:
         print(f"  Files moved: {len(moves)}")
         for m in moves[:10]:
-            print(f"    {m.get('source', '?')} -> {m.get('destination', '?')}")
+            print(f"    {m.get('from', '?')} -> {m.get('to', '?')}")
         if len(moves) > 10:
             print(f"    ... and {len(moves) - 10} more")
     if deletions:

@@ -198,6 +198,13 @@ class TestOrganizeFilesBackCompat:
 
         result = local_worker.organize_files(str(local_worker_dir), "")
         assert result["success"] is False
+        # Failed outcomes must be surfaced so the orchestrator can render the
+        # spec's `## Couldn't Complete` section. They must NOT appear in moves.
+        assert result["moves"] == []
+        assert len(result["failures"]) == 1
+        assert result["failures"][0]["kind"] == "move"
+        assert result["failures"][0]["error"] == "permission denied"
+        assert result["failures"][0]["source"].endswith("readme.txt")
 
     def test_success_false_when_discrepancies(self, local_worker, local_worker_dir, monkeypatch):
         from fda.organize.models import Plan, PlanResult
