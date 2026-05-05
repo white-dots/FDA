@@ -153,3 +153,121 @@ class TestValidateOperation:
             reason="r",
         )
         _fs.validate_operation(op, workspace)  # no raise
+
+
+class TestApplyCreateDir:
+    def test_creates_dir(self, workspace):
+        dest = workspace / "new" / "nested"
+        op = Operation(
+            kind=OperationKind.CREATE_DIR,
+            source=None,
+            destination=str(dest),
+            reason="r",
+        )
+        _fs.apply_create_dir(op, workspace)
+        assert dest.is_dir()
+
+    def test_existing_dir_is_idempotent(self, workspace):
+        dest = workspace / "subdir"
+        op = Operation(
+            kind=OperationKind.CREATE_DIR,
+            source=None,
+            destination=str(dest),
+            reason="r",
+        )
+        _fs.apply_create_dir(op, workspace)  # no raise
+        assert dest.is_dir()
+
+
+class TestApplyMove:
+    def test_moves_file(self, workspace):
+        src = workspace / "a.txt"
+        dest = workspace / "subdir" / "a.txt"
+        op = Operation(
+            kind=OperationKind.MOVE,
+            source=str(src),
+            destination=str(dest),
+            reason="r",
+        )
+        _fs.apply_move(op, workspace)
+        assert not src.exists()
+        assert dest.read_text() == "hello"
+
+    def test_creates_parent_dirs(self, workspace):
+        src = workspace / "a.txt"
+        dest = workspace / "deeply" / "nested" / "a.txt"
+        op = Operation(
+            kind=OperationKind.MOVE,
+            source=str(src),
+            destination=str(dest),
+            reason="r",
+        )
+        _fs.apply_move(op, workspace)
+        assert dest.read_text() == "hello"
+
+    def test_destination_collision_raises(self, workspace):
+        src = workspace / "a.txt"
+        dest = workspace / "subdir" / "a.txt"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text("existing")
+        op = Operation(
+            kind=OperationKind.MOVE,
+            source=str(src),
+            destination=str(dest),
+            reason="r",
+        )
+        with pytest.raises(FileExistsError):
+            _fs.apply_move(op, workspace)
+        # Source untouched
+        assert src.read_text() == "hello"
+
+    def test_idempotent_when_already_moved_returns_skipped(self, workspace):
+        # Source gone, destination has same-name file -> return "skipped".
+        src = workspace / "a.txt"
+        dest = workspace / "subdir" / "a.txt"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text("hello")
+        src.unlink()
+        op = Operation(
+            kind=OperationKind.MOVE,
+            source=str(src),
+            destination=str(dest),
+            reason="r",
+        )
+        # apply_move returns a status string: "applied" or "skipped".
+        assert _fs.apply_move(op, workspace) == "skipped"
+        assert dest.read_text() == "hello"
+
+    def test_returns_applied_on_first_move(self, workspace):
+        src = workspace / "a.txt"
+        dest = workspace / "subdir" / "a.txt"
+        op = Operation(
+            kind=OperationKind.MOVE,
+            source=str(src),
+            destination=str(dest),
+            reason="r",
+        )
+        assert _fs.apply_move(op, workspace) == "applied"
+
+
+class TestApplyDelete:
+    def test_deletes_junk(self, workspace):
+        target = workspace / ".DS_Store"
+        op = Operation(
+            kind=OperationKind.DELETE,
+            source=str(target),
+            destination=None,
+            reason="r",
+        )
+        _fs.apply_delete(op, workspace)
+        assert not target.exists()
+
+    def test_idempotent_when_already_gone(self, workspace):
+        target = workspace / "ghost.txt"
+        op = Operation(
+            kind=OperationKind.DELETE,
+            source=str(target),
+            destination=None,
+            reason="r",
+        )
+        _fs.apply_delete(op, workspace)  # no raise

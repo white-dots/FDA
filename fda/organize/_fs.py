@@ -7,6 +7,7 @@ operations used by the executor.
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 from fda.organize.models import Operation, OperationKind
@@ -119,3 +120,48 @@ def validate_operation(op: Operation, target: Path) -> None:
         return
 
     raise ValueError(f"Unknown operation kind: {op.kind}")
+
+
+def apply_create_dir(op: Operation, target: Path) -> None:
+    """Idempotent mkdir -p. Re-validates before applying."""
+    validate_operation(op, target)
+    Path(op.destination).mkdir(parents=True, exist_ok=True)
+
+
+def apply_move(op: Operation, target: Path) -> str:
+    """Move source -> destination.
+
+    Returns "applied" on a fresh move, "skipped" if source is already
+    missing AND destination already holds a file with the same name
+    (idempotent re-run). Raises FileExistsError on collision (source
+    still present), FileNotFoundError if neither source nor destination
+    is present, OSError on permission errors.
+    """
+    validate_operation(op, target)
+    src = Path(op.source)
+    dest = Path(op.destination)
+
+    if not src.exists():
+        if dest.exists() and dest.is_file():
+            return "skipped"
+        raise FileNotFoundError(f"source missing: {src}")
+
+    if dest.exists():
+        raise FileExistsError(f"destination already exists: {dest}")
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(src), str(dest))
+    return "applied"
+
+
+def apply_delete(op: Operation, target: Path) -> None:
+    """Delete source if it exists; no-op if already gone.
+
+    Existence is checked before validation so a re-run sees a clean
+    no-op even though `validate_operation` would reject a non-existent,
+    non-junk path at plan time.
+    """
+    if op.source is not None and not Path(op.source).exists():
+        return
+    validate_operation(op, target)
+    Path(op.source).unlink()
