@@ -102,7 +102,10 @@ class TestLocalWorkerTools:
 
 
 class TestFileOrganization:
-    """Tests for the file organization tools."""
+    """Tests retained for git-repo detection, human-size formatting, and
+    the still-public organize_files() validation entry point. The detailed
+    per-tool tests have moved into tests/test_organize_*.py now that
+    file organization lives in fda.organize."""
 
     def test_is_inside_git_repo(self, local_worker, local_worker_dir):
         git_file = local_worker_dir / "my-project" / "main.py"
@@ -110,113 +113,6 @@ class TestFileOrganization:
 
         assert local_worker._is_inside_git_repo(git_file) is True
         assert local_worker._is_inside_git_repo(non_git_file) is False
-
-    def test_orgtool_list_directory_shows_metadata(self, local_worker, local_worker_dir):
-        result = local_worker._orgtool_list_directory(
-            local_worker_dir, {"path": "."},
-        )
-        # Should show sizes and dates
-        assert "modified:" in result
-        # Should flag git repos
-        assert "[GIT REPO]" in result
-
-    def test_orgtool_get_file_info(self, local_worker, local_worker_dir):
-        result = local_worker._orgtool_get_file_info(
-            local_worker_dir, {"path": "readme.txt"},
-        )
-        info = json.loads(result)
-        assert info["name"] == "readme.txt"
-        assert info["type"] == "file"
-        assert info["in_git_repo"] is False
-        assert "size" in info
-        assert "modified" in info
-
-    def test_orgtool_get_file_info_git_repo(self, local_worker, local_worker_dir):
-        result = local_worker._orgtool_get_file_info(
-            local_worker_dir, {"path": "my-project"},
-        )
-        info = json.loads(result)
-        assert info["type"] == "directory"
-        assert info["is_git_repo"] is True
-
-    def test_orgtool_get_file_info_inside_repo(self, local_worker, local_worker_dir):
-        result = local_worker._orgtool_get_file_info(
-            local_worker_dir, {"path": "my-project/main.py"},
-        )
-        info = json.loads(result)
-        assert info["in_git_repo"] is True
-
-    def test_orgtool_create_directory(self, local_worker, local_worker_dir):
-        local_worker._organize_dirs_created = []
-        result = local_worker._orgtool_create_directory(
-            local_worker_dir, {"path": "Documents/PDFs"},
-        )
-        assert "Created" in result
-        assert (local_worker_dir / "Documents" / "PDFs").is_dir()
-        assert len(local_worker._organize_dirs_created) == 1
-
-    def test_orgtool_move_file(self, local_worker, local_worker_dir):
-        local_worker._organize_moves = []
-        # Create target dir first
-        (local_worker_dir / "organized").mkdir()
-
-        result = local_worker._orgtool_move_file(
-            local_worker_dir,
-            {"source": "readme.txt", "destination": "organized/readme.txt"},
-        )
-        assert "Moved" in result
-        assert not (local_worker_dir / "readme.txt").exists()
-        assert (local_worker_dir / "organized" / "readme.txt").exists()
-        assert len(local_worker._organize_moves) == 1
-
-    def test_orgtool_move_blocks_git_repo(self, local_worker, local_worker_dir):
-        local_worker._organize_moves = []
-        result = local_worker._orgtool_move_file(
-            local_worker_dir,
-            {"source": "my-project/main.py", "destination": "moved.py"},
-        )
-        assert "BLOCKED" in result
-        assert len(local_worker._organize_moves) == 0
-
-    def test_orgtool_move_nonexistent_source(self, local_worker, local_worker_dir):
-        result = local_worker._orgtool_move_file(
-            local_worker_dir,
-            {"source": "ghost.txt", "destination": "somewhere.txt"},
-        )
-        assert "Error" in result
-
-    def test_orgtool_delete_junk(self, local_worker, local_worker_dir):
-        local_worker._organize_deletions = []
-        result = local_worker._orgtool_delete_file(
-            local_worker_dir, {"path": ".DS_Store"},
-        )
-        assert "Deleted" in result
-        assert not (local_worker_dir / ".DS_Store").exists()
-        assert len(local_worker._organize_deletions) == 1
-
-    def test_orgtool_delete_blocks_user_files(self, local_worker, local_worker_dir):
-        local_worker._organize_deletions = []
-        result = local_worker._orgtool_delete_file(
-            local_worker_dir, {"path": "readme.txt"},
-        )
-        assert "BLOCKED" in result
-        assert (local_worker_dir / "readme.txt").exists()
-
-    def test_orgtool_delete_blocks_inside_git(self, local_worker, local_worker_dir):
-        # Create a .DS_Store inside the git repo
-        (local_worker_dir / "my-project" / ".DS_Store").write_bytes(b"\x00")
-        result = local_worker._orgtool_delete_file(
-            local_worker_dir, {"path": "my-project/.DS_Store"},
-        )
-        assert "BLOCKED" in result
-
-    def test_orgtool_delete_allows_empty_files(self, local_worker, local_worker_dir):
-        local_worker._organize_deletions = []
-        (local_worker_dir / "empty.tmp").write_text("")
-        result = local_worker._orgtool_delete_file(
-            local_worker_dir, {"path": "empty.tmp"},
-        )
-        assert "Deleted" in result
 
     def test_human_size(self):
         from fda.local_worker_agent import LocalWorkerAgent
@@ -229,31 +125,171 @@ class TestFileOrganization:
         result = local_worker.organize_files("/nonexistent/path")
         assert result["success"] is False
 
-    def test_execute_organize_tool_dispatch(self, local_worker, local_worker_dir):
-        """Verify the tool dispatcher routes to the right methods."""
-        local_worker._organize_moves = []
-        local_worker._organize_deletions = []
-        local_worker._organize_dirs_created = []
-        local_worker._repos_skipped = []
 
-        # list_directory
-        result = local_worker._execute_organize_tool(
-            "list_directory", {"path": "."},
-        )
-        assert "modified:" in result
+class TestOrganizeFilesBackCompat:
+    """Phase A: organize_files() returns the same dict shape as today,
+    plus per-move `reason`, `discrepancies`, and `leftover_empty_dirs`."""
 
-        # get_file_info
-        result = local_worker._execute_organize_tool(
-            "get_file_info", {"path": "readme.txt"},
+    def test_dict_shape_preserved(self, local_worker, local_worker_dir, monkeypatch):
+        from fda.organize.models import (
+            Operation, OperationKind, Plan, PlanResult, OperationOutcome,
         )
-        info = json.loads(result)
-        assert info["name"] == "readme.txt"
 
-        # unknown tool
-        result = local_worker._execute_organize_tool(
-            "nonexistent_tool", {},
+        op = Operation(
+            kind=OperationKind.MOVE,
+            source=str(local_worker_dir / "readme.txt"),
+            destination=str(local_worker_dir / "Texts" / "readme.txt"),
+            reason="text file",
         )
-        assert "Unknown tool" in result
+        plan = Plan(
+            target=str(local_worker_dir),
+            instructions="",
+            operations=(op,),
+            grouping_summary="g",
+        )
+        outcome = OperationOutcome(operation_index=0, operation=op, status="applied")
+        fake_result = PlanResult(
+            plan=plan,
+            outcomes=(outcome,),
+            leftover_empty_dirs=(),
+            discrepancies=(),
+            repos_skipped=(),
+            summary="rendered summary",
+        )
+
+        def fake_organize(target, instructions, **kwargs):
+            return fake_result
+
+        monkeypatch.setattr("fda.organize.organize", fake_organize)
+
+        result = local_worker.organize_files(str(local_worker_dir), "")
+        assert result["success"] is True
+        assert "summary" in result
+        assert "moves" in result
+        assert "deletions" in result
+        assert "dirs_created" in result
+        assert "repos_skipped" in result
+        assert "discrepancies" in result
+        assert "leftover_empty_dirs" in result
+        assert result["moves"][0]["reason"] == "text file"
+        assert result["moves"][0]["from"].endswith("readme.txt")
+        assert result["moves"][0]["to"].endswith("Texts/readme.txt")
+
+    def test_success_false_when_any_outcome_failed(self, local_worker, local_worker_dir, monkeypatch):
+        from fda.organize.models import (
+            Operation, OperationKind, Plan, PlanResult, OperationOutcome,
+        )
+
+        op = Operation(
+            kind=OperationKind.MOVE,
+            source=str(local_worker_dir / "readme.txt"),
+            destination=str(local_worker_dir / "Texts" / "readme.txt"),
+            reason="r",
+        )
+        plan = Plan(target=str(local_worker_dir), instructions="", operations=(op,), grouping_summary="")
+        outcome = OperationOutcome(
+            operation_index=0, operation=op, status="failed", error="permission denied",
+        )
+        fake_result = PlanResult(
+            plan=plan, outcomes=(outcome,), leftover_empty_dirs=(),
+            discrepancies=(), repos_skipped=(), summary="s",
+        )
+        monkeypatch.setattr("fda.organize.organize", lambda t, i, **kw: fake_result)
+
+        result = local_worker.organize_files(str(local_worker_dir), "")
+        assert result["success"] is False
+
+    def test_success_false_when_discrepancies(self, local_worker, local_worker_dir, monkeypatch):
+        from fda.organize.models import Plan, PlanResult
+
+        plan = Plan(target=str(local_worker_dir), instructions="", operations=(), grouping_summary="")
+        fake_result = PlanResult(
+            plan=plan, outcomes=(), leftover_empty_dirs=(),
+            discrepancies=("a.txt missing",), repos_skipped=(), summary="s",
+        )
+        monkeypatch.setattr("fda.organize.organize", lambda t, i, **kw: fake_result)
+
+        result = local_worker.organize_files(str(local_worker_dir), "")
+        assert result["success"] is False
+
+    def test_validation_error_returns_dict_not_raises(self, local_worker):
+        result = local_worker.organize_files("/etc", "")
+        assert result["success"] is False
+        assert "error" in result
+
+
+class TestOrganizeFilesPreviewAndApply:
+    def test_preview_returns_plan(self, local_worker, local_worker_dir, monkeypatch):
+        from fda.organize.models import Plan
+
+        fake_plan = Plan(target=str(local_worker_dir), instructions="", operations=(), grouping_summary="g")
+        monkeypatch.setattr("fda.organize.organize", lambda t, i, **kw: fake_plan)
+
+        result = local_worker.organize_files_preview(str(local_worker_dir), "")
+        assert isinstance(result, Plan)
+        assert result.grouping_summary == "g"
+
+    def test_apply_returns_dict(self, local_worker, local_worker_dir, monkeypatch):
+        from fda.organize.models import Plan, PlanResult
+
+        plan = Plan(target=str(local_worker_dir), instructions="", operations=(), grouping_summary="")
+        fake_result = PlanResult(
+            plan=plan, outcomes=(), leftover_empty_dirs=(),
+            discrepancies=(), repos_skipped=(), summary="done",
+        )
+        monkeypatch.setattr("fda.organize.apply_plan", lambda p, **kw: fake_result)
+
+        result = local_worker.organize_files_apply(plan)
+        assert result["success"] is True
+        assert result["summary"] == "done"
+
+
+class TestOrganizeConcurrencyRegression:
+    """Two back-to-back organize_files() calls on different targets must not
+    corrupt each other. Today's instance-field mutation made this unsafe;
+    Phase A removes the shared mutable state."""
+
+    def test_two_targets_dont_share_state(self, local_worker, tmp_path, monkeypatch):
+        from fda.organize.models import (
+            Operation, OperationKind, Plan, PlanResult, OperationOutcome,
+        )
+
+        ws_a = tmp_path / "a"
+        ws_a.mkdir()
+        (ws_a / "x.txt").write_text("x")
+        ws_b = tmp_path / "b"
+        ws_b.mkdir()
+        (ws_b / "y.txt").write_text("y")
+
+        local_worker.projects = [Path(tmp_path)]
+
+        captured_targets: list[str] = []
+
+        def fake_organize(target, instructions, **kwargs):
+            captured_targets.append(target)
+            t = Path(target)
+            entry = list(t.iterdir())[0]
+            op = Operation(
+                kind=OperationKind.MOVE,
+                source=str(t / entry.name),
+                destination=str(t / "Sorted" / entry.name),
+                reason="r",
+            )
+            plan = Plan(target=str(t), instructions=instructions, operations=(op,), grouping_summary="")
+            outcome = OperationOutcome(operation_index=0, operation=op, status="applied")
+            return PlanResult(
+                plan=plan, outcomes=(outcome,), leftover_empty_dirs=(),
+                discrepancies=(), repos_skipped=(), summary="s",
+            )
+
+        monkeypatch.setattr("fda.organize.organize", fake_organize)
+
+        r1 = local_worker.organize_files(str(ws_a), "first")
+        r2 = local_worker.organize_files(str(ws_b), "second")
+
+        assert r1["moves"][0]["from"].endswith("x.txt")
+        assert r2["moves"][0]["from"].endswith("y.txt")
+        assert captured_targets == [str(ws_a), str(ws_b)]
 
 
 class TestDeployment:

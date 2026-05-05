@@ -30,7 +30,6 @@ from fda.config import (
     LOCAL_WORKER_PROJECTS,
     LOCAL_WORKER_BACKUP_DIR,
     ANALYZE_TIMEOUT_SECONDS,
-    ORGANIZE_TIMEOUT_SECONDS,
     REPO_DISCOVERY_SKIP_DIRS,
     REPO_DISCOVERY_MAX_DEPTH,
 )
@@ -164,148 +163,48 @@ _LOCAL_WORKER_TOOLS: list[dict[str, Any]] = [
 ]
 
 
-# ---------------------------------------------------------------------------
-# File organization tool definitions
-# ---------------------------------------------------------------------------
+def _plan_result_to_dict(result) -> dict[str, Any]:
+    """Translate a fda.organize.PlanResult into the back-compat dict shape.
 
-_FILE_ORGANIZE_TOOLS: list[dict[str, Any]] = [
-    {
-        "name": "list_directory",
-        "description": (
-            "List files and subdirectories in a directory. "
-            "Returns filenames with '/' suffix for directories, plus basic "
-            "metadata (size, modified date). Use '.' for the target root."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Absolute or relative path. Use '.' for root.",
-                },
-            },
-            "required": [],
-        },
-    },
-    {
-        "name": "get_file_info",
-        "description": (
-            "Get detailed metadata about a file or directory: size, "
-            "creation date, modified date, file type, and whether it's "
-            "inside a git repository. Use this to understand what a file "
-            "is before deciding where it belongs."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Path to the file or directory.",
-                },
-            },
-            "required": ["path"],
-        },
-    },
-    {
-        "name": "read_file",
-        "description": (
-            "Read the contents of a text file to understand what it is. "
-            "Use sparingly — only when the filename alone isn't enough "
-            "to determine the file's purpose."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Path to the file.",
-                },
-            },
-            "required": ["path"],
-        },
-    },
-    {
-        "name": "move_file",
-        "description": (
-            "Move a file or directory to a new location. "
-            "Creates destination directories automatically. "
-            "NEVER move files that are inside a git repository."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "source": {
-                    "type": "string",
-                    "description": "Current path of the file/directory.",
-                },
-                "destination": {
-                    "type": "string",
-                    "description": "New path for the file/directory.",
-                },
-            },
-            "required": ["source", "destination"],
-        },
-    },
-    {
-        "name": "create_directory",
-        "description": (
-            "Create a new directory (and parent directories if needed). "
-            "Use this to create organization folders before moving files."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Path of the directory to create.",
-                },
-            },
-            "required": ["path"],
-        },
-    },
-    {
-        "name": "delete_file",
-        "description": (
-            "Delete a file. Only use for files that are clearly junk "
-            "(e.g. .DS_Store, Thumbs.db, empty temp files). "
-            "NEVER delete files inside a git repository. "
-            "NEVER delete files you haven't inspected first."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Path of the file to delete.",
-                },
-            },
-            "required": ["path"],
-        },
-    },
-    {
-        "name": "run_command",
-        "description": (
-            "Execute a shell command. Use for things like `du -sh`, "
-            "`file <path>`, `find`, etc. Output is capped at 10k chars."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "command": {
-                    "type": "string",
-                    "description": "Shell command to execute.",
-                },
-            },
-            "required": ["command"],
-        },
-    },
-]
+    Back-compat keys: success, summary, moves, deletions, dirs_created,
+    repos_skipped. Additive: per-move `reason`, plus `discrepancies` and
+    `leftover_empty_dirs`.
+    """
+    from fda.organize.models import OperationKind
 
-# Files that are always safe to delete
-_JUNK_FILES = frozenset({
-    ".DS_Store", "Thumbs.db", "desktop.ini", ".Spotlight-V100",
-    ".Trashes", ".fseventsd", "._*",
-})
+    moves: list[dict[str, str]] = []
+    deletions: list[dict[str, str]] = []
+    dirs_created: list[str] = []
+    for outcome in result.outcomes:
+        if outcome.status not in ("applied", "rescued", "skipped"):
+            continue
+        op = outcome.operation
+        if op.kind == OperationKind.MOVE:
+            moves.append({
+                "from": op.source,
+                "to": op.destination,
+                "reason": op.reason,
+            })
+        elif op.kind == OperationKind.DELETE:
+            deletions.append({"path": op.source, "reason": op.reason})
+        elif op.kind == OperationKind.CREATE_DIR:
+            dirs_created.append(op.destination)
+
+    success = (
+        all(o.status in ("applied", "rescued", "skipped") for o in result.outcomes)
+        and not result.discrepancies
+    )
+
+    return {
+        "success": success,
+        "summary": result.summary,
+        "moves": moves,
+        "deletions": deletions,
+        "dirs_created": dirs_created,
+        "repos_skipped": list(result.repos_skipped),
+        "discrepancies": list(result.discrepancies),
+        "leftover_empty_dirs": list(result.leftover_empty_dirs),
+    }
 
 
 class LocalWorkerAgent(BaseAgent):
@@ -980,45 +879,8 @@ IMPORTANT RULES:
         return name_or_path
 
     # ------------------------------------------------------------------
-    # File organization — agentic loop
+    # File organization — three-phase pipeline (planner+executor+verifier)
     # ------------------------------------------------------------------
-
-    ORGANIZE_SYSTEM_PROMPT = """You are the Local Worker agent for Datacore, operating in FILE ORGANIZATION mode.
-Your job is to scan a directory, understand what each file is and how files relate to each other, and organize them into a clean folder structure.
-
-You have tools to explore and organize the filesystem:
-- list_directory: See what files and folders exist
-- get_file_info: Get detailed metadata about a file (size, dates, type, git status)
-- read_file: Read a file's contents to understand its purpose
-- move_file: Move a file/directory to a new location
-- create_directory: Create new organization folders
-- delete_file: Delete junk files (only .DS_Store, Thumbs.db, etc.)
-- run_command: Run shell commands (du, file, find, etc.)
-
-WORKFLOW:
-1. List the target directory to see all files and folders
-2. For each file/folder, use get_file_info to understand what it is
-3. If the filename is ambiguous, read_file to understand its purpose
-4. Identify logical groupings (by project, by type, by purpose)
-5. Create organization folders if needed
-6. Move files into their logical homes
-
-CRITICAL RULES:
-- NEVER touch files inside a git repository. get_file_info tells you if a path is in a repo.
-  If a directory contains a .git folder, it's a repo — leave the ENTIRE directory alone.
-- NEVER delete user files. Only delete known junk files (.DS_Store, Thumbs.db, etc.)
-- NEVER move files without first understanding what they are
-- Group related files together (e.g. all PDFs about a topic, all scripts for a project)
-- Preserve the user's naming conventions — don't rename files
-- When in doubt, leave a file where it is
-- At the end, provide a clear summary of what you moved and why
-
-ORGANIZATION PRINCIPLES:
-- Group by purpose/project first, then by type within groups
-- Keep small, self-contained projects together even if they have mixed file types
-- Common top-level folders: Projects/, Documents/, Archives/, Scripts/, Downloads-Unsorted/
-- If a directory is already well-organized, say so and don't touch it
-"""
 
     def organize_files(
         self,
@@ -1026,333 +888,68 @@ ORGANIZATION PRINCIPLES:
         instructions: str = "",
         progress_callback: Optional[Callable[[str], None]] = None,
     ) -> dict[str, Any]:
-        """
-        Scan a directory and organize its files intelligently.
+        """Organize files in `target_path` via the planner+executor+verifier
+        pipeline. Returns the back-compat dict shape used by Telegram, the
+        web UI, and the orchestrator."""
+        from fda.organize import organize as _organize
+        from fda.organize.models import PlanResult
 
-        Understands file purposes and relationships, groups related files,
-        and moves them into a clean folder structure. Never touches git repos.
-
-        Args:
-            target_path: Directory to organize.
-            instructions: Optional user instructions (e.g. "sort by file type").
-            progress_callback: Optional callback for live progress updates.
-
-        Returns:
-            Dict with: success, summary, moves, deletions, repos_skipped, error.
-        """
-        def _progress(msg: str) -> None:
-            logger.info(f"[LocalWorker:organize] {msg}")
-            if progress_callback:
-                try:
-                    progress_callback(msg)
-                except Exception:
-                    pass
-
-        # Validate path
         try:
-            target = self._validate_project(target_path)
+            target_path = self.resolve_project_path(target_path)
+            result = _organize(
+                target_path,
+                instructions,
+                backend=self._backend,
+                allowed_roots=self.projects,
+                progress_callback=progress_callback,
+            )
         except ValueError as e:
             return {"success": False, "error": str(e)}
-
-        if not target.is_dir():
-            return {"success": False, "error": f"Not a directory: {target}"}
-
-        # Reset state for this run
-        self._current_project = target
-        self._organize_moves: list[dict[str, str]] = []
-        self._organize_deletions: list[str] = []
-        self._organize_dirs_created: list[str] = []
-        self._repos_skipped: list[str] = []
-
-        user_instruction = instructions or "Organize the files in this directory."
-
-        messages = [{
-            "role": "user",
-            "content": (
-                f"TARGET DIRECTORY: {target}\n\n"
-                f"INSTRUCTIONS: {user_instruction}\n\n"
-                "Please scan this directory, understand what each file is, "
-                "and organize them into a clean structure. Remember: never "
-                "touch anything inside a git repository."
-            ),
-        }]
-
-        _progress(f"Scanning {target.name} for organization...")
-
-        try:
-            response = self._backend.complete_with_tools(
-                system=self.ORGANIZE_SYSTEM_PROMPT,
-                messages=messages,
-                tools=_FILE_ORGANIZE_TOOLS,
-                tool_executor=self._execute_organize_tool,
-                model=MODEL_MEETING_SUMMARY,
-                max_tokens=8000,
-                max_iterations=20,
-                progress_callback=_progress,
-                timeout=ORGANIZE_TIMEOUT_SECONDS,
-            )
-        except ToolLoopTimeoutError as e:
-            logger.warning(f"File organization timed out: {e}")
-            return {"success": False, "error": f"Organization timed out after {e.elapsed:.0f}s."}
         except Exception as e:
-            logger.error(f"File organization failed: {e}", exc_info=True)
+            logger.error(f"organize_files failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
-        _progress(
-            f"Done: {len(self._organize_moves)} moves, "
-            f"{len(self._organize_deletions)} deletions, "
-            f"{len(self._repos_skipped)} repos skipped"
+        assert isinstance(result, PlanResult)
+        return _plan_result_to_dict(result)
+
+    def organize_files_preview(
+        self,
+        target_path: str,
+        instructions: str = "",
+        progress_callback: Optional[Callable[[str], None]] = None,
+    ):
+        """Build a Plan without executing it. Returns a fda.organize.Plan."""
+        from fda.organize import organize as _organize
+
+        target_path = self.resolve_project_path(target_path)
+        return _organize(
+            target_path,
+            instructions,
+            preview=True,
+            backend=self._backend,
+            allowed_roots=self.projects,
+            progress_callback=progress_callback,
         )
 
-        return {
-            "success": True,
-            "summary": response,
-            "moves": list(self._organize_moves),
-            "deletions": list(self._organize_deletions),
-            "dirs_created": list(self._organize_dirs_created),
-            "repos_skipped": list(self._repos_skipped),
-        }
-
-    # ------------------------------------------------------------------
-    # File organization tool execution
-    # ------------------------------------------------------------------
-
-    def _execute_organize_tool(
-        self, tool_name: str, tool_input: dict[str, Any]
-    ) -> str:
-        """Execute a file organization tool."""
-        project = self._current_project
-        if project is None:
-            return "Error: no project context set"
+    def organize_files_apply(
+        self,
+        plan,
+        progress_callback: Optional[Callable[[str], None]] = None,
+    ) -> dict[str, Any]:
+        """Apply a previously-generated Plan. Returns the back-compat dict."""
+        from fda.organize import apply_plan as _apply
 
         try:
-            if tool_name == "list_directory":
-                return self._orgtool_list_directory(project, tool_input)
-            elif tool_name == "get_file_info":
-                return self._orgtool_get_file_info(project, tool_input)
-            elif tool_name == "read_file":
-                return self._tool_read_file(project, tool_input)
-            elif tool_name == "move_file":
-                return self._orgtool_move_file(project, tool_input)
-            elif tool_name == "create_directory":
-                return self._orgtool_create_directory(project, tool_input)
-            elif tool_name == "delete_file":
-                return self._orgtool_delete_file(project, tool_input)
-            elif tool_name == "run_command":
-                return self._tool_run_command(project, tool_input)
-            else:
-                return f"Unknown tool: {tool_name}"
+            result = _apply(plan, progress_callback=progress_callback)
         except Exception as e:
-            logger.error(f"Organize tool {tool_name} error: {e}", exc_info=True)
-            return f"Error executing {tool_name}: {e}"
+            logger.error(f"organize_files_apply failed: {e}", exc_info=True)
+            return {"success": False, "error": str(e)}
+        return _plan_result_to_dict(result)
 
     def _is_inside_git_repo(self, path: Path) -> bool:
-        """Check if a path is inside a git repository."""
-        current = path if path.is_dir() else path.parent
-        while current != current.parent:
-            if (current / ".git").exists():
-                return True
-            current = current.parent
-        return False
-
-    def _orgtool_list_directory(
-        self, project: Path, tool_input: dict[str, Any]
-    ) -> str:
-        """List directory with metadata for organization."""
-        rel_path = tool_input.get("path", ".")
-        full_path = (project / rel_path).resolve()
-
-        if not full_path.is_relative_to(project):
-            return "Error: Path is outside the allowed directory"
-        if not full_path.is_dir():
-            return f"Error: Not a directory: {rel_path}"
-
-        entries: list[str] = []
-        try:
-            for entry in sorted(full_path.iterdir()):
-                if entry.name.startswith(".") and entry.name not in (".git",):
-                    continue
-                try:
-                    stat = entry.stat()
-                    modified = datetime.fromtimestamp(stat.st_mtime).strftime(
-                        "%Y-%m-%d"
-                    )
-                    if entry.is_dir():
-                        is_repo = (entry / ".git").exists()
-                        label = "[GIT REPO] " if is_repo else ""
-                        entries.append(
-                            f"{entry.name}/  {label}(modified: {modified})"
-                        )
-                    elif entry.is_file():
-                        size = self._human_size(stat.st_size)
-                        entries.append(
-                            f"{entry.name}  ({size}, modified: {modified})"
-                        )
-                except (PermissionError, OSError):
-                    entries.append(f"{entry.name}  (access denied)")
-        except PermissionError:
-            return f"Error: Permission denied: {rel_path}"
-
-        return "\n".join(entries) if entries else "(empty directory)"
-
-    def _orgtool_get_file_info(
-        self, project: Path, tool_input: dict[str, Any]
-    ) -> str:
-        """Get detailed file metadata."""
-        rel_path = tool_input.get("path", "")
-        if not rel_path:
-            return "Error: path is required"
-
-        full_path = (project / rel_path).resolve()
-        if not full_path.is_relative_to(project):
-            return "Error: Path is outside the allowed directory"
-        if not full_path.exists():
-            return f"Error: Path not found: {rel_path}"
-
-        try:
-            stat = full_path.stat()
-        except (PermissionError, OSError) as e:
-            return f"Error: Cannot stat {rel_path}: {e}"
-
-        info: dict[str, Any] = {
-            "name": full_path.name,
-            "type": "directory" if full_path.is_dir() else "file",
-            "size": self._human_size(stat.st_size),
-            "size_bytes": stat.st_size,
-            "created": datetime.fromtimestamp(stat.st_birthtime).strftime(
-                "%Y-%m-%d %H:%M"
-            ) if hasattr(stat, "st_birthtime") else "unknown",
-            "modified": datetime.fromtimestamp(stat.st_mtime).strftime(
-                "%Y-%m-%d %H:%M"
-            ),
-            "in_git_repo": self._is_inside_git_repo(full_path),
-        }
-
-        if full_path.is_dir():
-            info["is_git_repo"] = (full_path / ".git").exists()
-            try:
-                child_count = sum(1 for _ in full_path.iterdir())
-                info["contains"] = f"{child_count} items"
-            except PermissionError:
-                info["contains"] = "access denied"
-        else:
-            info["extension"] = full_path.suffix.lower()
-            # Use `file` command for MIME type
-            try:
-                result = subprocess.run(
-                    ["file", "--brief", "--mime-type", str(full_path)],
-                    capture_output=True, text=True, timeout=5,
-                )
-                info["mime_type"] = result.stdout.strip()
-            except Exception:
-                pass
-
-        return json.dumps(info, indent=2)
-
-    def _orgtool_move_file(
-        self, project: Path, tool_input: dict[str, Any]
-    ) -> str:
-        """Move a file/directory to a new location."""
-        source = tool_input.get("source", "")
-        destination = tool_input.get("destination", "")
-        if not source or not destination:
-            return "Error: source and destination are required"
-
-        src_path = (project / source).resolve()
-        dst_path = (project / destination).resolve()
-
-        if not src_path.is_relative_to(project):
-            return "Error: Source is outside the allowed directory"
-        if not dst_path.is_relative_to(project):
-            return "Error: Destination is outside the allowed directory"
-        if not src_path.exists():
-            return f"Error: Source not found: {source}"
-        if dst_path.exists():
-            return f"Error: Destination already exists: {destination}"
-
-        # Block moves inside git repos
-        if self._is_inside_git_repo(src_path):
-            return (
-                "BLOCKED: Source is inside a git repository. "
-                "Never move files within repos."
-            )
-
-        # Create parent directories
-        dst_path.parent.mkdir(parents=True, exist_ok=True)
-
-        try:
-            shutil.move(str(src_path), str(dst_path))
-            self._organize_moves.append({
-                "from": str(src_path.relative_to(project)),
-                "to": str(dst_path.relative_to(project)),
-            })
-            return f"Moved: {source} -> {destination}"
-        except Exception as e:
-            return f"Error moving file: {e}"
-
-    def _orgtool_create_directory(
-        self, project: Path, tool_input: dict[str, Any]
-    ) -> str:
-        """Create a directory."""
-        rel_path = tool_input.get("path", "")
-        if not rel_path:
-            return "Error: path is required"
-
-        full_path = (project / rel_path).resolve()
-        if not full_path.is_relative_to(project):
-            return "Error: Path is outside the allowed directory"
-
-        if full_path.exists():
-            return f"Directory already exists: {rel_path}"
-
-        try:
-            full_path.mkdir(parents=True, exist_ok=True)
-            self._organize_dirs_created.append(
-                str(full_path.relative_to(project))
-            )
-            return f"Created directory: {rel_path}"
-        except Exception as e:
-            return f"Error creating directory: {e}"
-
-    def _orgtool_delete_file(
-        self, project: Path, tool_input: dict[str, Any]
-    ) -> str:
-        """Delete a junk file (restricted to known safe patterns)."""
-        rel_path = tool_input.get("path", "")
-        if not rel_path:
-            return "Error: path is required"
-
-        full_path = (project / rel_path).resolve()
-        if not full_path.is_relative_to(project):
-            return "Error: Path is outside the allowed directory"
-        if not full_path.exists():
-            return f"Error: File not found: {rel_path}"
-        if full_path.is_dir():
-            return "Error: Cannot delete directories with this tool"
-
-        # Block deletion inside git repos
-        if self._is_inside_git_repo(full_path):
-            return "BLOCKED: File is inside a git repository."
-
-        # Only allow deleting known junk files or empty files
-        is_junk = full_path.name in _JUNK_FILES
-        is_empty = full_path.stat().st_size == 0
-
-        if not is_junk and not is_empty:
-            return (
-                f"BLOCKED: {full_path.name} is not a recognized junk file. "
-                "Only .DS_Store, Thumbs.db, desktop.ini, and empty files "
-                "can be deleted."
-            )
-
-        try:
-            full_path.unlink()
-            self._organize_deletions.append(
-                str(full_path.relative_to(project))
-            )
-            return f"Deleted: {rel_path}"
-        except Exception as e:
-            return f"Error deleting file: {e}"
+        """Back-compat shim — delegates to fda.organize._fs."""
+        from fda.organize import _fs
+        return _fs.is_inside_git_repo(path)
 
     @staticmethod
     def _human_size(size_bytes: int) -> str:
