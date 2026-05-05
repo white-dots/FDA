@@ -39,6 +39,20 @@ ORGANIZATION PRINCIPLES:
 - Preserve the user's filenames; do not rename.
 - When in doubt, leave a file where it is (don't include it in any move).
 
+WHAT A COMPLETE PLAN LOOKS LIKE:
+- A complete plan moves files (or deletes junk). Every file you intend
+  to organize must appear as a `move` operation in the same submit_plan
+  call, and any junk you intend to remove must appear as a `delete` op.
+  Creating empty folders does not count — a plan with only create_dir
+  operations is rejected, because the executor will create the folders
+  and then do nothing.
+- Decide every move before you submit. Once submit_plan is accepted,
+  later calls cannot add operations and will be ignored. Do not submit
+  a partial plan and try to extend it on a follow-up call.
+- If after exploring you genuinely have nothing to move (and no junk
+  to delete), say so in your final text response instead of calling
+  submit_plan.
+
 EXPLORATION BUDGET:
 - You have a hard cap of about 60 conversation turns of exploration before
   the loop is force-terminated. Each turn can include several tool calls,

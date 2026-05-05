@@ -337,6 +337,17 @@ def _exec_submit(
             "Fix every rejected op and resubmit:\n" + "\n".join(rejections)
         )
 
+    try:
+        _fs.validate_plan_shape(operations)
+    except ValueError as e:
+        emit(f"submit_plan rejected: {e}")
+        return (
+            f"submit_plan rejected: {e}. Add the move operations for "
+            "every file you intend to organize and resubmit. A single "
+            "complete plan is required — operations cannot be added "
+            "after a plan is accepted."
+        )
+
     state["submitted"] = True
     state["plan"] = Plan(
         target=str(target),

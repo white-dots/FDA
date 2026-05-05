@@ -1,5 +1,7 @@
 # Organize Success Rate — Phase A Implementation Plan
 
+**Status:** Implemented 2026-05-05.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Replace the single Claude tool-use loop in `LocalWorkerAgent.organize_files()` with a deterministic three-phase pipeline (planner → executor → verifier) so the same target folder + instructions yields the same set of file moves on every run, with per-move rationale captured for the journal.
@@ -9,6 +11,8 @@
 **Tech Stack:** Python 3.12, dataclasses, pytest with `tmp_path`, `unittest.mock.MagicMock` for the Claude backend, project's existing `fda.claude_backend.get_claude_backend` and `fda.config.LOCAL_WORKER_PROJECTS`.
 
 **Spec reference:** `docs/superpowers/specs/2026-05-04-organize-success-rate-design.md` (Phase A scope only — rescue, plan persistence, Telegram `--preview`, and web UI panel are deferred to a separate Phase B plan).
+
+**Rollback marker:** Pre-Phase-A HEAD is commit `76cb960` ("docs: Phase A implementation plan for organize success-rate redesign"). All Phase A code commits land on top of it. To revert Phase A wholesale on an unshared branch: `git reset --hard 76cb960`. To revert non-destructively (e.g., after the work has been pushed or merged): `git revert 76cb960..HEAD`. Optional one-time tag: `git tag pre-phase-a 76cb960`.
 
 **Test runner:** `/Users/john/.pyenv/versions/3.12.8/bin/python -m pytest tests/ -x -q --tb=short` (per project CLAUDE.md). The pre-commit hook runs the same command — commits are blocked on test failures.
 

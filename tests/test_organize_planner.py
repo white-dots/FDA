@@ -140,6 +140,78 @@ class TestSubmitPlanIdempotenceAndEmpty:
         assert len(plan.operations) == 2  # original plan preserved
 
 
+class TestSubmitPlanShape:
+    def test_create_dir_only_plan_is_rejected(self, workspace, stub_claude_backend):
+        # A plan with only create_dir ops creates empty folders and moves
+        # no files — useless. Reject so the planner tries again with moves.
+        scaffold_only = ("submit_plan", {
+            "operations": [
+                {
+                    "kind": "create_dir",
+                    "destination": str(workspace / "Texts"),
+                    "reason": "scaffold",
+                },
+                {
+                    "kind": "create_dir",
+                    "destination": str(workspace / "Other"),
+                    "reason": "scaffold",
+                },
+            ],
+            "grouping_summary": "scaffold only",
+        })
+        good = _valid_submit(workspace)
+        backend = stub_claude_backend([scaffold_only], [good])
+        plan = planner.build_plan(workspace, "", backend=backend)
+        # The second submission won — proves rejection didn't lock in
+        # the scaffold and didn't break idempotence either.
+        assert len(plan.operations) == 2
+        assert plan.grouping_summary == "grouped texts"
+
+    def test_delete_only_plan_is_accepted(self, workspace, stub_claude_backend):
+        # Junk cleanup with no moves is legitimate — the shape check
+        # must not over-reject delete-only plans.
+        junk = workspace / ".DS_Store"
+        junk.write_bytes(b"\x00" * 8)
+        delete_only = ("submit_plan", {
+            "operations": [
+                {
+                    "kind": "delete",
+                    "source": str(junk),
+                    "reason": "macOS junk",
+                },
+            ],
+            "grouping_summary": "junk cleanup",
+        })
+        backend = stub_claude_backend([delete_only])
+        plan = planner.build_plan(workspace, "", backend=backend)
+        assert len(plan.operations) == 1
+        assert plan.operations[0].kind == OperationKind.DELETE
+
+    def test_create_dir_plus_delete_is_accepted(self, workspace, stub_claude_backend):
+        # create_dir + delete (no moves) is unusual but legitimate.
+        # Guards against an over-eager rule that demands MOVE specifically.
+        junk = workspace / ".DS_Store"
+        junk.write_bytes(b"\x00" * 8)
+        mixed = ("submit_plan", {
+            "operations": [
+                {
+                    "kind": "create_dir",
+                    "destination": str(workspace / "Archive"),
+                    "reason": "pre-stage",
+                },
+                {
+                    "kind": "delete",
+                    "source": str(junk),
+                    "reason": "macOS junk",
+                },
+            ],
+            "grouping_summary": "stage + clean",
+        })
+        backend = stub_claude_backend([mixed])
+        plan = planner.build_plan(workspace, "", backend=backend)
+        assert len(plan.operations) == 2
+
+
 class TestBuildPlanLongExploration:
     def test_survives_many_exploration_turns_before_submit(
         self, workspace, stub_claude_backend
