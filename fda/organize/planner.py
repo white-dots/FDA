@@ -196,6 +196,11 @@ def _exec_info(target: Path, tinput: dict[str, Any]) -> str:
     return json.dumps(info)
 
 
+# Hard cap on bytes read from `pdftotext` stdout. The downstream slice is
+# 10_000 chars; 64 KB of bytes is enough headroom for that even after UTF-8
+# decoding, while preventing memory blow-up on adversarial PDFs.
+_PDF_MAX_BYTES = 64 * 1024
+
 _BINARY_EXTS = frozenset({
     ".pdf", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".webp",
     ".mp3", ".mp4", ".mov", ".avi", ".wav", ".flac", ".m4a", ".mkv",
@@ -208,11 +213,14 @@ _BINARY_EXTS = frozenset({
 def _extract_pdf_text(path: Path) -> str:
     """Best-effort PDF text extraction via `pdftotext` (poppler).
 
+    Reads at most _PDF_MAX_BYTES from the subprocess pipe so a malicious
+    or pathological PDF can't balloon memory even within the 10s timeout.
     Returns extracted text on success or an explanatory stub if pdftotext
-    is unavailable or fails. Limits to first 3 pages, 10 KB output.
+    is unavailable or fails. Limits to first 3 pages.
     """
     import shutil as _shutil
     import subprocess as _subprocess
+    import time as _time
 
     pdftotext = _shutil.which("pdftotext")
     if pdftotext is None:
@@ -221,14 +229,36 @@ def _extract_pdf_text(path: Path) -> str:
             f"(PDF, {size} bytes — install poppler/`pdftotext` "
             "to extract text content; classify by filename/size for now)"
         )
+
+    proc = None
     try:
-        r = _subprocess.run(
+        proc = _subprocess.Popen(
             [pdftotext, "-layout", "-l", "3", str(path), "-"],
-            capture_output=True, text=True, timeout=10,
+            stdout=_subprocess.PIPE, stderr=_subprocess.DEVNULL,
         )
+        chunks: list[bytes] = []
+        total = 0
+        deadline = _time.monotonic() + 10
+        while total < _PDF_MAX_BYTES and _time.monotonic() < deadline:
+            chunk = proc.stdout.read1(8192) if proc.stdout else b""
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        raw = b"".join(chunks)[:_PDF_MAX_BYTES]
     except (OSError, _subprocess.SubprocessError) as e:
         return f"(PDF extraction failed: {e})"
-    text = (r.stdout or "").strip()
+    finally:
+        if proc is not None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=2)
+            except _subprocess.TimeoutExpired:
+                pass
+    text = raw.decode("utf-8", errors="replace").strip()
     if not text:
         size = path.stat().st_size if path.exists() else 0
         return f"(PDF appears to be empty or image-only, {size} bytes)"
@@ -268,13 +298,6 @@ def _exec_submit(
     instructions: str,
     emit: Callable[[str], None],
 ) -> str:
-    raw_ops = tinput.get("operations", [])
-    grouping = tinput.get("grouping_summary", "")
-    try:
-        operations = _parse_operations(raw_ops)
-    except (KeyError, ValueError, TypeError) as e:
-        return f"error: malformed operation: {e}"
-
     if state["submitted"]:
         prev_n = len(state["plan"].operations) if state["plan"] else 0
         emit(f"submit_plan ignored (already accepted {prev_n} ops)")
@@ -283,6 +306,13 @@ def _exec_submit(
             "already accepted. The executor will run that plan. Stop "
             "calling tools and end your turn."
         )
+
+    raw_ops = tinput.get("operations", [])
+    grouping = tinput.get("grouping_summary", "")
+    try:
+        operations = _parse_operations(raw_ops)
+    except (KeyError, ValueError, TypeError) as e:
+        return f"error: malformed operation: {e}"
 
     if not operations:
         emit("submit_plan rejected: empty operations list")

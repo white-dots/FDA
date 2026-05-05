@@ -124,6 +124,36 @@ class TestSubmitPlanIdempotenceAndEmpty:
         with pytest.raises(planner.PlannerDidNotSubmitError):
             planner.build_plan(workspace, "", backend=backend)
 
+    def test_malformed_resubmit_after_acceptance_is_ignored_not_errored(
+        self, workspace, stub_claude_backend
+    ):
+        # Once a plan is accepted, even a malformed re-submission must
+        # surface the "already accepted" message — not "malformed" — so
+        # the model is steered toward ending its turn instead of repairing.
+        good = _valid_submit(workspace)
+        malformed = ("submit_plan", {
+            "operations": [{"kind": "garbage", "reason": "bad"}],  # invalid kind
+            "grouping_summary": "oops",
+        })
+        backend = stub_claude_backend([good], [malformed])
+        plan = planner.build_plan(workspace, "", backend=backend)
+        assert len(plan.operations) == 2  # original plan preserved
+
+
+class TestBuildPlanLongExploration:
+    def test_survives_many_exploration_turns_before_submit(
+        self, workspace, stub_claude_backend
+    ):
+        # Simulate a long exploration: many list_directory turns before the
+        # final submit. This guards against regressions in the iteration
+        # cap or loop termination behavior.
+        explore_turn = [("list_directory", {"path": "."})]
+        iterations = [explore_turn for _ in range(50)]
+        iterations.append([_valid_submit(workspace)])
+        backend = stub_claude_backend(*iterations)
+        plan = planner.build_plan(workspace, "", backend=backend)
+        assert len(plan.operations) == 2
+
 
 class TestExecRead:
     def test_text_file_returns_contents(self, workspace):
@@ -141,15 +171,51 @@ class TestExecRead:
     def test_pdf_with_pdftotext_extracts_text(self, workspace, monkeypatch):
         pdf = workspace / "doc.pdf"
         pdf.write_bytes(b"%PDF-fake")
+        import io
         import subprocess as _sp
-        class _Result:
-            stdout = "Invoice 12345\nCustomer: ACME\n"
-            returncode = 0
+
+        class _FakeProc:
+            def __init__(self):
+                self.stdout = io.BufferedReader(
+                    io.BytesIO(b"Invoice 12345\nCustomer: ACME\n")
+                )
+            def kill(self): pass
+            def wait(self, timeout=None): return 0
+            def poll(self): return 0
         monkeypatch.setattr("shutil.which",
                             lambda name: "/fake/pdftotext" if name == "pdftotext" else None)
-        monkeypatch.setattr(_sp, "run", lambda *a, **kw: _Result())
+        monkeypatch.setattr(_sp, "Popen", lambda *a, **kw: _FakeProc())
         out = planner._extract_pdf_text(pdf)
         assert "Invoice 12345" in out
+
+    def test_pdf_extraction_caps_bytes_read_from_subprocess(
+        self, workspace, monkeypatch
+    ):
+        # Adversarial PDF: subprocess produces megabytes of stdout. The
+        # extractor must cap reads at _PDF_MAX_BYTES rather than buffer
+        # everything into memory.
+        pdf = workspace / "huge.pdf"
+        pdf.write_bytes(b"%PDF-fake")
+        import io
+        import subprocess as _sp
+
+        # 1 MB of repeated chars — far above _PDF_MAX_BYTES (64 KB).
+        big_payload = b"x" * (1024 * 1024)
+
+        class _FakeProc:
+            def __init__(self):
+                self.stdout = io.BufferedReader(io.BytesIO(big_payload))
+                self.killed = False
+            def kill(self): self.killed = True
+            def wait(self, timeout=None): return 0
+            def poll(self): return None
+        monkeypatch.setattr("shutil.which",
+                            lambda name: "/fake/pdftotext" if name == "pdftotext" else None)
+        monkeypatch.setattr(_sp, "Popen", lambda *a, **kw: _FakeProc())
+        out = planner._extract_pdf_text(pdf)
+        # Output is ultimately sliced to 10_000 chars by the caller-facing
+        # return; the byte-level cap kicks in before that slice.
+        assert len(out) <= 10_000
 
     def test_pdf_without_pdftotext_returns_stub(self, workspace, monkeypatch):
         pdf = workspace / "doc.pdf"

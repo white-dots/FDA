@@ -40,7 +40,10 @@ ORGANIZATION PRINCIPLES:
 - When in doubt, leave a file where it is (don't include it in any move).
 
 EXPLORATION BUDGET:
-- You have a hard cap of about 60 tool calls before the loop is force-terminated.
+- You have a hard cap of about 60 conversation turns of exploration before
+  the loop is force-terminated. Each turn can include several tool calls,
+  so spend each turn deliberately — list-then-read a few files, not one
+  tool per turn.
 - For directories with many files, do NOT read every file. Sample 5–10 files
   spread across different folders/extensions/sizes to learn the patterns,
   then classify the rest using the patterns + filename/extension/size cues
