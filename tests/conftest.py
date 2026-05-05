@@ -139,6 +139,39 @@ def local_worker_dir(tmp_path):
     return root
 
 
+# ---------------------------------------------------------------------------
+# Stub Claude backend for organize planner tests
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def stub_claude_backend():
+    """Build a backend whose complete_with_tools replays scripted tool calls.
+
+    Usage:
+        backend = stub_claude_backend(
+            [("submit_plan", {"operations": [...], "grouping_summary": "..."})],
+        )
+        # Each positional arg is one iteration's list of (tool_name, tool_input).
+
+    The stub calls the tool_executor for each scripted tool call in order
+    and returns "" as final assistant text. Iteration cap and timeout
+    arguments from the real backend are ignored.
+    """
+    def _build(*iterations):
+        backend = MagicMock()
+
+        def fake_complete_with_tools(*, tool_executor, **_kwargs):
+            for iteration in iterations:
+                for name, tinput in iteration:
+                    tool_executor(name, tinput)
+            return ""
+
+        backend.complete_with_tools.side_effect = fake_complete_with_tools
+        return backend
+
+    return _build
+
+
 @pytest.fixture
 def local_worker(local_worker_dir, mock_claude_backend):
     """LocalWorkerAgent with mocked backend and temp project dir."""
