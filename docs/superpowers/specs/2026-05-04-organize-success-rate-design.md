@@ -1,7 +1,7 @@
 # Organize Success Rate — Design
 
 **Date:** 2026-05-04
-**Status:** draft — revised after Codex review (pending user approval)
+**Status:** Phase A landed 2026-05-05; Phase B pending separate plan
 **Owner:** hogyeongkim
 **Related notes:** Obsidian `FDA/Future Plan - Organization Success Rate`, `docs/local_metadata_layer_plan.md`
 
