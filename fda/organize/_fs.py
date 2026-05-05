@@ -42,11 +42,12 @@ def validate_target(path: str, allowed_roots: list[Path]) -> Path:
 def is_inside_git_repo(path: Path) -> bool:
     """Walk up from `path` looking for a `.git` directory.
 
-    Works for non-existent paths (uses the deepest existing ancestor).
+    Resolves symlinks and `..` components first so a path that lexically
+    sits outside a repo but physically resolves into one (via a symlink
+    or traversal) is detected. `Path.resolve(strict=False)` handles
+    non-existent leaf components.
     """
-    current = path
-    while not current.exists() and current != current.parent:
-        current = current.parent
+    current = path.resolve()
     if current.is_file():
         current = current.parent
     while current != current.parent:
@@ -75,7 +76,15 @@ def _require_absolute(label: str, value: str) -> Path:
 
 
 def _require_inside_target(label: str, p: Path, target: Path) -> None:
-    if not (p == target or p.is_relative_to(target)):
+    # Resolve both sides so `..` traversal can't bypass the lexical
+    # `is_relative_to` check (e.g., `/target/../outside` would otherwise
+    # appear to start with `/target/`).
+    resolved_p = p.resolve()
+    resolved_target = target.resolve()
+    if not (
+        resolved_p == resolved_target
+        or resolved_p.is_relative_to(resolved_target)
+    ):
         raise ValueError(f"{label} is outside target {target}: {p}")
 
 

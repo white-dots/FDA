@@ -51,6 +51,13 @@ class TestIsInsideGitRepo:
         path = workspace / "myrepo" / "would_be_here.txt"
         assert _fs.is_inside_git_repo(path) is True
 
+    def test_follows_symlinks_into_repo(self, workspace):
+        # Symlink outside the repo pointing at the repo: traversal via the
+        # symlink must still be detected as inside a git repo.
+        link = workspace / "shortcut"
+        link.symlink_to(workspace / "myrepo")
+        assert _fs.is_inside_git_repo(link / "tracked.py") is True
+
 
 class TestIsJunkFile:
     def test_known_junk(self, workspace):
@@ -98,6 +105,20 @@ class TestValidateOperation:
             kind=OperationKind.CREATE_DIR,
             source=None,
             destination=str(outside),
+            reason="r",
+        )
+        with pytest.raises(ValueError, match="outside target"):
+            _fs.validate_operation(op, workspace)
+
+    def test_destination_dotdot_traversal_rejected(self, workspace):
+        # Lexically starts with target but escapes via "..". Pure
+        # `is_relative_to` would let this through; the resolve-first
+        # containment check rejects it.
+        traversal = workspace / ".." / "outside_dir"
+        op = Operation(
+            kind=OperationKind.CREATE_DIR,
+            source=None,
+            destination=str(traversal),
             reason="r",
         )
         with pytest.raises(ValueError, match="outside target"):
