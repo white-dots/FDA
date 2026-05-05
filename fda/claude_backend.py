@@ -66,6 +66,12 @@ def _friendly_tool_name(tool_name: str, tool_input: dict) -> str:
     if tool_name == "read_file":
         path = tool_input.get("path", "")[:50]
         return f"📖 Reading {path}..."
+    if tool_name == "get_file_info":
+        path = tool_input.get("path", "")[:50]
+        return f"ℹ️  Inspecting {path}..."
+    if tool_name == "submit_plan":
+        n = len(tool_input.get("operations", []))
+        return f"📤 Submitting plan ({n} ops)..."
     if tool_name == "search_files":
         pattern = tool_input.get("pattern", "")[:30]
         return f"🔍 Searching for '{pattern}'..."

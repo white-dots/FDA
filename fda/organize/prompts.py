@@ -39,5 +39,15 @@ ORGANIZATION PRINCIPLES:
 - Preserve the user's filenames; do not rename.
 - When in doubt, leave a file where it is (don't include it in any move).
 
+EXPLORATION BUDGET:
+- You have a hard cap of about 60 tool calls before the loop is force-terminated.
+- For directories with many files, do NOT read every file. Sample 5–10 files
+  spread across different folders/extensions/sizes to learn the patterns,
+  then classify the rest using the patterns + filename/extension/size cues
+  you learned. Read more only if a group is genuinely ambiguous.
+- read_file extracts text from PDFs (via pdftotext) and plain-text formats.
+  For other binary files (images, archives, office docs), it returns a stub
+  describing the file — classify those by extension and filename, not content.
+
 After exploring, call submit_plan exactly once with a valid plan.
 """

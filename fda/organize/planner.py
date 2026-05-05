@@ -15,7 +15,7 @@ from fda.organize.prompts import PLANNER_SYSTEM_PROMPT
 logger = logging.getLogger(__name__)
 
 
-PLANNER_MAX_ITERATIONS = 20
+PLANNER_MAX_ITERATIONS = 60
 
 
 class PlannerDidNotSubmitError(Exception):
@@ -140,6 +140,7 @@ def build_plan(
         tools=_PLANNER_TOOLS,
         tool_executor=tool_executor,
         max_iterations=PLANNER_MAX_ITERATIONS,
+        progress_callback=_emit,
     )
 
     if not state["submitted"]:
@@ -195,6 +196,45 @@ def _exec_info(target: Path, tinput: dict[str, Any]) -> str:
     return json.dumps(info)
 
 
+_BINARY_EXTS = frozenset({
+    ".pdf", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".webp",
+    ".mp3", ".mp4", ".mov", ".avi", ".wav", ".flac", ".m4a", ".mkv",
+    ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar",
+    ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".odt", ".ods",
+    ".so", ".dylib", ".dll", ".exe", ".bin",
+})
+
+
+def _extract_pdf_text(path: Path) -> str:
+    """Best-effort PDF text extraction via `pdftotext` (poppler).
+
+    Returns extracted text on success or an explanatory stub if pdftotext
+    is unavailable or fails. Limits to first 3 pages, 10 KB output.
+    """
+    import shutil as _shutil
+    import subprocess as _subprocess
+
+    pdftotext = _shutil.which("pdftotext")
+    if pdftotext is None:
+        size = path.stat().st_size if path.exists() else 0
+        return (
+            f"(PDF, {size} bytes — install poppler/`pdftotext` "
+            "to extract text content; classify by filename/size for now)"
+        )
+    try:
+        r = _subprocess.run(
+            [pdftotext, "-layout", "-l", "3", str(path), "-"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, _subprocess.SubprocessError) as e:
+        return f"(PDF extraction failed: {e})"
+    text = (r.stdout or "").strip()
+    if not text:
+        size = path.stat().st_size if path.exists() else 0
+        return f"(PDF appears to be empty or image-only, {size} bytes)"
+    return text[:10000]
+
+
 def _exec_read(target: Path, tinput: dict[str, Any]) -> str:
     p = Path(tinput.get("path", ""))
     if not p.is_absolute():
@@ -203,6 +243,15 @@ def _exec_read(target: Path, tinput: dict[str, Any]) -> str:
         return "error: path outside target"
     if not p.is_file():
         return "error: not a file"
+    suffix = p.suffix.lower()
+    if suffix == ".pdf":
+        return _extract_pdf_text(p)
+    if suffix in _BINARY_EXTS:
+        size = p.stat().st_size
+        return (
+            f"(binary file: {suffix}, {size} bytes — read_file does not "
+            "extract text from this format; classify by filename/size)"
+        )
     try:
         text = p.read_text(encoding="utf-8", errors="replace")
     except OSError as e:
@@ -225,6 +274,24 @@ def _exec_submit(
         operations = _parse_operations(raw_ops)
     except (KeyError, ValueError, TypeError) as e:
         return f"error: malformed operation: {e}"
+
+    if state["submitted"]:
+        prev_n = len(state["plan"].operations) if state["plan"] else 0
+        emit(f"submit_plan ignored (already accepted {prev_n} ops)")
+        return (
+            f"submit_plan ignored: a plan with {prev_n} operations was "
+            "already accepted. The executor will run that plan. Stop "
+            "calling tools and end your turn."
+        )
+
+    if not operations:
+        emit("submit_plan rejected: empty operations list")
+        return (
+            "submit_plan rejected: operations list is empty. Submit a "
+            "complete plan of moves/creates/deletes. If there is genuinely "
+            "nothing to organize, say so in your final text response "
+            "instead of calling submit_plan with an empty list."
+        )
 
     rejections: list[str] = []
     for idx, op in enumerate(operations):

@@ -99,3 +99,61 @@ class TestBuildPlanMissedSubmit:
         backend = stub_claude_backend([])  # zero iterations
         with pytest.raises(planner.PlannerDidNotSubmitError):
             planner.build_plan(workspace, "", backend=backend)
+
+
+class TestSubmitPlanIdempotenceAndEmpty:
+    def test_first_accepted_plan_is_kept_when_resubmitted_empty(
+        self, workspace, stub_claude_backend
+    ):
+        # Models sometimes follow up an accepted plan with an empty resubmit.
+        # The first plan must NOT be overwritten.
+        good = _valid_submit(workspace)
+        empty = ("submit_plan", {"operations": [], "grouping_summary": "oops"})
+        backend = stub_claude_backend([good], [empty])
+        plan = planner.build_plan(workspace, "", backend=backend)
+        assert len(plan.operations) == 2  # not overwritten by the empty resubmit
+        assert plan.grouping_summary == "grouped texts"
+
+    def test_empty_plan_without_prior_submit_is_rejected(
+        self, workspace, stub_claude_backend
+    ):
+        # An empty operations list with no prior submission must be rejected,
+        # not silently accepted as a no-op plan.
+        empty = ("submit_plan", {"operations": [], "grouping_summary": "nothing"})
+        backend = stub_claude_backend([empty])  # only the empty submit, no follow-up
+        with pytest.raises(planner.PlannerDidNotSubmitError):
+            planner.build_plan(workspace, "", backend=backend)
+
+
+class TestExecRead:
+    def test_text_file_returns_contents(self, workspace):
+        out = planner._exec_read(workspace, {"path": "a.txt"})
+        assert out == "hello"
+
+    def test_binary_extension_returns_stub_not_garbage(self, workspace):
+        # An image file written with bytes — _exec_read must not return mojibake.
+        img = workspace / "photo.png"
+        img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)
+        out = planner._exec_read(workspace, {"path": "photo.png"})
+        assert out.startswith("(binary file: .png")
+        assert "PNG" not in out  # stub, not the raw header bytes
+
+    def test_pdf_with_pdftotext_extracts_text(self, workspace, monkeypatch):
+        pdf = workspace / "doc.pdf"
+        pdf.write_bytes(b"%PDF-fake")
+        import subprocess as _sp
+        class _Result:
+            stdout = "Invoice 12345\nCustomer: ACME\n"
+            returncode = 0
+        monkeypatch.setattr("shutil.which",
+                            lambda name: "/fake/pdftotext" if name == "pdftotext" else None)
+        monkeypatch.setattr(_sp, "run", lambda *a, **kw: _Result())
+        out = planner._extract_pdf_text(pdf)
+        assert "Invoice 12345" in out
+
+    def test_pdf_without_pdftotext_returns_stub(self, workspace, monkeypatch):
+        pdf = workspace / "doc.pdf"
+        pdf.write_bytes(b"%PDF-fake-content")
+        monkeypatch.setattr("shutil.which", lambda name: None)
+        out = planner._extract_pdf_text(pdf)
+        assert "PDF" in out and "pdftotext" in out
