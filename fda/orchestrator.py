@@ -1251,75 +1251,80 @@ Be specific and actionable. The developer needs to know exactly what to change.
             self.state.update_task(task_id, status="blocked")
             return {"success": False, "error": str(e)}
 
-        if result.get("success"):
-            self.state.update_task(task_id, status="completed")
+        success = bool(result.get("success"))
+        self.state.update_task(
+            task_id,
+            status="completed" if success else "blocked",
+        )
 
-            # Log to journal
-            moves = result.get("moves", [])
-            deletions = result.get("deletions", [])
-            repos_skipped = result.get("repos_skipped", [])
-            dirs_created = result.get("dirs_created", [])
-            summary = result.get("summary", "")
+        moves = result.get("moves", [])
+        deletions = result.get("deletions", [])
+        repos_skipped = result.get("repos_skipped", [])
+        dirs_created = result.get("dirs_created", [])
+        discrepancies = result.get("discrepancies", [])
+        leftover_empty_dirs = result.get("leftover_empty_dirs", [])
+        summary = result.get("summary", "")
+        error = result.get("error")
 
-            # Build journal content
-            parts = [f"## Target\n`{target_path}`"]
-            if instructions:
-                parts.append(f"## Instructions\n{instructions}")
+        parts = [f"## Target\n`{target_path}`"]
+        if instructions:
+            parts.append(f"## Instructions\n{instructions}")
+        if summary:
+            parts.append(f"## Plan Summary\n{summary[:2000]}")
 
-            if moves:
-                move_lines = "\n".join(
-                    f"- `{m['from']}` → `{m['to']}`" for m in moves[:50]
-                )
-                parts.append(f"## Files Moved ({len(moves)})\n{move_lines}")
-
-            if dirs_created:
-                dir_lines = "\n".join(f"- `{d}`" for d in dirs_created)
-                parts.append(f"## Directories Created\n{dir_lines}")
-
-            if deletions:
-                del_lines = "\n".join(f"- `{d}`" for d in deletions)
-                parts.append(f"## Junk Deleted\n{del_lines}")
-
-            if repos_skipped:
-                repo_lines = "\n".join(f"- `{r}`" for r in repos_skipped)
-                parts.append(f"## Git Repos Skipped\n{repo_lines}")
-
-            if summary:
-                parts.append(f"## Summary\n{summary[:2000]}")
-
-            content = "\n\n".join(parts)
-
-            journal_tags = ["worker", "local", "file-organization"]
-            brief = instructions[:60] if instructions else f"Organize {dir_name}"
-            journal_summary = (
-                f"[LOCAL] File organization: {brief} "
-                f"({len(moves)} moves, {len(deletions)} deletions)"
+        if moves:
+            move_lines = "\n".join(
+                f"- `{m['from']}` → `{m['to']}` — {m.get('reason', '')}".rstrip(" — ")
+                for m in moves[:50]
             )
+            parts.append(f"## Files Moved ({len(moves)})\n{move_lines}")
 
-            try:
-                self._journal.write_entry(
-                    author="orchestrator",
-                    tags=journal_tags,
-                    summary=journal_summary,
-                    content=content,
-                    relevance_decay="medium",
-                )
-            except Exception as e:
-                logger.warning(f"Failed to write organize journal entry: {e}")
+        if dirs_created:
+            dir_lines = "\n".join(f"- `{d}`" for d in dirs_created)
+            parts.append(f"## Directories Created\n{dir_lines}")
 
-            return result
-        else:
-            error = result.get("error", "Unknown error")
-            self.state.update_task(task_id, status="blocked")
-
-            self._log_worker_journal(
-                task_brief=instructions or f"Organize {dir_name}",
-                target=f"LOCAL ({dir_name})",
-                result_type="error",
-                error=error,
+        if deletions:
+            del_lines = "\n".join(
+                f"- `{d.get('path', d) if isinstance(d, dict) else d}`"
+                for d in deletions
             )
+            parts.append(f"## Junk Deleted\n{del_lines}")
 
-            return result
+        if leftover_empty_dirs:
+            empty_lines = "\n".join(f"- `{d}`" for d in leftover_empty_dirs)
+            parts.append(f"## Empty Folders Cleaned\n{empty_lines}")
+
+        if repos_skipped:
+            repo_lines = "\n".join(f"- `{r}`" for r in repos_skipped)
+            parts.append(f"## Git Repos Skipped\n{repo_lines}")
+
+        if discrepancies:
+            disc_lines = "\n".join(f"- {d}" for d in discrepancies)
+            parts.append(f"## Discrepancies\n{disc_lines}")
+
+        if error:
+            parts.append(f"## Error\n{error}")
+
+        content = "\n\n".join(parts)
+        brief = instructions[:60] if instructions else f"Organize {dir_name}"
+        journal_summary = (
+            f"[LOCAL] File organization: {brief} "
+            f"({len(moves)} moves, {len(deletions)} deletions, "
+            f"{len(leftover_empty_dirs)} cleanups)"
+        )
+
+        try:
+            self._journal.write_entry(
+                author="orchestrator",
+                tags=["worker", "local", "file-organization"],
+                summary=journal_summary,
+                content=content,
+                relevance_decay="medium",
+            )
+        except Exception as e:
+            logger.warning(f"Failed to write organize journal entry: {e}")
+
+        return result
 
     # ------------------------------------------------------------------
     # Journal logging for worker results
