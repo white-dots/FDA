@@ -223,7 +223,7 @@ def _exec_submit(
     grouping = tinput.get("grouping_summary", "")
     try:
         operations = _parse_operations(raw_ops)
-    except (KeyError, ValueError) as e:
+    except (KeyError, ValueError, TypeError) as e:
         return f"error: malformed operation: {e}"
 
     rejections: list[str] = []

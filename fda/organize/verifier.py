@@ -50,10 +50,20 @@ def _find_discrepancies(outcomes: tuple[OperationOutcome, ...]) -> list[str]:
             if not Path(op.destination).is_dir():
                 issues.append(f"create_dir marked applied but missing: {op.destination}")
         elif op.kind == OperationKind.MOVE:
-            if not Path(op.destination).exists():
+            dest = Path(op.destination)
+            src = Path(op.source) if op.source else None
+            if not dest.exists():
                 issues.append(
                     f"move marked applied but destination missing: "
-                    f"{Path(op.source).name} -> {op.destination}"
+                    f"{src.name if src else '?'} -> {op.destination}"
+                )
+            elif src is not None and src.exists() and src.resolve() != dest.resolve():
+                # Completed MOVE should leave the source gone. If it's still
+                # there alongside an existing destination, the file was
+                # duplicated rather than moved — flag it.
+                issues.append(
+                    f"move marked applied but source still present: "
+                    f"{src} (alongside {op.destination})"
                 )
         elif op.kind == OperationKind.DELETE:
             if Path(op.source).exists():
@@ -68,24 +78,41 @@ def _clean_empty_source_dirs(
 ) -> list[str]:
     """Remove directories that the plan itself emptied.
 
-    Walks the source-parents of every MOVE op (whether applied or not),
-    and rmdirs any that are now empty AND inside `target` AND not a
-    git repo. Each removed dir is recorded.
+    Walks the source-parents of every MOVE op the executor considers
+    complete (applied/rescued/skipped) and rmdirs any that are now
+    empty AND inside `target` AND not a git repo. Failed MOVEs are
+    skipped — their source may have a `..` traversal that lexically
+    starts with `target` but resolves outside, and we must never rmdir
+    a directory outside the target tree.
     """
+    move_status: dict[int, str] = {
+        outcome.operation_index: outcome.status
+        for outcome in outcomes
+        if outcome.operation.kind == OperationKind.MOVE
+    }
     candidates: set[Path] = set()
-    for op in plan.operations:
+    target_resolved = target.resolve()
+    for idx, op in enumerate(plan.operations):
         if op.kind != OperationKind.MOVE or op.source is None:
             continue
-        parent = Path(op.source).parent
-        if parent == target:
+        if move_status.get(idx) not in ("applied", "rescued", "skipped"):
+            continue
+        try:
+            parent = Path(op.source).parent.resolve()
+        except OSError:
+            continue
+        if parent == target_resolved:
+            continue
+        # Resolve-first containment check: `..`-traversal sources that
+        # lexically start with `target` but escape it never become
+        # candidates.
+        if not (parent == target_resolved or parent.is_relative_to(target_resolved)):
             continue
         candidates.add(parent)
 
     cleaned: list[str] = []
     for parent in sorted(candidates, key=lambda p: -len(p.parts)):
         if not parent.exists() or not parent.is_dir():
-            continue
-        if not parent.is_relative_to(target):
             continue
         if _fs.is_inside_git_repo(parent) or (parent / ".git").exists():
             continue

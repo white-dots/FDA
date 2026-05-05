@@ -127,6 +127,67 @@ class TestEmptyDirCleanup:
         assert sub.exists()
 
 
+class TestCleanupSafety:
+    def test_failed_move_with_dotdot_source_does_not_rmdir_outside_target(
+        self, workspace, tmp_path
+    ):
+        # An empty directory that lives OUTSIDE the target. A malicious or
+        # corrupted plan with a `..` traversal source would lexically appear
+        # to be inside target but resolve outside. The verifier must never
+        # rmdir something outside target.
+        outside = tmp_path / "outside_dir"
+        outside.mkdir()
+        op_move = Operation(
+            kind=OperationKind.MOVE,
+            source=str(workspace / ".." / "outside_dir" / "ghost.txt"),
+            destination=str(workspace / "Texts" / "ghost.txt"),
+            reason="r",
+        )
+        plan = _plan(workspace, op_move)
+        # Even if some buggy executor marked this applied, the parent
+        # resolves outside target and must be ignored.
+        outcomes = (_outcome(0, op_move, status="applied"),)
+        result = verifier.verify_plan(plan, outcomes, workspace)
+        assert str(outside) not in result.leftover_empty_dirs
+        assert outside.exists()
+
+    def test_failed_move_does_not_rmdir_source_parent(self, workspace):
+        # Even an in-target failed MOVE shouldn't trigger cleanup — the
+        # plan didn't actually empty the parent.
+        old = workspace / "old"
+        old.mkdir()
+        # Simulate: source never existed, MOVE failed.
+        op_move = Operation(
+            kind=OperationKind.MOVE,
+            source=str(old / "nonexistent.txt"),
+            destination=str(workspace / "Texts" / "nonexistent.txt"),
+            reason="r",
+        )
+        plan = _plan(workspace, op_move)
+        outcomes = (_outcome(0, op_move, status="failed", error="src missing"),)
+        result = verifier.verify_plan(plan, outcomes, workspace)
+        assert str(old) not in result.leftover_empty_dirs
+        assert old.exists()
+
+
+class TestMoveSourceStillPresent:
+    def test_applied_move_with_source_still_present_is_discrepancy(self, workspace):
+        # File was duplicated rather than moved — both ends exist.
+        (workspace / "a.txt").write_text("hello")
+        (workspace / "Texts").mkdir()
+        (workspace / "Texts" / "a.txt").write_text("hello")
+        op_move = Operation(
+            kind=OperationKind.MOVE,
+            source=str(workspace / "a.txt"),
+            destination=str(workspace / "Texts" / "a.txt"),
+            reason="r",
+        )
+        plan = _plan(workspace, op_move)
+        outcomes = (_outcome(0, op_move, status="applied"),)
+        result = verifier.verify_plan(plan, outcomes, workspace)
+        assert any("source still present" in d for d in result.discrepancies)
+
+
 class TestSummaryRendering:
     def test_summary_includes_grouping_and_reasons(self, workspace):
         (workspace / "Texts").mkdir()

@@ -3,6 +3,15 @@
 Single source of truth for path validation, git-repo detection (both
 source and destination), junk-file rules, and the deterministic apply
 operations used by the executor.
+
+Concurrency model: the apply primitives assume a single writer for the
+target tree during a run. `apply_move` checks `dest.exists()` before
+calling `shutil.move`, and `apply_delete` re-validates and unlinks.
+A second concurrent process modifying the same files between those
+steps can produce a TOCTOU race (silent overwrite or unintended
+unlink). The orchestrator guarantees per-target serialization, so
+callers outside that path must not invoke organize concurrently
+against the same directory.
 """
 
 from __future__ import annotations
