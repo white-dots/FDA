@@ -95,7 +95,8 @@ class OrganizeLogger:
         return DEFAULT_LOG_ROOT / f"{stem}.log"
 
     def log(self, event: str, **fields: object) -> None:
-        ts = datetime.now().strftime("%H:%M:%S.") + f"{datetime.now().microsecond // 1000:03d}"
+        now = datetime.now()
+        ts = now.strftime("%H:%M:%S.") + f"{now.microsecond // 1000:03d}"
         parts = [f"[{ts}] {event}"]
         for key, value in fields.items():
             parts.append(f"{key}={_format_value(key, value)}")
