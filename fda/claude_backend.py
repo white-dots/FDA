@@ -10,6 +10,8 @@ Set FDA_CLAUDE_BACKEND=api to force API mode, or FDA_CLAUDE_BACKEND=cli to force
 By default, the system auto-detects: if `claude` is on PATH, it uses CLI.
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import os
@@ -100,6 +102,7 @@ class ClaudeBackend:
         model: str = "",
         max_tokens: int = 4096,
         temperature: float = 0.7,
+        timeout: float | None = None,
     ) -> str:
         """
         Send a prompt to Claude and return the text response.
@@ -110,6 +113,7 @@ class ClaudeBackend:
             model: Model name (used by API backend; ignored by CLI backend).
             max_tokens: Maximum tokens in response.
             temperature: Sampling temperature.
+            timeout: Per-request HTTP timeout in seconds. None means use the backend's default.
 
         Returns:
             Claude's response text.
@@ -177,6 +181,7 @@ class ClaudeCodeCLIBackend(ClaudeBackend):
         model: str = "",
         max_tokens: int = 4096,
         temperature: float = 0.7,
+        timeout: float | None = None,
     ) -> str:
         # Build the user prompt from messages
         prompt = self._build_prompt("", messages)
@@ -190,13 +195,15 @@ class ClaudeCodeCLIBackend(ClaudeBackend):
 
         logger.debug(f"[ClaudeCodeCLI] Running: claude --print ({len(prompt)} chars via stdin)")
 
+        effective_timeout = self._timeout if timeout is None else timeout
+
         try:
             result = subprocess.run(
                 cmd,
                 input=prompt,
                 capture_output=True,
                 text=True,
-                timeout=self._timeout,
+                timeout=effective_timeout,
             )
 
             if result.returncode != 0:
@@ -214,8 +221,8 @@ class ClaudeCodeCLIBackend(ClaudeBackend):
             return output
 
         except subprocess.TimeoutExpired:
-            raise RuntimeError(
-                f"Claude Code CLI timed out after {self._timeout}s"
+            raise TimeoutError(
+                f"Claude Code CLI timed out after {effective_timeout}s"
             )
         except FileNotFoundError:
             raise RuntimeError(
@@ -334,13 +341,18 @@ class AnthropicAPIBackend(ClaudeBackend):
         model: str = "claude-sonnet-4-5-20250929",
         max_tokens: int = 4096,
         temperature: float = 0.7,
+        timeout: float | None = None,
     ) -> str:
+        extra: dict = {}
+        if timeout is not None:
+            extra["timeout"] = timeout
         response = self._client.messages.create(
             model=model,
             max_tokens=max_tokens,
             system=system,
             messages=messages,
             temperature=temperature,
+            **extra,
         )
         return response.content[0].text
 
