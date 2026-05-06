@@ -54,6 +54,7 @@ class TestEachConstantHasOneHome:
         "READER_PER_FILE_TIMEOUT_SECONDS": ("reader.py", "30"),
         "READER_TOTAL_TIMEOUT_SECONDS": ("reader.py", "300"),
         "READER_WORKER_COUNT": ("reader.py", "8"),
+        "VERBATIM_HEAD_CHARS": ("reader.py", "300"),
         "TAXONOMY_SAMPLE_FULL_THRESHOLD": ("classifier.py", "150"),
         "TAXONOMY_SAMPLE_TARGET_SIZE": ("classifier.py", "100"),
         "TAXONOMY_SAMPLE_FALLBACK_BUDGET": ("classifier.py", "100"),
