@@ -165,6 +165,7 @@ class TestOrganizeFilesBackCompat:
         result = local_worker.organize_files(str(local_worker_dir), "")
         assert result["success"] is True
         assert "summary" in result
+        assert "log_path" in result
         assert "moves" in result
         assert "deletions" in result
         assert "dirs_created" in result

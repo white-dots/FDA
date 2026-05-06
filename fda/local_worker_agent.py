@@ -217,6 +217,7 @@ def _plan_result_to_dict(result) -> dict[str, Any]:
         "discrepancies": list(result.discrepancies),
         "leftover_empty_dirs": list(result.leftover_empty_dirs),
         "failures": failures,
+        "log_path": result.log_path,
     }
 
 

@@ -1265,6 +1265,7 @@ Be specific and actionable. The developer needs to know exactly what to change.
         leftover_empty_dirs = result.get("leftover_empty_dirs", [])
         failures = result.get("failures", [])
         summary = result.get("summary", "")
+        log_path = result.get("log_path") or ""
         error = result.get("error")
 
         parts = [f"## Target\n`{target_path}`"]
@@ -1320,6 +1321,9 @@ Be specific and actionable. The developer needs to know exactly what to change.
 
         if error:
             parts.append(f"## Error\n{error}")
+
+        if log_path:
+            parts.append(f"**Detailed log:** `{log_path}`")
 
         content = "\n\n".join(parts)
         brief = instructions[:60] if instructions else f"Organize {dir_name}"
