@@ -283,12 +283,10 @@ def _propose_taxonomy(
             )
         try:
             t0 = time.monotonic()
-            raw = backend.complete(
-                system=sys_prompt,
-                messages=[{"role": "user", "content": payload}],
-                model=skill.model,
-                max_tokens=4096,
-                temperature=0.0,
+            raw = _backend_call_with_backoff(
+                backend, skill, payload, logger,
+                override_system=sys_prompt,
+                retry_event="CLASSIFIER_RETRY",
             )
             elapsed = int((time.monotonic() - t0) * 1000)
         except Exception as e:  # noqa: BLE001
@@ -363,6 +361,9 @@ def _validate_assignment_payload(
     seen: dict[str, str] = {}
     violations: list[str] = []
     for it in items:
+        if not isinstance(it, dict):
+            violations.append(f"non-dict assignment item: {type(it).__name__}")
+            continue
         pid = it.get("path_id")
         cat = it.get("category_name")
         if pid not in batch_ids:
@@ -428,7 +429,10 @@ def _run_stage_b(
                 "ASSIGNER_BATCH_START", batch=idx, of=n_batches, files=len(batch),
             )
             raw = _backend_call_with_backoff(backend, skill, payload, logger)
-            mapping, violations = _validate_assignment_payload(raw, ids, allowed)
+            try:
+                mapping, violations = _validate_assignment_payload(raw, ids, allowed)
+            except json.JSONDecodeError as e:
+                mapping, violations = {}, [f"invalid JSON: {e}"]
             if violations:
                 logger.log(
                     "ASSIGNER_RETRY", batch=idx, reason="; ".join(violations[:3]),
@@ -442,12 +446,15 @@ def _run_stage_b(
                 raw = _backend_call_with_backoff(
                     backend, skill, payload, logger, override_system=retry_skill_body,
                 )
-                mapping, violations = _validate_assignment_payload(raw, ids, allowed)
+                try:
+                    mapping, violations = _validate_assignment_payload(raw, ids, allowed)
+                except json.JSONDecodeError as e:
+                    mapping, violations = {}, [f"invalid JSON: {e}"]
 
             if violations:
                 bad_count = len(violations)
                 if (bad_count <= ASSIGNER_BAD_RESPONSE_FALLBACK_MAX
-                    and bad_count <= len(ids) * ASSIGNER_BAD_RESPONSE_FALLBACK_RATE):
+                    and bad_count <= max(1, len(ids) * ASSIGNER_BAD_RESPONSE_FALLBACK_RATE)):
                     # Coerce missing / bad entries to the fallback.
                     coerced = 0
                     for pid in ids:
@@ -474,8 +481,13 @@ def _run_stage_b(
 
     with ThreadPoolExecutor(max_workers=MAX_CLASSIFIER_CONCURRENCY) as ex:
         futures = [ex.submit(run_one, i, b) for i, b in enumerate(batches)]
-        for fut in as_completed(futures):
-            fut.result()  # propagate
+        try:
+            for fut in as_completed(futures):
+                fut.result()  # propagate
+        except BaseException:
+            for f in futures:
+                f.cancel()
+            raise
 
     return results
 
@@ -488,6 +500,7 @@ def _backend_call_with_backoff(
     *,
     override_system: str | None = None,
     max_attempts: int = 4,
+    retry_event: str = "ASSIGNER_RETRY",
 ) -> str:
     delay = 1.0
     last: BaseException | None = None
@@ -504,7 +517,7 @@ def _backend_call_with_backoff(
             last = e
             if not _is_rate_limit(e) or attempt == max_attempts - 1:
                 raise
-            logger.log("ASSIGNER_RETRY", reason="rate_limit", delay=delay)
+            logger.log(retry_event, reason="rate_limit", delay=delay)
             time.sleep(delay)
             delay *= 2
     raise last  # type: ignore[misc]

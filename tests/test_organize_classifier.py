@@ -532,3 +532,138 @@ class TestFinalGroupings:
         g = result.items[0]
         assert g.subpath.startswith("S/")
         assert g.reason == "c"
+
+
+class TestStageBJsonRetryRecovers:
+    def test_malformed_json_first_then_valid(self, logger):
+        from fda.organize import classifier
+
+        backend = MagicMock()
+        backend.complete.side_effect = [
+            _taxonomy_payload(["A"]),
+            "```json\n" + _assignment_payload([("f000", "A")]) + "\n```",  # fenced/malformed-ish
+            _assignment_payload([("f000", "A")]),  # clean retry
+        ]
+        cat = _catalog([_entry(0)])
+        result = classifier.classify(cat, "", backend=backend, logger=logger)
+        assert result.items[0].category == "A"
+
+    def test_totally_invalid_json_falls_back(self, logger):
+        from fda.organize import classifier
+
+        backend = MagicMock()
+        # Stage A ok; Stage B returns garbage twice. Single-entry batch
+        # within fallback bounds gets coerced to Misc.
+        backend.complete.side_effect = [
+            _taxonomy_payload(["A"]),
+            "{not json at all",
+            "still {not} json",
+        ]
+        cat = _catalog([_entry(0)])
+        result = classifier.classify(cat, "", backend=backend, logger=logger)
+        # The lone file ends up coerced to the fallback category.
+        names = sorted(g.category for g in result.items)
+        assert names == ["Misc"]
+
+
+class TestNonDictAssignmentItem:
+    def test_null_item_treated_as_violation(self, logger):
+        from fda.organize import classifier
+
+        backend = MagicMock()
+        bad = json.dumps({"assignments": [None, {"path_id": "f000", "category_name": "A"}]})
+        good = _assignment_payload([("f000", "A")])
+        backend.complete.side_effect = [
+            _taxonomy_payload(["A"]),
+            bad,
+            good,
+        ]
+        cat = _catalog([_entry(0)])
+        result = classifier.classify(cat, "", backend=backend, logger=logger)
+        assert result.items[0].category == "A"
+
+    def test_string_item_does_not_crash(self, logger):
+        from fda.organize import classifier
+
+        backend = MagicMock()
+        bad = json.dumps({"assignments": ["f000"]})
+        good = _assignment_payload([("f000", "A")])
+        backend.complete.side_effect = [
+            _taxonomy_payload(["A"]),
+            bad,
+            good,
+        ]
+        cat = _catalog([_entry(0)])
+        result = classifier.classify(cat, "", backend=backend, logger=logger)
+        assert result.items[0].category == "A"
+
+
+class TestStageARateLimitBackoff:
+    def test_429_in_stage_a_then_success(self, logger, monkeypatch):
+        from fda.organize import classifier
+
+        class FakeRateLimit(Exception):
+            status_code = 429
+
+        # Make sleep a no-op so the test runs fast.
+        monkeypatch.setattr(classifier.time, "sleep", lambda *_: None)
+
+        backend = MagicMock()
+        calls = {"n": 0}
+
+        def fake_complete(**kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise FakeRateLimit("rate limited")
+            payload = kwargs["messages"][0]["content"]
+            parsed = json.loads(payload)
+            if "CATALOG" in parsed:
+                return _taxonomy_payload(["A"])
+            return _assignment_payload([("f000", "A")])
+
+        backend.complete.side_effect = fake_complete
+        with patch.object(classifier, "_is_rate_limit", lambda e: isinstance(e, FakeRateLimit)):
+            cat = _catalog([_entry(0)])
+            result = classifier.classify(cat, "", backend=backend, logger=logger)
+        assert result.items[0].category == "A"
+        # Stage A retried once, so total backend calls = 1 (429) + 1 (taxonomy) + 1 (assigner) = 3
+        assert calls["n"] == 3
+
+
+class TestPendingBatchesCanceledOnFailure:
+    def test_first_failure_cancels_pending(self, logger, monkeypatch):
+        from fda.organize import classifier
+
+        # Force many batches of ~5 entries each; one batch always returns
+        # no assignments (exceeds bounded-coercion threshold) so it raises
+        # ClassifierBatchError. Remaining pending batches should be canceled.
+        monkeypatch.setattr(classifier, "ASSIGNER_BATCH_TARGET_TOKENS", 200)
+        monkeypatch.setattr(classifier, "MAX_CLASSIFIER_CONCURRENCY", 1)  # serialize for determinism
+
+        entries = [_entry(i) for i in range(30)]
+        cat = _catalog(entries)
+
+        call_log: list[list[str]] = []
+        lock = threading.Lock()
+
+        def fake_complete(*, messages, **_):
+            payload = messages[0]["content"]
+            parsed = json.loads(payload)
+            if "CATALOG" in parsed:
+                return _taxonomy_payload(["A"])
+            ids = [e["path_id"] for e in parsed["BATCH"]]
+            with lock:
+                call_log.append(ids)
+            # The second distinct batch (by its ids) always returns no assignments,
+            # causing violations that exceed the bounded-coercion threshold.
+            batch_ids = frozenset(ids)
+            if len(call_log) >= 2 and batch_ids == frozenset(call_log[1]):
+                return _assignment_payload([])
+            return _assignment_payload([(pid, "A") for pid in ids])
+
+        backend = MagicMock()
+        backend.complete.side_effect = fake_complete
+        with pytest.raises(classifier.ClassifierBatchError):
+            classifier.classify(cat, "", backend=backend, logger=logger)
+        # Must NOT have processed all batches — cancellation limited further work.
+        assert len(call_log) < 30
