@@ -56,6 +56,7 @@ class TestEachConstantHasOneHome:
         "READER_WORKER_COUNT": ("reader.py", "8"),
         "TAXONOMY_SAMPLE_FULL_THRESHOLD": ("classifier.py", "150"),
         "TAXONOMY_SAMPLE_TARGET_SIZE": ("classifier.py", "100"),
+        "TAXONOMY_SAMPLE_FALLBACK_BUDGET": ("classifier.py", "100"),
         "ASSIGNER_BATCH_TARGET_TOKENS": ("classifier.py", "45_000"),
         "MAX_ASSIGNER_INPUT_TOKENS": ("classifier.py", "50_000"),
         "MAX_CLASSIFIER_CONCURRENCY": ("classifier.py", "4"),
@@ -66,6 +67,7 @@ class TestEachConstantHasOneHome:
         "ASSIGNER_BAD_RESPONSE_FALLBACK_MAX": ("classifier.py", "10"),
         "CLASSIFIER_INPUT_TOKEN_BUDGET": ("classifier.py", "60_000"),
         "READER_FAILED_SUMMARY_THRESHOLD": ("classifier.py", "0.25"),
+        "SUMMARY_TRUNCATE_CHARS": ("classifier.py", "200"),
     }
 
     def test_constant_defined_in_owning_module(self):
@@ -141,7 +143,8 @@ class TestClassifierPublicSurface:
         tree = ast.parse(text)
         publics = [
             n.name for n in tree.body
-            if isinstance(n, ast.FunctionDef) and not n.name.startswith("_")
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and not n.name.startswith("_")
         ]
         assert publics == ["classify"], (
             f"classifier.py public functions must be exactly ['classify']; got {publics}"
