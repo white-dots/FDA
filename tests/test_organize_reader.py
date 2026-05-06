@@ -280,3 +280,179 @@ class TestSkillLoaderUnit:
         (skill_dir / "SKILL.md").write_text("---\nname: demo\n---\nbody\n")
         with pytest.raises(ValueError):
             _skills.load_skill(skill_dir)
+
+
+# ---------------------------------------------------------------------------
+# F1 — TOCTOU guard: worker exception yields failed entry, not abort
+# ---------------------------------------------------------------------------
+
+
+class TestWorkerExceptionDoesNotAbortRun:
+    def test_summarize_one_raise_yields_failed_entry(
+        self, workspace, fake_backend, logger, monkeypatch
+    ):
+        """If _summarize_one raises (e.g., file vanished mid-walk), the run
+        completes with a synthesized failed entry — it doesn't abort."""
+        from fda.organize import reader
+
+        (workspace / "a.txt").write_text("a")
+        (workspace / "b.txt").write_text("b")
+
+        original = reader._summarize_one
+        call_count = {"n": 0}
+
+        def flaky(path, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise OSError("file vanished mid-walk")
+            return original(path, **kwargs)
+
+        monkeypatch.setattr(reader, "_summarize_one", flaky)
+        catalog = reader.read(workspace, backend=fake_backend, logger=logger)
+        # 2 entries returned, one of them is failed
+        assert len(catalog.entries) == 2
+        failed = [e for e in catalog.entries if e.summary_failed]
+        assert len(failed) == 1
+
+
+# ---------------------------------------------------------------------------
+# F2 — elapsed_ms reflects worker wall time, not as_completed overhead
+# ---------------------------------------------------------------------------
+
+
+class TestElapsedMsCovered:
+    def test_elapsed_ms_is_nonzero_for_slow_call(self, workspace, tmp_path):
+        """elapsed_ms should reflect worker wall time, not as_completed overhead."""
+        import re as _re
+        from fda.organize._logger import OrganizeLogger
+        from fda.organize import reader
+
+        log_path = tmp_path / "r.log"
+        log = OrganizeLogger(log_path=log_path, target_basename="ws")
+
+        (workspace / "a.txt").write_text("a")
+        backend = MagicMock()
+
+        def slow(*args, **kwargs):
+            time.sleep(0.05)
+            return _summarizer_response()
+
+        backend.complete.side_effect = slow
+        reader.read(workspace, backend=backend, logger=log)
+        log.close()
+        lines = log_path.read_text().splitlines()
+        done_lines = [l for l in lines if "READER_FILE_DONE" in l]
+        assert done_lines, "expected a READER_FILE_DONE event"
+        match = _re.search(r"elapsed_ms=(\d+)", done_lines[0])
+        assert match, "elapsed_ms field missing"
+        assert int(match.group(1)) >= 50, f"elapsed_ms looks wrong: {done_lines[0]}"
+
+
+# ---------------------------------------------------------------------------
+# F3 — APITimeoutError → built-in TimeoutError rewrap
+# ---------------------------------------------------------------------------
+
+
+class TestApiBackendTimeoutRewrap:
+    def test_apitimeouterror_rewrapped_as_builtin_timeouterror(self, monkeypatch):
+        """The API backend translates anthropic.APITimeoutError to built-in
+        TimeoutError so Reader's TimeoutError catch can classify it."""
+        try:
+            from anthropic import APITimeoutError
+        except ImportError:
+            pytest.skip("anthropic SDK not installed")
+
+        from fda.claude_backend import AnthropicAPIBackend
+
+        backend = AnthropicAPIBackend.__new__(AnthropicAPIBackend)
+
+        # Build a stub client whose with_options(...) returns a stub whose
+        # messages.create raises APITimeoutError.
+        class _Stub:
+            class messages:
+                @staticmethod
+                def create(**kwargs):
+                    raise APITimeoutError(request=None)
+
+        class _Client:
+            def with_options(self, **kw):
+                return _Stub()
+
+            class messages:
+                @staticmethod
+                def create(**kwargs):
+                    raise APITimeoutError(request=None)
+
+        backend._client = _Client()
+        with pytest.raises(TimeoutError):
+            backend.complete(
+                system="x",
+                messages=[{"role": "user", "content": "hi"}],
+                timeout=1.0,
+            )
+
+
+# ---------------------------------------------------------------------------
+# F5 — deadline-skipped entries report extract_status="failed", not "ok"
+# ---------------------------------------------------------------------------
+
+
+class TestDeadlineExtractStatus:
+    def test_deadline_skipped_entries_have_failed_extract_status(
+        self, workspace, logger, monkeypatch
+    ):
+        """When a file is skipped because the deadline expired before the
+        worker picked it up, the synthesized fail entry must report
+        extract_status='failed', not 'ok'."""
+        from fda.organize import reader
+
+        for i in range(8):
+            (workspace / f"f{i}.txt").write_text("x")
+
+        # Force every worker pickup to find remaining <= 0.
+        monkeypatch.setattr(reader, "READER_TOTAL_TIMEOUT_SECONDS", -1.0)
+
+        backend = MagicMock()
+        backend.complete.return_value = _summarizer_response()
+        catalog = reader.read(workspace, backend=backend, logger=logger)
+        # Every entry should be a deadline failure with extract_status="failed"
+        for e in catalog.entries:
+            assert e.summary_failed
+            assert e.extract_status == "failed", (
+                f"expected extract_status='failed' for deadline-skipped {e.path}, "
+                f"got {e.extract_status!r}"
+            )
+        # Backend was not called for any file (all skipped pre-pickup).
+        assert backend.complete.call_count == 0
+
+
+# ---------------------------------------------------------------------------
+# F6 — detail field present in failure log
+# ---------------------------------------------------------------------------
+
+
+class TestFailureDetailInLog:
+    def test_unparseable_failure_logs_detail(self, workspace, tmp_path):
+        """Unparseable JSON failures must surface a 'detail' field in the
+        READER_FILE_FAIL log line so post-mortem can distinguish parser
+        errors from backend errors."""
+        from fda.organize._logger import OrganizeLogger
+        from fda.organize import reader
+
+        log_path = tmp_path / "r.log"
+        log = OrganizeLogger(log_path=log_path, target_basename="ws")
+
+        (workspace / "a.txt").write_text("a")
+        backend = MagicMock()
+        backend.complete.return_value = "not-json"
+        reader.read(workspace, backend=backend, logger=log)
+        log.close()
+        lines = log_path.read_text().splitlines()
+        fail_lines = [l for l in lines if "READER_FILE_FAIL" in l]
+        assert fail_lines, "expected a READER_FILE_FAIL event"
+        assert "detail=" in fail_lines[0], (
+            f"detail field missing from log: {fail_lines[0]!r}"
+        )
+        assert "unparseable" in fail_lines[0], (
+            f"detail should mention 'unparseable': {fail_lines[0]!r}"
+        )

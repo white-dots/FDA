@@ -94,8 +94,12 @@ def _summarize_one(
     backend,
     skill: _skills.SkillConfig,
     timeout_seconds: float,
-) -> tuple[CatalogEntry, str]:
-    """Returns (entry, log_event_kind). log_event_kind is 'done' or 'fail'."""
+) -> tuple[CatalogEntry, str, str]:
+    """Returns (entry, log_event_kind, detail).
+
+    log_event_kind is 'done', 'timeout', or 'fail'.
+    detail carries a human-readable description for failure logs.
+    """
     size = path.stat().st_size
     extraction = _extractors.extract(path)
     user = _build_user_message(path, extraction, size)
@@ -109,16 +113,20 @@ def _summarize_one(
             timeout=timeout_seconds,
         )
     except TimeoutError as e:
-        return _fail_entry(path, size, extraction.status, str(e)), "timeout"
+        return _fail_entry(path, size, extraction.status, str(e)), "timeout", str(e)
     except Exception as e:  # noqa: BLE001 — never abort a run because one file fails
-        return _fail_entry(path, size, extraction.status, str(e)), "fail"
+        return _fail_entry(path, size, extraction.status, str(e)), "fail", str(e)
 
     try:
         parsed = json.loads(raw)
         type_label = str(parsed.get("type_label", ""))[:32]
         summary = str(parsed.get("summary", ""))
     except (json.JSONDecodeError, AttributeError, TypeError):
-        return _fail_entry(path, size, extraction.status, "unparseable summary"), "fail"
+        return (
+            _fail_entry(path, size, extraction.status, "unparseable summary"),
+            "fail",
+            "unparseable summary",
+        )
 
     return (
         CatalogEntry(
@@ -133,6 +141,7 @@ def _summarize_one(
             extract_status=extraction.status,
         ),
         "done",
+        "",
     )
 
 
@@ -190,31 +199,46 @@ def read(
 
     deadline = time.monotonic() + READER_TOTAL_TIMEOUT_SECONDS
 
-    def _worker(p: Path) -> tuple[CatalogEntry, str]:
+    def _worker(p: Path) -> tuple[CatalogEntry, str, int, str]:
         """Per-file worker. Recomputes the timeout when the worker
         actually picks up the task — so a file that sat in the queue past
-        the deadline returns a deadline-failed entry rather than running."""
-        remaining = max(0.0, deadline - time.monotonic())
+        the deadline returns a deadline-failed entry rather than running.
+
+        Returns (entry, kind, elapsed_ms, detail).
+        """
+        t0 = time.monotonic()
+        remaining = max(0.0, deadline - t0)
         if remaining <= 0:
             try:
                 size = p.stat().st_size
             except OSError:
                 size = 0
-            return _fail_entry(p, size, "ok", "deadline"), "deadline"
+            elapsed_ms = int((time.monotonic() - t0) * 1000)
+            return _fail_entry(p, size, "failed", "deadline"), "deadline", elapsed_ms, "deadline"
         timeout_for_call = min(float(READER_PER_FILE_TIMEOUT_SECONDS), remaining)
-        return _summarize_one(
+        entry, kind, detail = _summarize_one(
             p, backend=backend, skill=skill, timeout_seconds=timeout_for_call,
         )
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        return entry, kind, elapsed_ms, detail
 
     with ThreadPoolExecutor(max_workers=READER_WORKER_COUNT) as ex:
         futures = {ex.submit(_worker, p): p for p in real}
 
         for fut in as_completed(futures):
             p = futures[fut]
-            t0 = time.monotonic()
-            entry, kind = fut.result()
+            try:
+                entry, kind, elapsed_ms, detail = fut.result()
+            except Exception as e:  # TOCTOU defense (F1) — e.g., file vanished mid-walk
+                try:
+                    size = p.stat().st_size
+                except OSError:
+                    size = 0
+                entry = _fail_entry(p, size, "failed", str(e))
+                kind = "fail"
+                elapsed_ms = 0
+                detail = f"worker raised: {e}"
             entries_by_path[str(p)] = entry
-            elapsed_ms = int((time.monotonic() - t0) * 1000)
             if kind == "done":
                 logger.log(
                     "READER_FILE_DONE",
@@ -230,6 +254,7 @@ def read(
                     "READER_FILE_FAIL",
                     path=str(p),
                     reason=kind,
+                    detail=detail,
                     extract_status=entry.extract_status,
                     elapsed_ms=elapsed_ms,
                 )

@@ -343,17 +343,24 @@ class AnthropicAPIBackend(ClaudeBackend):
         temperature: float = 0.7,
         timeout: float | None = None,
     ) -> str:
+        from anthropic import APITimeoutError
+
         extra: dict = {}
+        client = self._client
         if timeout is not None:
             extra["timeout"] = timeout
-        response = self._client.messages.create(
-            model=model,
-            max_tokens=max_tokens,
-            system=system,
-            messages=messages,
-            temperature=temperature,
-            **extra,
-        )
+            client = self._client.with_options(max_retries=0)
+        try:
+            response = client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                system=system,
+                messages=messages,
+                temperature=temperature,
+                **extra,
+            )
+        except APITimeoutError as e:
+            raise TimeoutError(f"Anthropic API timed out: {e}")
         return response.content[0].text
 
     def complete_with_tools(

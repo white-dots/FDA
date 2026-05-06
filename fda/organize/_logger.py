@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_LOG_ROOT = Path.home() / ".fda" / "logs" / "organize"
 LONG_VALUE_TRUNCATE_CHARS = 200
 
-_LONG_VALUE_KEYS = frozenset({"summary", "instructions", "fallback", "reason"})
+_LONG_VALUE_KEYS = frozenset({"summary", "instructions", "fallback", "reason", "detail"})
 
 
 def _now_stamp() -> str:
