@@ -47,7 +47,8 @@ def _run_pdftotext(path: Path) -> bytes:
     """Run `pdftotext -layout -l 3 <path> -` and return up to _PDF_PIPE_CAP_BYTES.
     Raises RuntimeError on non-zero exit."""
     pdftotext = _which("pdftotext")
-    assert pdftotext is not None  # caller already checked
+    if pdftotext is None:
+        raise RuntimeError("pdftotext vanished from PATH between check and use")
     proc = subprocess.Popen(
         [pdftotext, "-layout", "-l", "3", str(path), "-"],
         stdout=subprocess.PIPE,
