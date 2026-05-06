@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 from pathlib import Path
@@ -750,3 +751,191 @@ class TestVerbatimHeadInPayload:
 
         assert "verbatim_head" in captured["stage_a"]
         assert "Order ID: 10488" in captured["stage_a"]
+
+
+# ---------------------------------------------------------------------------
+# Behavioral regressions: conflict, informative-filename, hash-filename
+#
+# These verify the wire format AND the end-to-end routing produced by a
+# backend that follows the assigner prompt's priority hierarchy.
+# ---------------------------------------------------------------------------
+
+
+class TestPriorityRegressions:
+    """End-to-end tests for the prompt's signal-priority hierarchy.
+
+    The fake backend in each test simulates an assigner that actually
+    follows the prompt: it parses the BATCH payload, asserts the expected
+    fields are present (so the wire format must include them for the
+    assertion to pass), and routes by inspecting `path` / `verbatim_head`
+    / `summary` per the documented priority. If a future change removes
+    `verbatim_head` from `_entry_dict`, these tests fail immediately
+    rather than passing on a tautology.
+    """
+
+    HASH_RE = re.compile(r"^[0-9a-f]{16,}$")  # informative-vs-hash discriminator
+
+    def _make_backend(self, taxonomy_categories, decide):
+        """Return a MagicMock backend that:
+          - returns the given Stage A taxonomy on the first call (whose
+            payload contains 'CATALOG' but not 'BATCH'),
+          - delegates Stage B per-file assignment to `decide(parsed_batch)
+            -> {pid: category}` where parsed_batch is the JSON-decoded
+            list of entry dicts from the BATCH payload.
+        """
+        backend = MagicMock()
+
+        def respond(*, system, messages, **kwargs):
+            payload = messages[0]["content"]
+            if '"BATCH"' in payload:
+                parsed = json.loads(payload)
+                batch = parsed["BATCH"]
+                mapping = decide(batch)
+                return _assignment_payload(list(mapping.items()))
+            return _taxonomy_payload(taxonomy_categories)
+
+        backend.complete.side_effect = respond
+        return backend
+
+    def test_conflict_summary_says_PO_but_verbatim_says_shipping(self, logger):
+        """Reader summary calls it a purchase order, but verbatim_head
+        clearly shows shipping-order content. Filename is a hash (ignored).
+        A simulated assigner following the prompt picks
+        Shipping-And-Fulfillment by reading verbatim_head over summary."""
+        from fda.organize import classifier
+        from fda.organize.models import CatalogEntry
+
+        e = CatalogEntry(
+            path_id="f000",
+            path="/tmp/target/0fa84d61b3158eaba46dee96.pdf",
+            ext=".pdf",
+            size_bytes=2686,
+            summary="Purchase order #10488 for Frankenversand in Munich.",
+            type_label="purchase-order",
+            is_junk=False,
+            summary_failed=False,
+            extract_status="ok",
+            verbatim_head=(
+                "Order ID: 10488\n\nShipping Details:\n"
+                "Ship Name: Frankenversand\nShipper Name: United Package\n"
+                "Shipped Date: 2017-04-02"
+            ),
+        )
+
+        def decide(batch):
+            assert len(batch) == 1
+            entry = batch[0]
+            # Wire-format preconditions: every field the prompt's priority
+            # rule depends on MUST be in the payload.
+            assert entry["path_id"] == "f000"
+            assert "verbatim_head" in entry
+            assert "path" in entry
+            assert "summary" in entry
+            basename = Path(entry["path"]).name
+            head = entry["verbatim_head"]
+            summary = entry["summary"]
+            # Priority step 2: hash basename → ignore filename signal.
+            assert self.HASH_RE.match(basename.split(".")[0]), \
+                "expected a hash basename for this scenario"
+            # Priority step 3: verbatim says shipping ('Shipping Details',
+            # 'Shipper Name', 'Shipped Date'); summary says PO. Trust verbatim.
+            assert "Shipping Details" in head
+            assert "Purchase order" in summary
+            return {"f000": "Shipping-And-Fulfillment"}
+
+        backend = self._make_backend(
+            ["Purchase-Orders", "Shipping-And-Fulfillment"], decide,
+        )
+        result = classifier.classify(
+            _catalog([e]), "sort", backend=backend, logger=logger,
+        )
+        cats = {g.category for g in result.items}
+        assert "Shipping-And-Fulfillment" in cats
+        assert "Purchase-Orders" not in cats
+
+    def test_informative_filename_drives_routing(self, logger):
+        """Filename `Invoice_10488.pdf` is the strongest signal even though
+        verbatim_head doesn't contain the literal word 'Invoice'."""
+        from fda.organize import classifier
+        from fda.organize.models import CatalogEntry
+
+        e = CatalogEntry(
+            path_id="f000",
+            path="/tmp/target/Invoice_10488.pdf",
+            ext=".pdf",
+            size_bytes=1024,
+            summary="Order document for ACME Corp with line items and total.",
+            type_label="order-document",
+            is_junk=False,
+            summary_failed=False,
+            extract_status="ok",
+            verbatim_head="Order ID: 10488\nCustomer: ACME\nTotal: 1234.5",
+        )
+
+        def decide(batch):
+            assert len(batch) == 1
+            entry = batch[0]
+            assert "verbatim_head" in entry
+            basename = Path(entry["path"]).name
+            head = entry["verbatim_head"]
+            # Priority step 1: informative basename ('Invoice' word) → use it.
+            stem = basename.split(".")[0]
+            assert not self.HASH_RE.match(stem), \
+                "expected an informative basename for this scenario"
+            assert "invoice" in basename.lower(), \
+                "scenario expects 'Invoice' in the filename"
+            # Priority preserves: verbatim doesn't carry the literal type word.
+            assert "Invoice" not in head and "invoice" not in head.lower(), \
+                "scenario expects the verbatim slice to lack the type word"
+            return {"f000": "Sales-Invoices"}
+
+        backend = self._make_backend(
+            ["Sales-Invoices", "Purchase-Orders"], decide,
+        )
+        result = classifier.classify(
+            _catalog([e]), "sort", backend=backend, logger=logger,
+        )
+        assert any(g.category == "Sales-Invoices" for g in result.items)
+
+    def test_hash_filename_ignored_routing_from_content(self, logger):
+        """Hash filename carries no signal — routing must come from the
+        verbatim slice ('Monthly Stock Report') and summary."""
+        from fda.organize import classifier
+        from fda.organize.models import CatalogEntry
+
+        e = CatalogEntry(
+            path_id="f000",
+            path="/tmp/target/0fa84d61b3158eaba46dee96.pdf",
+            ext=".pdf",
+            size_bytes=1500,
+            summary="Stock report for beverages with units sold and in stock.",
+            type_label="stock-report",
+            is_junk=False,
+            summary_failed=False,
+            extract_status="ok",
+            verbatim_head=(
+                "Monthly Stock Report\nCategory: Beverages\n"
+                "Units Sold: 240\nUnits In Stock: 1200"
+            ),
+        )
+
+        def decide(batch):
+            assert len(batch) == 1
+            entry = batch[0]
+            assert "verbatim_head" in entry
+            basename = Path(entry["path"]).name
+            head = entry["verbatim_head"]
+            # Priority step 2: hash basename → ignore filename.
+            assert self.HASH_RE.match(basename.split(".")[0])
+            # Priority step 3: verbatim_head literally says 'Monthly Stock
+            # Report' → Stock-Reports.
+            assert "Monthly Stock Report" in head
+            return {"f000": "Stock-Reports"}
+
+        backend = self._make_backend(
+            ["Stock-Reports", "Sales-Invoices"], decide,
+        )
+        result = classifier.classify(
+            _catalog([e]), "sort", backend=backend, logger=logger,
+        )
+        assert any(g.category == "Stock-Reports" for g in result.items)
