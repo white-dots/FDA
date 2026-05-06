@@ -36,6 +36,22 @@ The plan is **9 tasks**. Steps inside each task are bite-sized (2-5 min). Depend
 
 ---
 
+## Chunks (for codex review between chunks)
+
+The 9 tasks are grouped into **4 review chunks plus 1 manual measurement step**. Implement one chunk at a time; ask codex to review at each chunk boundary before starting the next.
+
+| Chunk | Tasks | Scope | Codex review focus |
+|-------|-------|-------|--------------------|
+| **Chunk 1 — Data plumbing** ✅ **DONE** | 1, 2, 3 | `models.py` field, `reader.py` population (helper + `_summarize_one` + final rebuild), constraints registration | Helper correctness; `verbatim_head` survives summary timeout / exception / unparseable JSON; cap at 300 chars; field threaded through global sort |
+| **Chunk 2 — Reader prompt (signal A)** | 4 | `file-summarizer/SKILL.md` only | Do the new grounding rules actually disambiguate the Northwind shipping-order failure mode? Wording strict enough to block hallucinated `purchase-order` labels? |
+| **Chunk 3 — Classifier wire format + prompts (signal C)** | 5, 6, 7 | `classifier.py:_entry_dict`, `taxonomy-proposer/SKILL.md`, `taxonomy-assigner/SKILL.md` | Field reaches both Stage A and Stage B payloads; priority hierarchy (`filename → verbatim → summary`) is consistent across the two prompts; hash-vs-informative filename heuristic is unambiguous |
+| **Chunk 4 — Classifier regression tests (signal B)** | 8 | `tests/test_organize_classifier.py` (`TestPriorityRegressions`) | Are fake-backend assertions strict enough that the tests fail loudly if `verbatim_head` is dropped from the wire format? Are the three scenarios (conflict, informative-filename, hash-filename) representative? |
+| **Manual — Northwind validation** | 9 | Fixture restore + `--apply` run + manifest scoring | Not a codex-review chunk — measurement against live Sonnet. Run after Chunk 4 lands; report numbers to the user. |
+
+**Chunk boundaries are marked inline below** with `### CHUNK N START` / `### CHUNK N END` markers around the task groups.
+
+---
+
 ## File map
 
 ### Modified files
@@ -59,6 +75,10 @@ tests/test_organize_classifier.py                       # Tasks 5, 8
 None.
 
 ---
+
+<!-- ===================== CHUNK 1 START — Data plumbing (Tasks 1–3) ===================== -->
+<!-- STATUS: ✅ DONE — landed on dev_branch as commits 6910979, 1a5a76d, ff9edf9, 03f652f -->
+<!-- (Codex review for Chunk 1 surfaced two test gaps; both addressed in 03f652f.) -->
 
 ### Task 1: Add `verbatim_head` field to `CatalogEntry`
 
@@ -537,6 +557,13 @@ EOF
 
 ---
 
+<!-- ===================== CHUNK 1 END — pause for codex review =====================
+     Review focus: helper correctness; verbatim_head survives summary
+     timeout / exception / unparseable JSON; cap at 300 chars; field
+     threaded through global sort and final path_id rebuild. -->
+
+<!-- ===================== CHUNK 2 START — Reader prompt (Task 4) ===================== -->
+
 ### Task 4: Tighten `file-summarizer/SKILL.md` to forbid invented type labels (A)
 
 **Files:**
@@ -614,6 +641,14 @@ EOF
 ```
 
 ---
+
+<!-- ===================== CHUNK 2 END — pause for codex review =====================
+     Review focus: do the new grounding rules disambiguate the Northwind
+     shipping-order failure mode? Wording strict enough to block
+     hallucinated 'purchase-order' / 'shipping-order' labels when the
+     phrase is not literally in the extracted text? -->
+
+<!-- ===================== CHUNK 3 START — Classifier wire format + prompts (Tasks 5–7) ===================== -->
 
 ### Task 5: Classifier `_entry_dict` includes `verbatim_head` (wire format change for both stages)
 
@@ -948,6 +983,15 @@ EOF
 
 ---
 
+<!-- ===================== CHUNK 3 END — pause for codex review =====================
+     Review focus: field reaches both Stage A (CATALOG) and Stage B
+     (BATCH) payloads; priority hierarchy (filename → verbatim →
+     summary) is consistent across taxonomy-proposer and
+     taxonomy-assigner; hash-vs-informative filename heuristic is
+     unambiguous; constraint test for path_id rules still green. -->
+
+<!-- ===================== CHUNK 4 START — Classifier regression tests (Task 8) ===================== -->
+
 ### Task 8: Classifier regression tests (conflict, informative-filename, hash-filename)
 
 **Files:**
@@ -1197,6 +1241,14 @@ EOF
 ```
 
 ---
+
+<!-- ===================== CHUNK 4 END — pause for codex review =====================
+     Review focus: are the fake-backend assertions strict enough that
+     the tests fail loudly if verbatim_head is dropped from the wire
+     format? Are the three scenarios (conflict, informative-filename,
+     hash-filename) representative of the Northwind failure modes? -->
+
+<!-- ===================== MANUAL STEP — Northwind validation (Task 9, no codex review) ===================== -->
 
 ### Task 9: Manual validation against the Northwind fixture
 
