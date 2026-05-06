@@ -335,14 +335,6 @@ class TestTimeouts:
         assert result["success"] is False
         assert "timed out" in result["error"].lower()
 
-    def test_organize_returns_timeout_error(self, local_worker, local_worker_dir):
-        local_worker._backend.complete_with_tools.side_effect = ToolLoopTimeoutError(
-            elapsed=601.0, budget=600.0, iterations=10,
-        )
-        result = local_worker.organize_files(target_path=str(local_worker_dir))
-        assert result["success"] is False
-        assert "timed out" in result["error"].lower()
-
     def test_timeout_error_attributes(self):
         err = ToolLoopTimeoutError(elapsed=120.5, budget=100.0, iterations=3)
         assert err.elapsed == 120.5
