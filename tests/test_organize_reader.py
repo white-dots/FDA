@@ -497,6 +497,19 @@ class TestVerbatimHead:
         e = catalog.entries[0]
         assert len(e.verbatim_head) == reader.VERBATIM_HEAD_CHARS
 
+    def test_cap_is_characters_not_bytes(self, workspace, fake_backend, logger):
+        """Multibyte text must be capped at VERBATIM_HEAD_CHARS *characters*,
+        not bytes. A regression to byte-based slicing (e.g. ``encode()[:N]``)
+        would slice mid-codepoint and produce a shorter string on multibyte
+        input — this test pins the character semantics."""
+        from fda.organize import reader
+
+        body = "界" * (reader.VERBATIM_HEAD_CHARS * 2)
+        (workspace / "cjk.txt").write_text(body)
+        catalog = reader.read(workspace, backend=fake_backend, logger=logger)
+        e = catalog.entries[0]
+        assert e.verbatim_head == "界" * reader.VERBATIM_HEAD_CHARS
+
     def test_preserved_when_summary_call_fails(self, workspace, logger):
         """The slice is INDEPENDENT of the summarization call. When
         extraction succeeded but the backend errored out, verbatim_head is
@@ -506,6 +519,20 @@ class TestVerbatimHead:
 
         backend = MagicMock()
         backend.complete.side_effect = RuntimeError("boom")
+        (workspace / "a.txt").write_text("Order ID: 10488\nShipping Details:\n")
+        catalog = reader.read(workspace, backend=backend, logger=logger)
+        e = catalog.entries[0]
+        assert e.summary_failed is True
+        assert e.verbatim_head.startswith("Order ID: 10488")
+
+    def test_preserved_when_summary_call_times_out(self, workspace, logger):
+        """The TimeoutError branch in _summarize_one is distinct from the
+        generic Exception branch. Pin that the slice survives it too —
+        the docstring promises 'preserved across summarization timeout'."""
+        from fda.organize import reader
+
+        backend = MagicMock()
+        backend.complete.side_effect = TimeoutError("backend HTTP timeout")
         (workspace / "a.txt").write_text("Order ID: 10488\nShipping Details:\n")
         catalog = reader.read(workspace, backend=backend, logger=logger)
         e = catalog.entries[0]
