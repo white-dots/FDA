@@ -159,7 +159,12 @@ def organize(
         olog.log("RUN_END", status="failed", error=str(e))
         raise
     finally:
-        olog.close()
+        try:
+            olog.close()
+        except Exception:
+            # Never let log close failures override the run's outcome
+            # (success: would replace PlanResult; failure: would mask original)
+            logger.debug("olog.close() raised; suppressed", exc_info=True)
 
 
 def apply_plan(
