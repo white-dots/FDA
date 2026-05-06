@@ -83,6 +83,7 @@ class CatalogEntry:
     is_junk: bool
     summary_failed: bool
     extract_status: ExtractStatus
+    verbatim_head: str = ""
 
 
 @dataclass(frozen=True)

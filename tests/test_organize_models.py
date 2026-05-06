@@ -206,3 +206,38 @@ class TestPlanResultCarriesLogPath:
             discrepancies=(), repos_skipped=(), summary="",
         )
         assert r.log_path is None
+
+
+class TestCatalogEntryVerbatimHead:
+    def test_default_is_empty_string(self):
+        from fda.organize.models import CatalogEntry
+
+        e = CatalogEntry(
+            path_id="f000",
+            path="/tmp/a.txt",
+            ext=".txt",
+            size_bytes=10,
+            summary="text",
+            type_label="text",
+            is_junk=False,
+            summary_failed=False,
+            extract_status="ok",
+        )
+        assert e.verbatim_head == ""
+
+    def test_accepts_explicit_value(self):
+        from fda.organize.models import CatalogEntry
+
+        e = CatalogEntry(
+            path_id="f000",
+            path="/tmp/a.txt",
+            ext=".txt",
+            size_bytes=10,
+            summary="text",
+            type_label="text",
+            is_junk=False,
+            summary_failed=False,
+            extract_status="ok",
+            verbatim_head="Order ID: 10488\n\nShipping Details:",
+        )
+        assert e.verbatim_head == "Order ID: 10488\n\nShipping Details:"
