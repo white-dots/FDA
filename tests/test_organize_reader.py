@@ -456,3 +456,101 @@ class TestFailureDetailInLog:
         assert "unparseable" in fail_lines[0], (
             f"detail should mention 'unparseable': {fail_lines[0]!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# verbatim_head: deterministic Python slice of extracted text
+# ---------------------------------------------------------------------------
+
+
+class TestVerbatimHead:
+    def test_populated_with_lstripped_first_chars(
+        self, workspace, fake_backend, logger
+    ):
+        """Reader stores extracted_text.lstrip()[:VERBATIM_HEAD_CHARS] on
+        the catalog entry — leading whitespace removed, newlines preserved
+        inside the slice."""
+        from fda.organize import reader
+
+        body = (
+            "\n\n  \n"
+            "Order ID: 10488\n"
+            "\n"
+            "Shipping Details:\n"
+            "Ship Name: Frankenversand\n"
+        )
+        (workspace / "a.txt").write_text(body)
+        catalog = reader.read(workspace, backend=fake_backend, logger=logger)
+        e = catalog.entries[0]
+        assert e.verbatim_head.startswith("Order ID: 10488")
+        assert "\n" in e.verbatim_head  # internal newlines preserved
+        assert not e.verbatim_head.startswith("\n")
+        assert not e.verbatim_head.startswith(" ")
+
+    def test_capped_at_constant(self, workspace, fake_backend, logger):
+        """The slice never exceeds VERBATIM_HEAD_CHARS characters."""
+        from fda.organize import reader
+
+        big = "x" * (reader.VERBATIM_HEAD_CHARS * 4)
+        (workspace / "big.txt").write_text(big)
+        catalog = reader.read(workspace, backend=fake_backend, logger=logger)
+        e = catalog.entries[0]
+        assert len(e.verbatim_head) == reader.VERBATIM_HEAD_CHARS
+
+    def test_preserved_when_summary_call_fails(self, workspace, logger):
+        """The slice is INDEPENDENT of the summarization call. When
+        extraction succeeded but the backend errored out, verbatim_head is
+        still the head of the extracted text — that grounding signal is
+        the whole point of the field."""
+        from fda.organize import reader
+
+        backend = MagicMock()
+        backend.complete.side_effect = RuntimeError("boom")
+        (workspace / "a.txt").write_text("Order ID: 10488\nShipping Details:\n")
+        catalog = reader.read(workspace, backend=backend, logger=logger)
+        e = catalog.entries[0]
+        assert e.summary_failed is True
+        assert e.verbatim_head.startswith("Order ID: 10488")
+
+    def test_preserved_when_summary_response_is_unparseable(
+        self, workspace, logger
+    ):
+        """JSON parse failure path also preserves the slice."""
+        from fda.organize import reader
+
+        backend = MagicMock()
+        backend.complete.return_value = "not-json"
+        (workspace / "a.txt").write_text("Invoice\nOrder ID: 627\n")
+        catalog = reader.read(workspace, backend=backend, logger=logger)
+        e = catalog.entries[0]
+        assert e.summary_failed is True
+        assert e.verbatim_head.startswith("Invoice")
+
+    def test_empty_on_extractor_failure(self, workspace, fake_backend, logger):
+        """When the EXTRACTOR returns a non-ok status (e.g., status='failed'
+        because the file was unreadable or the extractor raised),
+        verbatim_head is empty even though the helper sees an extraction
+        result."""
+        from fda.organize import reader, _extractors
+        from fda.organize.models import ExtractionResult
+
+        (workspace / "a.foo").write_bytes(b"\x00\x01\x02")
+
+        def failing_extract(_path):
+            return ExtractionResult(text=None, status="failed", note="boom")
+
+        with patch.dict(_extractors.EXTRACTORS, {".foo": failing_extract}, clear=False):
+            catalog = reader.read(workspace, backend=fake_backend, logger=logger)
+        e = catalog.entries[0]
+        assert e.extract_status == "failed"
+        assert e.verbatim_head == ""
+
+    def test_empty_for_unsupported_extension(self, workspace, fake_backend, logger):
+        """No extractor → extract_status='no_extractor' → verbatim_head is ''."""
+        from fda.organize import reader
+
+        (workspace / "a.zzz").write_bytes(b"\x00\x01\x02\x03")
+        catalog = reader.read(workspace, backend=fake_backend, logger=logger)
+        e = catalog.entries[0]
+        assert e.extract_status == "no_extractor"
+        assert e.verbatim_head == ""

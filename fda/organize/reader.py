@@ -30,9 +30,21 @@ READER_TEXT_CAP_BYTES = 64 * 1024
 READER_PER_FILE_TIMEOUT_SECONDS = 30
 READER_TOTAL_TIMEOUT_SECONDS = 300
 READER_WORKER_COUNT = 8
+VERBATIM_HEAD_CHARS = 300
 
 _TRUNCATE_MARKER = "[TRUNCATED at 64KB]\n"
 _SKILL_DIR = Path(__file__).parent / "skills" / "file-summarizer"
+
+
+def _verbatim_head(extraction: ExtractionResult) -> str:
+    """Deterministic head slice for the Classifier's grounding signal.
+
+    Returns extracted_text.lstrip()[:VERBATIM_HEAD_CHARS] when extraction
+    succeeded; "" otherwise. No LLM call.
+    """
+    if extraction.status != "ok" or not extraction.text:
+        return ""
+    return extraction.text.lstrip()[:VERBATIM_HEAD_CHARS]
 
 
 def _walk(target: Path) -> tuple[list[Path], list[str]]:
@@ -102,6 +114,7 @@ def _summarize_one(
     """
     size = path.stat().st_size
     extraction = _extractors.extract(path)
+    head = _verbatim_head(extraction)
     user = _build_user_message(path, extraction, size)
     try:
         raw = backend.complete(
@@ -113,9 +126,17 @@ def _summarize_one(
             timeout=timeout_seconds,
         )
     except TimeoutError as e:
-        return _fail_entry(path, size, extraction.status, str(e)), "timeout", str(e)
+        return (
+            _fail_entry(path, size, extraction.status, str(e), verbatim_head=head),
+            "timeout",
+            str(e),
+        )
     except Exception as e:  # noqa: BLE001 — never abort a run because one file fails
-        return _fail_entry(path, size, extraction.status, str(e)), "fail", str(e)
+        return (
+            _fail_entry(path, size, extraction.status, str(e), verbatim_head=head),
+            "fail",
+            str(e),
+        )
 
     try:
         parsed = json.loads(raw)
@@ -123,7 +144,10 @@ def _summarize_one(
         summary = str(parsed.get("summary", ""))
     except (json.JSONDecodeError, AttributeError, TypeError):
         return (
-            _fail_entry(path, size, extraction.status, "unparseable summary"),
+            _fail_entry(
+                path, size, extraction.status, "unparseable summary",
+                verbatim_head=head,
+            ),
             "fail",
             "unparseable summary",
         )
@@ -139,13 +163,21 @@ def _summarize_one(
             is_junk=False,
             summary_failed=False,
             extract_status=extraction.status,
+            verbatim_head=head,
         ),
         "done",
         "",
     )
 
 
-def _fail_entry(path: Path, size: int, extract_status: str, _why: str) -> CatalogEntry:
+def _fail_entry(
+    path: Path,
+    size: int,
+    extract_status: str,
+    _why: str,
+    *,
+    verbatim_head: str = "",
+) -> CatalogEntry:
     return CatalogEntry(
         path_id="",
         path=str(path),
@@ -156,6 +188,7 @@ def _fail_entry(path: Path, size: int, extract_status: str, _why: str) -> Catalo
         is_junk=False,
         summary_failed=True,
         extract_status=extract_status,
+        verbatim_head=verbatim_head,
     )
 
 
@@ -272,6 +305,7 @@ def read(
             is_junk=e.is_junk,
             summary_failed=e.summary_failed,
             extract_status=e.extract_status,
+            verbatim_head=e.verbatim_head,
         )
         for idx, e in enumerate(ordered)
     )
