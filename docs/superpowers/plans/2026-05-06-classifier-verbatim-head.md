@@ -43,8 +43,8 @@ The 9 tasks are grouped into **4 review chunks plus 1 manual measurement step**.
 | Chunk | Tasks | Scope | Codex review focus |
 |-------|-------|-------|--------------------|
 | **Chunk 1 — Data plumbing** ✅ **DONE** | 1, 2, 3 | `models.py` field, `reader.py` population (helper + `_summarize_one` + final rebuild), constraints registration | Helper correctness; `verbatim_head` survives summary timeout / exception / unparseable JSON; cap at 300 chars; field threaded through global sort |
-| **Chunk 2 — Reader prompt (signal A)** | 4 | `file-summarizer/SKILL.md` only | Do the new grounding rules actually disambiguate the Northwind shipping-order failure mode? Wording strict enough to block hallucinated `purchase-order` labels? |
-| **Chunk 3 — Classifier wire format + prompts (signal C)** | 5, 6, 7 | `classifier.py:_entry_dict`, `taxonomy-proposer/SKILL.md`, `taxonomy-assigner/SKILL.md` | Field reaches both Stage A and Stage B payloads; priority hierarchy (`filename → verbatim → summary`) is consistent across the two prompts; hash-vs-informative filename heuristic is unambiguous |
+| **Chunk 2 — Reader prompt (signal A)** ✅ **DONE** | 4 | `file-summarizer/SKILL.md` only | Do the new grounding rules actually disambiguate the Northwind shipping-order failure mode? Wording strict enough to block hallucinated `purchase-order` labels? |
+| **Chunk 3 — Classifier wire format + prompts (signal C)** ✅ **DONE** | 5, 6, 7 | `classifier.py:_entry_dict`, `taxonomy-proposer/SKILL.md`, `taxonomy-assigner/SKILL.md` | Field reaches both Stage A and Stage B payloads; priority hierarchy (`filename → verbatim → summary`) is consistent across the two prompts; hash-vs-informative filename heuristic is unambiguous |
 | **Chunk 4 — Classifier regression tests (signal B)** | 8 | `tests/test_organize_classifier.py` (`TestPriorityRegressions`) | Are fake-backend assertions strict enough that the tests fail loudly if `verbatim_head` is dropped from the wire format? Are the three scenarios (conflict, informative-filename, hash-filename) representative? |
 | **Manual — Northwind validation** | 9 | Fixture restore + `--apply` run + manifest scoring | Not a codex-review chunk — measurement against live Sonnet. Run after Chunk 4 lands; report numbers to the user. |
 
@@ -563,6 +563,7 @@ EOF
      threaded through global sort and final path_id rebuild. -->
 
 <!-- ===================== CHUNK 2 START — Reader prompt (Task 4) ===================== -->
+<!-- STATUS: DONE — landed in 0d036b1 (Task 4 prompt edit) and 4265fa3 (Codex review fix scoping the rule to business-document types). -->
 
 ### Task 4: Tighten `file-summarizer/SKILL.md` to forbid invented type labels (A)
 
@@ -649,6 +650,7 @@ EOF
      phrase is not literally in the extracted text? -->
 
 <!-- ===================== CHUNK 3 START — Classifier wire format + prompts (Tasks 5–7) ===================== -->
+<!-- STATUS: DONE — landed in c40ac91 (Task 5 _entry_dict + tests), 253c05a (Task 6 proposer prompt), 976a2a9 (Task 7 assigner prompt). Codex review clean — no fixes needed. -->
 
 ### Task 5: Classifier `_entry_dict` includes `verbatim_head` (wire format change for both stages)
 
