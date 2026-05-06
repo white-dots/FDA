@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import logging
 import re
-import sys
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -33,6 +32,14 @@ class PlanBuilderError(Exception):
 # Windows-illegal characters; control chars handled separately.
 _WIN_ILLEGAL = re.compile(r'[<>:"|?*]')
 _CTRL = re.compile(r"[\x00-\x1f\x7f]")
+# Subpaths arrive from the Classifier as plain strings; they may contain
+# either forward or back slashes. We split on both so a Windows-style
+# "..\\escape" can't slip past the traversal check on POSIX.
+_SUBPATH_SEP = re.compile(r"[/\\]")
+# Cap on how many "name (N).ext" attempts the basename resolver makes
+# before giving up. A degenerate destination directory pre-populated with
+# every variant up to the cap is the only thing this guards against.
+_MAX_COLLISION_RETRIES = 100
 
 
 def _sanitize_component(part: str) -> str:
@@ -46,8 +53,8 @@ def _sanitize_component(part: str) -> str:
 
 def _sanitize_subpath(subpath: str) -> str:
     parts: list[str] = []
-    for raw in Path(subpath).parts:
-        if raw in ("", "/", "\\"):
+    for raw in _SUBPATH_SEP.split(subpath):
+        if raw == "":
             continue
         if raw == "..":
             raise PlanBuilderError(f"subpath traversal not allowed: {subpath!r}")
@@ -85,23 +92,42 @@ def _resolve_basename(
     src: Path,
     planned: set[tuple[str, str]],
     on_disk_check: bool,
+    planned_sources: frozenset[Path],
 ) -> str:
     """Pick the lowest-N basename that doesn't collide with another planned
-    move OR an unrelated file already on disk."""
+    move OR an unrelated file already on disk.
+
+    `planned` is keyed by `(dest_dir, casefolded_basename)` so that on
+    case-insensitive filesystems (default macOS/Windows) `Report.pdf` and
+    `report.pdf` aren't both planned into the same directory.
+
+    `planned_sources` lets us ignore disk files that are themselves about
+    to move away — they'd otherwise force a spurious "(2)" rename.
+    """
     base = src.name
+    src_resolved = src.resolve()
     n = 2
     candidate = base
-    while True:
-        key = (str(dest_dir), candidate)
-        on_disk_collision = (
-            on_disk_check
-            and (dest_dir / candidate).exists()
-            and (dest_dir / candidate).resolve() != src.resolve()
-        )
+    for _ in range(_MAX_COLLISION_RETRIES + 1):
+        key = (str(dest_dir), candidate.casefold())
+        on_disk_collision = False
+        if on_disk_check:
+            existing = dest_dir / candidate
+            if existing.exists():
+                existing_resolved = existing.resolve()
+                if (
+                    existing_resolved != src_resolved
+                    and existing_resolved not in planned_sources
+                ):
+                    on_disk_collision = True
         if key not in planned and not on_disk_collision:
             return candidate
         candidate = _next_basename(base, n)
         n += 1
+    raise PlanBuilderError(
+        f"too many basename collisions for {src.name!r} in {dest_dir} "
+        f"(retried {_MAX_COLLISION_RETRIES} times)"
+    )
 
 
 def build(
@@ -112,6 +138,20 @@ def build(
 ) -> Plan:
     """Construct a Plan from Groupings."""
     target = Path(target_dir).resolve()
+
+    # Reject overlap between grouped sources and junk paths upfront. A path
+    # in both would be MOVED (relocating it) and then DELETEd at the old
+    # location, where apply_delete silently no-ops — leaving the file in
+    # the categorized destination instead of removed. That's almost
+    # certainly an upstream Reader/Classifier bug; refuse the plan.
+    grouped_resolved = {Path(p).resolve() for p in path_by_id.values()}
+    junk_resolved = {Path(p).resolve() for p in junk_paths}
+    overlap = grouped_resolved & junk_resolved
+    if overlap:
+        sample = next(iter(overlap))
+        raise PlanBuilderError(
+            f"path appears in both groupings and junk_paths: {sample}"
+        )
 
     seen_ids: dict[str, str] = {}
     moves_intent: list[tuple[Grouping, Path, str]] = []  # (grouping, src, reason)
@@ -135,28 +175,36 @@ def build(
             if pid in seen_ids:
                 raise PlanBuilderError(
                     f"path_id {pid!r} (resolved to {path_by_id[pid]!r}) appears "
-                    f"in two groupings: {seen_ids[pid]!r} and {grp.category!r}"
+                    f"in two groupings: {seen_ids[pid]!r} and "
+                    f"{grp.category!r} (subpath={grp.subpath!r})"
                 )
-            seen_ids[pid] = grp.category
+            seen_ids[pid] = f"{grp.category!r} (subpath={grp.subpath!r})"
             moves_intent.append((grp, Path(path_by_id[pid]), grp.reason))
 
     # Resolve destination dirs once per grouping, so two groupings with the
     # same subpath share a single create_dir.
-    dest_dir_by_grouping: dict[int, Path] = {}
+    dest_dir_by_grouping: dict[Grouping, Path] = {}
     for grp in groupings.items:
-        dest_dir_by_grouping[id(grp)] = _resolve_destination_dir(target, grp.subpath)
+        dest_dir_by_grouping[grp] = _resolve_destination_dir(target, grp.subpath)
 
-    # Build candidate moves: drop missing sources; drop sources already in dest dir.
+    # Build candidate moves: drop non-file sources; drop sources already in
+    # dest dir. `is_file()` (vs `exists()`) also rejects directory sources,
+    # which the rest of the pipeline isn't designed to move.
     candidates: list[tuple[Grouping, Path, Path, str]] = []  # (grp, src, dest_dir, reason)
     for grp, src, reason in moves_intent:
-        dest_dir = dest_dir_by_grouping[id(grp)]
-        if not src.exists():
-            logger.info("dropping missing source: %s", src)
+        dest_dir = dest_dir_by_grouping[grp]
+        if not src.is_file():
+            logger.info("dropping non-file source: %s", src)
             continue
         if src.parent.resolve() == dest_dir:
             logger.info("dropping no-op move (already in dest): %s", src)
             continue
         candidates.append((grp, src, dest_dir, reason))
+
+    # Snapshot of all paths that *will* leave their current location, so
+    # _resolve_basename can ignore on-disk "collisions" with files that
+    # are themselves planned sources moving away.
+    planned_sources = frozenset(src.resolve() for _, src, _, _ in candidates)
 
     # Resolve basenames deterministically. Sort by source path so collisions
     # break ties alphabetically and reproducibly.
@@ -164,8 +212,12 @@ def build(
     planned: set[tuple[str, str]] = set()
     move_ops: list[Operation] = []
     for grp, src, dest_dir, reason in candidates:
-        basename = _resolve_basename(dest_dir, src, planned, on_disk_check=True)
-        planned.add((str(dest_dir), basename))
+        basename = _resolve_basename(
+            dest_dir, src, planned,
+            on_disk_check=True, planned_sources=planned_sources,
+        )
+        key = (str(dest_dir), basename.casefold())
+        planned.add(key)
         op = Operation(
             kind=OperationKind.MOVE,
             source=str(src),
@@ -176,7 +228,7 @@ def build(
             _fs.validate_operation(op, target)
         except ValueError as e:
             logger.info("dropping invalid move %s -> %s: %s", src, dest_dir / basename, e)
-            planned.discard((str(dest_dir), basename))
+            planned.discard(key)
             continue
         move_ops.append(op)
 
@@ -187,7 +239,7 @@ def build(
             kind=OperationKind.CREATE_DIR,
             source=None,
             destination=str(d),
-            reason=f"destination for grouping",
+            reason="destination for grouping",
         )
         for d in sorted(surviving_dirs, key=str)
     ]

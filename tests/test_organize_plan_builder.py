@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -115,10 +116,12 @@ class TestIntraGroupDuplicate:
         groupings = _groupings(
             _grouping("A", "A", ["f000", "f000"]),
         )
-        plan = plan_builder.build(str(workspace), groupings, path_by_id, [])
+        with caplog.at_level(logging.WARNING, logger="fda.organize.plan_builder"):
+            plan = plan_builder.build(str(workspace), groupings, path_by_id, [])
         from fda.organize.models import OperationKind
         moves = [op for op in plan.operations if op.kind == OperationKind.MOVE]
         assert len(moves) == 1
+        assert "duplicate path_id" in caplog.text
 
 
 class TestSourceMissing:
@@ -127,9 +130,11 @@ class TestSourceMissing:
 
         path_by_id = {"f000": str(workspace / "ghost.txt")}  # no file on disk
         groupings = _groupings(_grouping("A", "A", ["f000"]))
-        with pytest.raises(plan_builder.PlanBuilderError) as exc:
-            plan_builder.build(str(workspace), groupings, path_by_id, [])
+        with caplog.at_level(logging.INFO, logger="fda.organize.plan_builder"):
+            with pytest.raises(plan_builder.PlanBuilderError) as exc:
+                plan_builder.build(str(workspace), groupings, path_by_id, [])
         assert "all operations dropped" in str(exc.value)
+        assert "non-file source" in caplog.text
 
 
 class TestJunkOnly:
@@ -189,10 +194,9 @@ class TestSubpathSanitization:
         plan = plan_builder.build(str(workspace), groupings, path_by_id, [])
         for op in plan.operations:
             if op.destination and op.destination != str(workspace):
-                # Each component has been stripped of trailing dots
                 for part in Path(op.destination).relative_to(workspace).parts:
                     assert not part.endswith(".")
-                    assert not part.startswith(".") or part == ".git"
+                    assert not part.startswith(".")
 
 
 class TestSubpathTraversal:
@@ -304,3 +308,123 @@ class TestPlanOrdering:
             i for i, k in enumerate(kinds) if k == OperationKind.CREATE_DIR
         )
         assert last_create_dir < first_move < first_delete
+
+
+class TestBackslashTraversal:
+    def test_backslash_double_dot_raises(self, workspace):
+        # POSIX-only Path().parts wouldn't see "..\\escape" as containing
+        # ".."; the explicit split-on-both-slashes guards this.
+        from fda.organize import plan_builder
+
+        (workspace / "a.txt").write_text("a")
+        path_by_id = {"f000": str(workspace / "a.txt")}
+        groupings = _groupings(_grouping("A", "..\\escape", ["f000"]))
+        with pytest.raises(plan_builder.PlanBuilderError):
+            plan_builder.build(str(workspace), groupings, path_by_id, [])
+
+
+class TestDirectorySource:
+    def test_directory_source_dropped(self, workspace):
+        # `is_file()` rejects directories. Pipeline organizes files only.
+        from fda.organize import plan_builder
+
+        (workspace / "subdir").mkdir()
+        path_by_id = {"f000": str(workspace / "subdir")}
+        groupings = _groupings(_grouping("A", "A", ["f000"]))
+        with pytest.raises(plan_builder.PlanBuilderError) as exc:
+            plan_builder.build(str(workspace), groupings, path_by_id, [])
+        assert "all operations dropped" in str(exc.value)
+
+
+class TestCaseInsensitivePlannedCollision:
+    def test_two_basenames_differing_only_in_case_collide(self, workspace):
+        # On case-insensitive filesystems (macOS APFS default, Windows
+        # NTFS), `Report.pdf` and `report.pdf` share storage. The planned
+        # set is keyed by casefold so we don't emit two MOVEs that fight.
+        from fda.organize import plan_builder
+        from fda.organize.models import OperationKind
+
+        (workspace / "x").mkdir()
+        (workspace / "y").mkdir()
+        (workspace / "x" / "Report.pdf").write_text("a")
+        (workspace / "y" / "report.pdf").write_text("b")
+        path_by_id = {
+            "f000": str(workspace / "x" / "Report.pdf"),
+            "f001": str(workspace / "y" / "report.pdf"),
+        }
+        groupings = _groupings(_grouping("R", "R", ["f000", "f001"]))
+        plan = plan_builder.build(str(workspace), groupings, path_by_id, [])
+        moves = [op for op in plan.operations if op.kind == OperationKind.MOVE]
+        names = [Path(op.destination).name for op in moves]
+        # Exactly one of the two should have been bumped to "(2)".
+        assert sum("(2)" in n for n in names) == 1
+
+
+class TestJunkAndGroupedOverlap:
+    def test_path_in_both_groupings_and_junk_raises(self, workspace):
+        from fda.organize import plan_builder
+
+        target = workspace / "a.txt"
+        target.write_text("a")
+        path_by_id = {"f000": str(target)}
+        groupings = _groupings(_grouping("A", "A", ["f000"]))
+        with pytest.raises(plan_builder.PlanBuilderError) as exc:
+            plan_builder.build(
+                str(workspace), groupings, path_by_id, [str(target)],
+            )
+        assert "both" in str(exc.value).lower()
+
+
+class TestPlannedSourceAwareCollision:
+    def test_existing_file_that_is_planned_source_does_not_force_rename(self, workspace):
+        # workspace/report.pdf -> R/report.pdf (incoming).
+        # Existing R/report.pdf is itself going elsewhere (S/), so the
+        # incoming file should keep its name.
+        from fda.organize import plan_builder
+        from fda.organize.models import OperationKind
+
+        (workspace / "R").mkdir()
+        (workspace / "report.pdf").write_text("incoming")
+        (workspace / "R" / "report.pdf").write_text("moving out")
+        path_by_id = {
+            "f000": str(workspace / "report.pdf"),
+            "f001": str(workspace / "R" / "report.pdf"),
+        }
+        groupings = _groupings(
+            _grouping("Into-R", "R", ["f000"], reason="r"),
+            _grouping("Into-S", "S", ["f001"], reason="s"),
+        )
+        plan = plan_builder.build(str(workspace), groupings, path_by_id, [])
+        moves = [op for op in plan.operations if op.kind == OperationKind.MOVE]
+        into_r = next(
+            op for op in moves if op.source == str(workspace / "report.pdf")
+        )
+        assert Path(into_r.destination).name == "report.pdf"
+
+
+class TestCollisionRetryCap:
+    def test_pathological_directory_raises_after_cap(self, workspace, monkeypatch):
+        # Force every candidate basename inside the destination dir to
+        # appear "already on disk" so the resolver never finds a free slot.
+        # Confirm it raises with the cap message rather than spinning.
+        from fda.organize import plan_builder
+
+        (workspace / "report.pdf").write_text("a")
+        path_by_id = {"f000": str(workspace / "report.pdf")}
+        groupings = _groupings(_grouping("R", "R", ["f000"]))
+
+        dest_dir = (workspace / "R").resolve()
+        original_exists = Path.exists
+
+        def fake_exists(self):
+            try:
+                if self.parent.resolve() == dest_dir:
+                    return True
+            except OSError:
+                pass
+            return original_exists(self)
+
+        monkeypatch.setattr(Path, "exists", fake_exists)
+        with pytest.raises(plan_builder.PlanBuilderError) as exc:
+            plan_builder.build(str(workspace), groupings, path_by_id, [])
+        assert "too many basename collisions" in str(exc.value)
