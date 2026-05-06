@@ -140,26 +140,6 @@ def validate_operation(op: Operation, target: Path) -> None:
     raise ValueError(f"Unknown operation kind: {op.kind}")
 
 
-def validate_plan_shape(operations: list[Operation]) -> None:
-    """Plan-level shape check: a plan that only creates directories does
-    nothing useful — reject it so a plan must include at least one move
-    (or junk delete) that actually organizes the directory.
-
-    Empty list is NOT this helper's concern; the caller handles that
-    separately so it can return its own message.
-
-    Raises ValueError on rejection.
-    """
-    if not operations:
-        return
-    if all(op.kind == OperationKind.CREATE_DIR for op in operations):
-        raise ValueError(
-            "plan contains only create_dir operations and no moves; a "
-            "plan must include at least one move (or junk delete) to "
-            "actually organize files"
-        )
-
-
 def apply_create_dir(op: Operation, target: Path) -> None:
     """Idempotent mkdir -p. Re-validates before applying."""
     validate_operation(op, target)
