@@ -40,8 +40,9 @@ Recover ≥95% per-class accuracy on the Northwind fixture (and analogously-stru
 
 - **(A)** Tightening the Reader prompt so it never invents a document type.
 - **(B)** Adding a small verbatim slice of extracted text to every catalog entry, surfaced to both Classifier stages so they can ground decisions independently of Reader's prose summary.
+- **(C)** Making filename-as-signal explicit in the Classifier prompts, with a clear priority: use the basename if it's informative (e.g., `Invoice_10488.pdf`, `Q3_Sales_Report.xlsx`); ignore it when it's a hash, a random ID, or a generic name (`doc1.pdf`, `0fa84d61b3158eaba46dee96.pdf`) and fall back to `verbatim_head` + `summary`.
 
-A and B are complementary: A reduces the rate of misleading prose; B gives the Classifier authoritative signal even when prose drifts.
+A, B, and C are complementary: A reduces the rate of misleading prose; B gives the Classifier authoritative signal even when prose drifts; C makes filename signal a deliberate, prioritized input rather than something the model uses or ignores at random.
 
 ## Non-goals
 
@@ -99,7 +100,7 @@ def _verbatim_head(text: str) -> str:
 
 The summarization call itself is unchanged — Reader still sends the full extracted text to Haiku and stores Haiku's prose response in `summary`. The slice is independent.
 
-### 4. Classifier Stage A sees the slice (B)
+### 4. Classifier Stage A sees the slice (B) and uses filename when informative (C)
 
 **Files:**
 - `fda/organize/skills/taxonomy-proposer/SKILL.md`
@@ -107,10 +108,13 @@ The summarization call itself is unchanged — Reader still sends the full extra
 
 **Changes:**
 
-- Stage A sample payload (today: per-entry `{path_id, summary, ...}`) gains `verbatim_head`. Approximate cost: ~100 sampled entries × ~300 chars / 4 chars-per-token ≈ 7.5K extra tokens per Stage A call. One call per run. Negligible.
-- Prompt update in `taxonomy-proposer/SKILL.md`: "Each sampled entry has `summary` (Reader's prose) and `verbatim_head` (the raw first ~300 chars of the file's extracted text, leading whitespace stripped). Use `verbatim_head` to perceive structural diversity in the corpus; if many summaries describe similar 'order documents' but the slices show distinct templates (e.g. some begin with `'Purchase Orders'`, others with `'Invoice'`, others with `'Order ID:'` and a Shipping Details section), propose distinct categories accordingly."
+- Stage A sample payload (today: per-entry `{path_id, path, summary, ...}`) gains `verbatim_head`. The existing `path` field is unchanged — it already carries the basename. Approximate cost: ~100 sampled entries × ~300 chars / 4 chars-per-token ≈ 7.5K extra tokens per Stage A call. One call per run. Negligible.
+- Prompt update in `taxonomy-proposer/SKILL.md` covering both the verbatim slice and the filename priority:
+  - "Each sampled entry has `summary` (Reader's prose), `verbatim_head` (the raw first ~300 chars of the file's extracted text, leading whitespace stripped), and `path` (full path; the last component is the filename)."
+  - "**Filename as signal.** When sampling, examine basenames. If many files share an informative naming convention (e.g. `Invoice_*.pdf`, `PO_*.pdf`, `Q3_Sales_Report_*.xlsx`), let that inform what categories to propose. **Ignore basenames that are hashes, random IDs, or generic placeholders** (e.g. `0fa84d61b3158eaba46dee96.pdf`, `doc1.pdf`, `Untitled.pdf`); rely on `verbatim_head` + `summary` for those."
+  - "**Verbatim slice as signal.** Use `verbatim_head` to perceive structural diversity in the corpus; if many summaries describe similar 'order documents' but the slices show distinct templates (some begin with `'Purchase Orders'`, others with `'Invoice'`, others with `'Order ID:'` and a Shipping Details section), propose distinct categories accordingly."
 
-### 5. Classifier Stage B sees the slice (B)
+### 5. Classifier Stage B sees the slice (B) and uses filename when informative (C)
 
 **Files:**
 - `fda/organize/skills/taxonomy-assigner/SKILL.md`
@@ -118,11 +122,15 @@ The summarization call itself is unchanged — Reader still sends the full extra
 
 **Changes:**
 
-- Stage B per-file payload gains `verbatim_head` alongside `path_id` and `summary`. Cost: per-file × all files. For 10K files at 300 chars each ≈ 750K chars ≈ 200K extra tokens distributed across Stage B batches.
-- Prompt update in `taxonomy-assigner/SKILL.md`:
-  - "Each entry has `summary` (Reader's prose, may be imprecise about document type) and `verbatim_head` (raw first ~300 chars of the file's extracted text). If `verbatim_head` and `summary` disagree about document type, trust `verbatim_head`."
-  - "Look for literal type labels in `verbatim_head` (e.g. the document's own header line such as `'Invoice'`, `'Purchase Orders'`, `'Statement'`, `'Receipt'`) before falling back to prose."
-  - "Empty `verbatim_head` (extraction failed) → use `summary` only."
+- Stage B per-file payload gains `verbatim_head` alongside the existing `path_id`, `path`, `summary`, etc. The `path` field already carries the basename today. Cost: per-file × all files. For 10K files at 300 chars each ≈ 750K chars ≈ 200K extra tokens distributed across Stage B batches.
+- Prompt update in `taxonomy-assigner/SKILL.md` — explicit priority hierarchy:
+  - "Each entry has `path` (full path; last component is the filename), `summary` (Reader's prose, may be imprecise about document type), and `verbatim_head` (raw first ~300 chars of the file's extracted text)."
+  - "**Signal priority for assignment:**"
+    - "**1. Filename, if informative.** If the basename contains words that hint at document type or business purpose (e.g. `Invoice_10488.pdf`, `Q3_Sales_Report.xlsx`, `PO-2024-0042.pdf`), use it as a strong signal. Confirm with `verbatim_head` when possible, but a clearly-named file usually settles the assignment."
+    - "**2. If the filename is a hash, a random ID, or generic** (e.g. `0fa84d61b3158eaba46dee96.pdf`, `doc1.pdf`, `Untitled.pdf`, `IMG_4521.jpg`), **ignore it.** Make the decision from `verbatim_head` and `summary` alone."
+    - "**3. Within `verbatim_head` + `summary`:** if they disagree about document type, trust `verbatim_head`. Look for literal type labels in the slice (e.g. `'Invoice'`, `'Purchase Orders'`, `'Statement'`, `'Receipt'`) before falling back to prose."
+    - "**4. Empty `verbatim_head` (extraction failed):** use `summary` only."
+  - "How to recognize an uninformative filename: long hex strings (e.g. 16+ contiguous hex characters), UUID-like patterns, generic placeholders. When in doubt, default to ignoring the filename rather than over-weighting it."
 
 ### 6. Tests
 
@@ -130,7 +138,10 @@ The summarization call itself is unchanged — Reader still sends the full extra
 
 - `tests/test_organize_models.py` — assert `CatalogEntry().verbatim_head == ""` (default).
 - `tests/test_organize_reader.py` — fixture file with leading whitespace; assert reader populates `verbatim_head`, strips leading whitespace, caps at 300 chars; on extraction failure assert `verbatim_head == ""`.
-- `tests/test_organize_classifier.py` — regression case: build a `Catalog` with one entry whose `summary == "Purchase order #10488 for Frankenversand"` and whose `verbatim_head == "Order ID: 10488\n\nShipping Details:\n..."`. Stub Stage A to propose categories `[Purchase-Orders, Shipping-And-Fulfillment, Misc]` and Stage B to receive the per-file payload. Assert the assigner is given `verbatim_head` in the payload (test the wire format) and, with a fake backend that follows the prompt, returns `Shipping-And-Fulfillment`.
+- `tests/test_organize_classifier.py` — three regression cases:
+  - **Conflict case (B):** entry with `summary == "Purchase order #10488 for Frankenversand"`, `verbatim_head == "Order ID: 10488\n\nShipping Details:\n..."`, and a hash basename (`0fa84d61b3158eaba46dee96.pdf`). Stub taxonomy `[Purchase-Orders, Shipping-And-Fulfillment, Misc]`. Assert the per-file payload contains `verbatim_head` (wire format) and that a fake backend following the prompt returns `Shipping-And-Fulfillment`.
+  - **Informative-filename case (C):** entry with basename `Invoice_10488.pdf`, `summary == "Order document for ACME Corp..."`, `verbatim_head == "Order ID: 10488\nCustomer: ACME..."` (no literal "Invoice" in slice). Assert assignment is `Sales-Invoices` — driven purely by filename signal.
+  - **Hash-filename ignored case (C):** entry with basename `0fa84d61b3158eaba46dee96.pdf`, `summary == "Stock report for beverages..."`, `verbatim_head == "Monthly Stock Report\nCategory: Beverages..."`. Assert assignment is `Stock-Reports` — model must ignore the hash basename and use `verbatim_head` + `summary`.
 - `tests/test_organize_constraints.py` — extend the existing `CONSTS` mapping to include `"VERBATIM_HEAD_CHARS": ("reader.py", "300")` so the named-constant-defined check covers it. Do **not** add `300` to `DISTINCTIVE_LITERALS`: the value `300` is already in `reader.py` as `READER_TOTAL_TIMEOUT_SECONDS = 300` (a seconds timeout, semantically distinct from the chars cap), so a literal-uniqueness check would be ambiguous. The named-constant check is sufficient.
 
 All 113 existing tests must still pass.
@@ -148,16 +159,16 @@ extract(path) ─┐
                ├── summary (Haiku) ──┐
                │                     ├── CatalogEntry ──┐
                └── verbatim_head ────┘    {path_id,     │
-                   (deterministic           summary,    ├── Stage A ─── proposes taxonomy
-                    Python; first           verbatim_   │   (sample sees both fields)
-                    300 chars after         head,       │
-                    lstrip)                 ...}        └── Stage B ─── assigns each file
-                                                            (per-file sees both fields,
-                                                             told to trust verbatim
-                                                             when in conflict)
+                   (deterministic           path,       ├── Stage A ─── proposes taxonomy
+                    Python; first           summary,    │   (sees path/basename, summary,
+                    300 chars after         verbatim_   │    verbatim_head)
+                    lstrip)                 head,       │
+                                            ...}        └── Stage B ─── assigns each file
+                                                            (sees same fields; priority:
+                                                             filename → verbatim → summary)
 ```
 
-The data flow shape is unchanged. One field is added to `CatalogEntry`. Two prompts gain a paragraph and a per-entry field. No changes to PlanBuilder, Executor, Verifier, or any orchestration code.
+The data flow shape is unchanged. One field (`verbatim_head`) is added to `CatalogEntry`. Three prompts (`file-summarizer`, `taxonomy-proposer`, `taxonomy-assigner`) are updated. The existing `path` field is reused — no new filename field needed. No changes to PlanBuilder, Executor, Verifier, or any orchestration code.
 
 ## Risks and mitigations
 
@@ -166,6 +177,8 @@ The data flow shape is unchanged. One field is added to `CatalogEntry`. Two prom
 - **Extracted text starts with garbage** (e.g. malformed PDF where pdftotext yields binary noise before the content). The slice will be garbage too, and the prompt fallback ("empty or noisy → trust summary") covers this. Reader still produces a useful prose summary independently.
 - **Classifier overcorrects** — trusts a misleading slice over a correct summary. Mitigation: prompt instructs to use the slice for *type label* signal specifically, not as a wholesale summary replacement. Stage B regression test pins the expected behavior on the canonical conflict case.
 - **Reader prompt fix (A) doesn't fully prevent confabulation.** Mitigation: B carries the load. Even if A fails 100% of the time and Haiku continues to invent type labels, B alone should fix the bug as long as the Classifier follows the "trust verbatim" instruction.
+- **Filename signal (C) over-trusted on misleading basenames.** Real corpora sometimes have lying filenames — e.g., `Invoice_old_template_donotuse.pdf` is actually a draft, or `Q3.pdf` is actually Q4. Mitigation: prompt instructs to *confirm filename signal with `verbatim_head` when possible*, not to use it blindly. The hash-filename test case pins the "ignore uninformative basename" behavior; if real-world misleading basenames become a problem, add a "verbatim must not contradict filename" check in a future iteration.
+- **Hash detection in the prompt is heuristic, not deterministic.** The model decides what counts as "uninformative" — it could miscall a real word like `report.pdf` as generic, or miss a less-obvious hash format. Acceptable risk for v1: the priority hierarchy explicitly defaults to ignoring the filename when in doubt, so misjudgments fall back to the (correct) `verbatim_head` + `summary` path.
 
 ## Backward compatibility
 
@@ -176,15 +189,15 @@ The data flow shape is unchanged. One field is added to `CatalogEntry`. Two prom
 
 ## Implementation order (handed to writing-plans)
 
-1. `fda/organize/models.py`: add field with default.
+1. `fda/organize/models.py`: add `verbatim_head` field with default `""`.
 2. `tests/test_organize_models.py`: default-value test.
-3. `fda/organize/reader.py`: implement `_verbatim_head`, populate field, define `VERBATIM_HEAD_CHARS`.
+3. `fda/organize/reader.py`: implement `_verbatim_head`, populate field, define `VERBATIM_HEAD_CHARS = 300`.
 4. `tests/test_organize_reader.py`: leading-whitespace strip, cap, extraction-failure cases.
 5. `fda/organize/skills/file-summarizer/SKILL.md`: prompt rewrite (A).
-6. `fda/organize/classifier.py` + `taxonomy-proposer/SKILL.md`: Stage A payload + prompt update.
-7. `fda/organize/classifier.py` + `taxonomy-assigner/SKILL.md`: Stage B payload + prompt update.
-8. `tests/test_organize_classifier.py`: conflict-case regression.
-9. `tests/test_organize_constraints.py`: extend literal-uniqueness for `300`.
-10. Manual validation against the Northwind fixture.
+6. `fda/organize/classifier.py` + `taxonomy-proposer/SKILL.md`: Stage A payload (+ `verbatim_head`) + prompt update covering both verbatim slice and filename-signal priority (B + C).
+7. `fda/organize/classifier.py` + `taxonomy-assigner/SKILL.md`: Stage B payload (+ `verbatim_head`) + prompt update with the explicit signal-priority hierarchy `filename → verbatim → summary` (B + C).
+8. `tests/test_organize_classifier.py`: three regression cases (conflict, informative-filename, hash-filename).
+9. `tests/test_organize_constraints.py`: add `VERBATIM_HEAD_CHARS` to the `CONSTS` named-constant check.
+10. Manual validation against the Northwind fixture (hash-named) and a follow-up smoke run with informative basenames if a fixture is available.
 
 Each step is one commit; pre-commit hook enforces the test suite.
