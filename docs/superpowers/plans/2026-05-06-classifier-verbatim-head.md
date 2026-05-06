@@ -221,9 +221,11 @@ class TestVerbatimHead:
         e = catalog.entries[0]
         assert len(e.verbatim_head) == reader.VERBATIM_HEAD_CHARS
 
-    def test_empty_on_extraction_failure(self, workspace, logger):
-        """When the backend errors out (summary_failed=True), the entry
-        still carries an empty verbatim_head — never None."""
+    def test_preserved_when_summary_call_fails(self, workspace, logger):
+        """The slice is INDEPENDENT of the summarization call. When
+        extraction succeeded but the backend errored out, verbatim_head is
+        still the head of the extracted text — that grounding signal is
+        the whole point of the field."""
         from fda.organize import reader
 
         backend = MagicMock()
@@ -232,6 +234,39 @@ class TestVerbatimHead:
         catalog = reader.read(workspace, backend=backend, logger=logger)
         e = catalog.entries[0]
         assert e.summary_failed is True
+        assert e.verbatim_head.startswith("Order ID: 10488")
+
+    def test_preserved_when_summary_response_is_unparseable(
+        self, workspace, logger
+    ):
+        """JSON parse failure path also preserves the slice."""
+        from fda.organize import reader
+
+        backend = MagicMock()
+        backend.complete.return_value = "not-json"
+        (workspace / "a.txt").write_text("Invoice\nOrder ID: 627\n")
+        catalog = reader.read(workspace, backend=backend, logger=logger)
+        e = catalog.entries[0]
+        assert e.summary_failed is True
+        assert e.verbatim_head.startswith("Invoice")
+
+    def test_empty_on_extractor_failure(self, workspace, fake_backend, logger):
+        """When the EXTRACTOR returns a non-ok status (e.g., status='failed'
+        because the file was unreadable or the extractor raised),
+        verbatim_head is empty even though the helper sees an extraction
+        result."""
+        from fda.organize import reader, _extractors
+        from fda.organize.models import ExtractionResult
+
+        (workspace / "a.foo").write_bytes(b"\x00\x01\x02")
+
+        def failing_extract(_path):
+            return ExtractionResult(text=None, status="failed", note="boom")
+
+        with patch.dict(_extractors.EXTRACTORS, {".foo": failing_extract}, clear=False):
+            catalog = reader.read(workspace, backend=fake_backend, logger=logger)
+        e = catalog.entries[0]
+        assert e.extract_status == "failed"
         assert e.verbatim_head == ""
 
     def test_empty_for_unsupported_extension(self, workspace, fake_backend, logger):
@@ -251,7 +286,7 @@ class TestVerbatimHead:
 python3 -m pytest tests/test_organize_reader.py::TestVerbatimHead -v
 ```
 
-Expected: FAIL — `AttributeError: module 'fda.organize.reader' has no attribute 'VERBATIM_HEAD_CHARS'` and entries' `verbatim_head` is always `""` (so the lstrip test fails too).
+Expected: FAIL. The `cap` test raises `AttributeError: module 'fda.organize.reader' has no attribute 'VERBATIM_HEAD_CHARS'`. The `populated`, `preserved-on-summary-error`, and `preserved-on-unparseable-json` tests fail because `verbatim_head` defaults to `""` and nothing populates it. The `empty-on-extractor-failure` and `empty-on-no-extractor` tests pass coincidentally (default is already `""`) — that's fine; they will pin the right behavior once the field is populated.
 
 - [ ] **Step 3: Add the constant and helper to `reader.py`.**
 
@@ -276,9 +311,40 @@ def _verbatim_head(extraction: ExtractionResult) -> str:
     return extraction.text.lstrip()[:VERBATIM_HEAD_CHARS]
 ```
 
-- [ ] **Step 4: Populate the field in `_summarize_one`.**
+- [ ] **Step 4: Populate the field in `_summarize_one` (success AND failure paths).**
 
-In `fda/organize/reader.py`, find `_summarize_one` (around line 91). After `extraction = _extractors.extract(path)` (line 104), compute the slice once and pass it through to the success-case `CatalogEntry` constructor. Modify the success-path return (around lines 131-145) to include the new field:
+The slice must be **independent of the summarization call** — when extraction succeeds but the Haiku call times out, errors, or returns unparseable JSON, the entry must STILL carry `verbatim_head`. Otherwise we lose the grounding signal exactly when the prose summary is missing — defeating the purpose of the field.
+
+To support this, `_fail_entry` gains an optional `verbatim_head` keyword argument. The existing call site in `read()`'s exception handler (around line 232-237) — which fires when a worker raises before extraction can be evaluated — keeps the default `""`.
+
+In `fda/organize/reader.py`:
+
+(a) Update `_fail_entry` (around lines 148-159) to accept `verbatim_head`:
+
+```python
+def _fail_entry(
+    path: Path,
+    size: int,
+    extract_status: str,
+    _why: str,
+    *,
+    verbatim_head: str = "",
+) -> CatalogEntry:
+    return CatalogEntry(
+        path_id="",
+        path=str(path),
+        ext=path.suffix.lower(),
+        size_bytes=size,
+        summary="",
+        type_label="",
+        is_junk=False,
+        summary_failed=True,
+        extract_status=extract_status,
+        verbatim_head=verbatim_head,
+    )
+```
+
+(b) Update `_summarize_one` (around lines 91-145). After `extraction = _extractors.extract(path)`, compute the slice once and thread it through the success path AND every failure path:
 
 ```python
 def _summarize_one(
@@ -307,9 +373,17 @@ def _summarize_one(
             timeout=timeout_seconds,
         )
     except TimeoutError as e:
-        return _fail_entry(path, size, extraction.status, str(e)), "timeout", str(e)
+        return (
+            _fail_entry(path, size, extraction.status, str(e), verbatim_head=head),
+            "timeout",
+            str(e),
+        )
     except Exception as e:  # noqa: BLE001 — never abort a run because one file fails
-        return _fail_entry(path, size, extraction.status, str(e)), "fail", str(e)
+        return (
+            _fail_entry(path, size, extraction.status, str(e), verbatim_head=head),
+            "fail",
+            str(e),
+        )
 
     try:
         parsed = json.loads(raw)
@@ -317,7 +391,10 @@ def _summarize_one(
         summary = str(parsed.get("summary", ""))
     except (json.JSONDecodeError, AttributeError, TypeError):
         return (
-            _fail_entry(path, size, extraction.status, "unparseable summary"),
+            _fail_entry(
+                path, size, extraction.status, "unparseable summary",
+                verbatim_head=head,
+            ),
             "fail",
             "unparseable summary",
         )
@@ -340,7 +417,7 @@ def _summarize_one(
     )
 ```
 
-Note: `_fail_entry` and `_junk_entry` already construct entries without `verbatim_head` — the dataclass default `""` covers them. **Do not** modify those helpers.
+Note: `_junk_entry` is unchanged — junk files are not extracted and have `verbatim_head=""` by default. The `read()` exception handler (the worker-raised TOCTOU branch at lines 232-237) is also unchanged: at that point `extraction` is unknown, so the default `""` is correct.
 
 The final-sort loop near the end of `read()` (around lines 264-277) re-builds entries to assign `path_id`. It must carry `verbatim_head` through. Edit that comprehension:
 
@@ -368,7 +445,7 @@ The final-sort loop near the end of `read()` (around lines 264-277) re-builds en
 python3 -m pytest tests/test_organize_reader.py::TestVerbatimHead -v
 ```
 
-Expected: PASS for all four cases.
+Expected: PASS for all six cases (lstrip, cap, preserved-on-summary-error, preserved-on-unparseable-json, empty-on-extractor-failure, empty-on-no-extractor).
 
 - [ ] **Step 6: Run the full suite.**
 
@@ -387,8 +464,13 @@ organize(reader): populate CatalogEntry.verbatim_head from extracted text
 
 Adds VERBATIM_HEAD_CHARS=300 and a deterministic Python helper that
 stores extracted_text.lstrip()[:300] on each catalog entry. No LLM call.
-Empty when extraction did not return status='ok'. Threaded through the
-final path_id-assignment rebuild so the field survives the sort.
+Empty only when the EXTRACTOR did not return status='ok' — preserved
+across summarization timeout, backend exception, and unparseable JSON
+so the grounding signal survives exactly when the prose summary is
+unavailable. _fail_entry gains an optional verbatim_head kw-arg.
+
+Threaded through the final path_id-assignment rebuild so the field
+survives the global sort.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 EOF
@@ -875,7 +957,11 @@ These are end-to-end tests on the classifier with a stubbed backend. They verify
 
 The fake backend uses `side_effect` with a function that inspects the captured Stage B payload and returns the expected assignment based on what the prompt says to do.
 
-- [ ] **Step 1: Write the three failing tests.**
+- [ ] **Step 1: Add `import re` to the test module's imports if missing.**
+
+The new tests use a class-level regex to identify hash basenames. Open `tests/test_organize_classifier.py` and add `import re` to the import block at the top of the file (currently lines 1-13). After: the imports include `import re` alongside `import json`, `import threading`, `import time`.
+
+- [ ] **Step 2: Write the three failing tests.**
 
 Append to `tests/test_organize_classifier.py`:
 
@@ -889,19 +975,35 @@ Append to `tests/test_organize_classifier.py`:
 
 
 class TestPriorityRegressions:
+    """End-to-end tests for the prompt's signal-priority hierarchy.
+
+    The fake backend in each test simulates an assigner that actually
+    follows the prompt: it parses the BATCH payload, asserts the expected
+    fields are present (so the wire format must include them for the
+    assertion to pass), and routes by inspecting `path` / `verbatim_head`
+    / `summary` per the documented priority. If a future change removes
+    `verbatim_head` from `_entry_dict`, these tests fail immediately
+    rather than passing on a tautology.
+    """
+
+    HASH_RE = re.compile(r"^[0-9a-f]{16,}$")  # informative-vs-hash discriminator
+
     def _make_backend(self, taxonomy_categories, decide):
         """Return a MagicMock backend that:
           - returns the given Stage A taxonomy on the first call (whose
             payload contains 'CATALOG' but not 'BATCH'),
-          - delegates Stage B per-file assignment to `decide(payload) -> {pid:
-            category}` for each call whose payload contains 'BATCH'.
+          - delegates Stage B per-file assignment to `decide(parsed_batch)
+            -> {pid: category}` where parsed_batch is the JSON-decoded
+            list of entry dicts from the BATCH payload.
         """
         backend = MagicMock()
 
         def respond(*, system, messages, **kwargs):
             payload = messages[0]["content"]
             if '"BATCH"' in payload:
-                mapping = decide(payload)
+                parsed = json.loads(payload)
+                batch = parsed["BATCH"]
+                mapping = decide(batch)
                 return _assignment_payload(list(mapping.items()))
             return _taxonomy_payload(taxonomy_categories)
 
@@ -910,8 +1012,9 @@ class TestPriorityRegressions:
 
     def test_conflict_summary_says_PO_but_verbatim_says_shipping(self, logger):
         """Reader summary calls it a purchase order, but verbatim_head
-        clearly shows shipping-order content. A backend following the
-        prompt picks Shipping-And-Fulfillment."""
+        clearly shows shipping-order content. Filename is a hash (ignored).
+        A simulated assigner following the prompt picks
+        Shipping-And-Fulfillment by reading verbatim_head over summary."""
         from fda.organize import classifier
         from fda.organize.models import CatalogEntry
 
@@ -932,9 +1035,25 @@ class TestPriorityRegressions:
             ),
         )
 
-        def decide(payload: str) -> dict[str, str]:
-            # The prompt says: ignore hash basenames; prefer verbatim_head over
-            # summary on conflict; verbatim_head shows shipping content → ship.
+        def decide(batch):
+            assert len(batch) == 1
+            entry = batch[0]
+            # Wire-format preconditions: every field the prompt's priority
+            # rule depends on MUST be in the payload.
+            assert entry["path_id"] == "f000"
+            assert "verbatim_head" in entry
+            assert "path" in entry
+            assert "summary" in entry
+            basename = Path(entry["path"]).name
+            head = entry["verbatim_head"]
+            summary = entry["summary"]
+            # Priority step 2: hash basename → ignore filename signal.
+            assert self.HASH_RE.match(basename.split(".")[0]), \
+                "expected a hash basename for this scenario"
+            # Priority step 3: verbatim says shipping ('Shipping Details',
+            # 'Shipper Name', 'Shipped Date'); summary says PO. Trust verbatim.
+            assert "Shipping Details" in head
+            assert "Purchase order" in summary
             return {"f000": "Shipping-And-Fulfillment"}
 
         backend = self._make_backend(
@@ -966,9 +1085,21 @@ class TestPriorityRegressions:
             verbatim_head="Order ID: 10488\nCustomer: ACME\nTotal: 1234.5",
         )
 
-        def decide(payload: str) -> dict[str, str]:
-            # The prompt says: informative filename ('Invoice_10488') is a
-            # strong signal even when verbatim_head lacks the literal word.
+        def decide(batch):
+            assert len(batch) == 1
+            entry = batch[0]
+            assert "verbatim_head" in entry
+            basename = Path(entry["path"]).name
+            head = entry["verbatim_head"]
+            # Priority step 1: informative basename ('Invoice' word) → use it.
+            stem = basename.split(".")[0]
+            assert not self.HASH_RE.match(stem), \
+                "expected an informative basename for this scenario"
+            assert "invoice" in basename.lower(), \
+                "scenario expects 'Invoice' in the filename"
+            # Priority preserves: verbatim doesn't carry the literal type word.
+            assert "Invoice" not in head and "invoice" not in head.lower(), \
+                "scenario expects the verbatim slice to lack the type word"
             return {"f000": "Sales-Invoices"}
 
         backend = self._make_backend(
@@ -1001,9 +1132,17 @@ class TestPriorityRegressions:
             ),
         )
 
-        def decide(payload: str) -> dict[str, str]:
-            # The prompt says: hash basename → ignore; rely on verbatim_head
-            # ('Monthly Stock Report') + summary → Stock-Reports.
+        def decide(batch):
+            assert len(batch) == 1
+            entry = batch[0]
+            assert "verbatim_head" in entry
+            basename = Path(entry["path"]).name
+            head = entry["verbatim_head"]
+            # Priority step 2: hash basename → ignore filename.
+            assert self.HASH_RE.match(basename.split(".")[0])
+            # Priority step 3: verbatim_head literally says 'Monthly Stock
+            # Report' → Stock-Reports.
+            assert "Monthly Stock Report" in head
             return {"f000": "Stock-Reports"}
 
         backend = self._make_backend(
@@ -1015,15 +1154,15 @@ class TestPriorityRegressions:
         assert any(g.category == "Stock-Reports" for g in result.items)
 ```
 
-- [ ] **Step 2: Run the new tests to verify they pass.**
+- [ ] **Step 3: Run the new tests to verify they pass.**
 
 ```bash
 python3 -m pytest tests/test_organize_classifier.py::TestPriorityRegressions -v
 ```
 
-Expected: PASS for all three. (After Task 5 the wire format already includes `verbatim_head`, and the fake backend simply enacts the prompt's priority — no extra production code is needed.)
+Expected: PASS for all three. The fake backend parses the BATCH payload and asserts the wire format contains every field the prompt's priority hierarchy depends on (`verbatim_head`, `path`, `summary`). After Task 5 the wire format already includes `verbatim_head`, so no extra production code is needed beyond what's already landed.
 
-- [ ] **Step 3: Run the full suite.**
+- [ ] **Step 4: Run the full suite.**
 
 ```bash
 python3 -m pytest tests/ -x -q --tb=short
@@ -1031,19 +1170,26 @@ python3 -m pytest tests/ -x -q --tb=short
 
 Expected: all tests pass.
 
-- [ ] **Step 4: Commit.**
+- [ ] **Step 5: Commit.**
 
 ```bash
 git add tests/test_organize_classifier.py
 git commit -m "$(cat <<'EOF'
 organize(classifier): regression tests for verbatim/filename priority
 
-Three end-to-end stub-backend tests pinning the assigner contract:
+Three end-to-end stub-backend tests pinning the assigner contract.
+The fake backend parses each BATCH payload and asserts the fields the
+prompt's priority hierarchy depends on (verbatim_head, path, summary)
+are actually present, then routes accordingly:
+
 1. verbatim_head wins over a misleading summary (the canonical Northwind
    shipping-order misclassification scenario);
 2. an informative filename ('Invoice_10488.pdf') drives routing even
    when verbatim_head lacks the literal type word;
 3. a hash basename is ignored; routing comes from verbatim + summary.
+
+Tests fail loudly if a future change drops verbatim_head from the
+classifier wire format.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 EOF
