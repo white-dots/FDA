@@ -667,3 +667,86 @@ class TestPendingBatchesCanceledOnFailure:
             classifier.classify(cat, "", backend=backend, logger=logger)
         # Must NOT have processed all batches — cancellation limited further work.
         assert len(call_log) < 30
+
+
+# ---------------------------------------------------------------------------
+# Wire format: verbatim_head present in classifier payloads
+# ---------------------------------------------------------------------------
+
+
+class TestVerbatimHeadInPayload:
+    def test_assigner_batch_payload_carries_verbatim_head(self, logger):
+        """The Stage B per-batch JSON payload must include each entry's
+        verbatim_head alongside path, summary, etc."""
+        from fda.organize import classifier
+        from fda.organize.models import CatalogEntry
+
+        captured: dict[str, str] = {}
+
+        def capture(*, system, messages, **kwargs):
+            payload = messages[0]["content"]
+            captured["payload"] = payload
+            # Distinguish Stage A (CATALOG) from Stage B (BATCH).
+            if '"BATCH"' in payload:
+                return _assignment_payload([("f000", "Texts")])
+            return _taxonomy_payload(["Texts"])
+
+        backend = MagicMock()
+        backend.complete.side_effect = capture
+
+        e = CatalogEntry(
+            path_id="f000",
+            path="/tmp/target/0fa84d61b3158eaba46dee96.pdf",
+            ext=".pdf",
+            size_bytes=2686,
+            summary="Order document with shipping sections.",
+            type_label="order-document",
+            is_junk=False,
+            summary_failed=False,
+            extract_status="ok",
+            verbatim_head="Order ID: 10488\n\nShipping Details:\nShip Name: Frankenversand",
+        )
+        cat = _catalog([e])
+        classifier.classify(cat, "sort", backend=backend, logger=logger)
+
+        # The captured payload from the *last* call (Stage B) should mention
+        # the verbatim_head field name AND the slice content.
+        assert "verbatim_head" in captured["payload"]
+        assert "Order ID: 10488" in captured["payload"]
+        assert "Shipping Details" in captured["payload"]
+
+    def test_proposer_sample_payload_carries_verbatim_head(self, logger):
+        """The Stage A sample JSON payload must include verbatim_head per
+        sampled entry."""
+        from fda.organize import classifier
+        from fda.organize.models import CatalogEntry
+
+        captured: dict[str, str] = {}
+
+        def capture(*, system, messages, **kwargs):
+            payload = messages[0]["content"]
+            if '"CATALOG"' in payload and '"BATCH"' not in payload:
+                captured["stage_a"] = payload
+                return _taxonomy_payload(["Texts"])
+            return _assignment_payload([("f000", "Texts")])
+
+        backend = MagicMock()
+        backend.complete.side_effect = capture
+
+        e = CatalogEntry(
+            path_id="f000",
+            path="/tmp/target/Invoice_10488.pdf",
+            ext=".pdf",
+            size_bytes=1024,
+            summary="Order document for ACME Corp.",
+            type_label="order-document",
+            is_junk=False,
+            summary_failed=False,
+            extract_status="ok",
+            verbatim_head="Order ID: 10488\nCustomer: ACME",
+        )
+        cat = _catalog([e])
+        classifier.classify(cat, "sort", backend=backend, logger=logger)
+
+        assert "verbatim_head" in captured["stage_a"]
+        assert "Order ID: 10488" in captured["stage_a"]

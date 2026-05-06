@@ -97,6 +97,7 @@ def _entry_dict(e: CatalogEntry) -> dict[str, Any]:
                    else "summary unavailable",
         "type_label": e.type_label,
         "extract_status": e.extract_status,
+        "verbatim_head": e.verbatim_head,
     }
 
 
