@@ -29,16 +29,20 @@ Rules:
 - If the file is impossible to classify (corrupt, empty, opaque), set `type_label` to `unknown` and write a one-sentence summary saying so.
 
 Type-label grounding rules — important:
-- DO NOT name a document type unless that exact phrase appears verbatim in the
-  extracted text. If the text says "Purchase Orders" or "Invoice" at the top,
-  use it. If the text only says "Order ID: …" with shipping/customer/shipper
-  sections and no explicit type word, do not call it a "purchase order" or a
-  "shipping order" — describe its structure instead.
-- When no type label is present, prefer a neutral structural `summary` such as
-  "Order document with shipping, customer, employee, shipper, products, and
-  shipped-date sections, dated 2017-03-27, total 1560.0." Use a generic
-  `type_label` such as `order-document` or `unknown`, NOT `purchase-order` or
-  `shipping-order`.
+- DO NOT name a business-document type (such as `invoice`, `purchase-order`,
+  `shipping-order`, `receipt`, `statement`, `contract`, `quote`) unless that
+  exact phrase appears verbatim in the extracted text. If the text says
+  "Purchase Orders" or "Invoice" at the top, use it. If the text only says
+  "Order ID: …" with shipping/customer/shipper sections and no explicit type
+  word, do not call it a "purchase order" or a "shipping order" — describe
+  its structure instead. (Technical file-type labels derived from extension
+  or format — `python-source`, `image`, `archive`, `binary`, etc. — are not
+  affected by this rule.)
+- When no business-document type label is present, prefer a neutral structural
+  `summary` such as "Order document with shipping, customer, employee,
+  shipper, products, and shipped-date sections, dated 2017-03-27, total
+  1560.0." Use a generic `type_label` such as `order-document` or `unknown`,
+  NOT `purchase-order` or `shipping-order`.
 - A downstream classifier sees a separate verbatim slice of the file's text
   for grounding. Your job is neutral, accurate description — not confident
   guessing. Hallucinated type labels harm classification accuracy more than
