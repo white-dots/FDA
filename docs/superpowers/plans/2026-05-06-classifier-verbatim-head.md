@@ -45,7 +45,7 @@ The 9 tasks are grouped into **4 review chunks plus 1 manual measurement step**.
 | **Chunk 1 — Data plumbing** ✅ **DONE** | 1, 2, 3 | `models.py` field, `reader.py` population (helper + `_summarize_one` + final rebuild), constraints registration | Helper correctness; `verbatim_head` survives summary timeout / exception / unparseable JSON; cap at 300 chars; field threaded through global sort |
 | **Chunk 2 — Reader prompt (signal A)** ✅ **DONE** | 4 | `file-summarizer/SKILL.md` only | Do the new grounding rules actually disambiguate the Northwind shipping-order failure mode? Wording strict enough to block hallucinated `purchase-order` labels? |
 | **Chunk 3 — Classifier wire format + prompts (signal C)** ✅ **DONE** | 5, 6, 7 | `classifier.py:_entry_dict`, `taxonomy-proposer/SKILL.md`, `taxonomy-assigner/SKILL.md` | Field reaches both Stage A and Stage B payloads; priority hierarchy (`filename → verbatim → summary`) is consistent across the two prompts; hash-vs-informative filename heuristic is unambiguous |
-| **Chunk 4 — Classifier regression tests (signal B)** | 8 | `tests/test_organize_classifier.py` (`TestPriorityRegressions`) | Are fake-backend assertions strict enough that the tests fail loudly if `verbatim_head` is dropped from the wire format? Are the three scenarios (conflict, informative-filename, hash-filename) representative? |
+| **Chunk 4 — Classifier regression tests (signal B)** ✅ **DONE** | 8 | `tests/test_organize_classifier.py` (`TestPriorityRegressions`) | Are fake-backend assertions strict enough that the tests fail loudly if `verbatim_head` is dropped from the wire format? Are the three scenarios (conflict, informative-filename, hash-filename) representative? |
 | **Manual — Northwind validation** | 9 | Fixture restore + `--apply` run + manifest scoring | Not a codex-review chunk — measurement against live Sonnet. Run after Chunk 4 lands; report numbers to the user. |
 
 **Chunk boundaries are marked inline below** with `### CHUNK N START` / `### CHUNK N END` markers around the task groups.
@@ -992,6 +992,12 @@ EOF
      taxonomy-assigner; hash-vs-informative filename heuristic is
      unambiguous; constraint test for path_id rules still green. -->
 
+<!-- ===================== CHUNK 4 START — Classifier regression tests (Task 8) =====================
+     STATUS: DONE (2026-05-06). Implemented in commit c4caaa9 — three
+     end-to-end stub-backend regression tests pinning the assigner contract.
+     Codex reviewed and passed all 5 dimensions (wire-format fail-loud,
+     scenario coverage, hash-regex correctness, no-tautology, imports).
+     -->
 <!-- ===================== CHUNK 4 START — Classifier regression tests (Task 8) ===================== -->
 
 ### Task 8: Classifier regression tests (conflict, informative-filename, hash-filename)
