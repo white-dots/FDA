@@ -1187,16 +1187,26 @@ class TestSamplingShapeBudget:
         """Construct a 200-entry catalog with 6 distinct sections-shapes,
         most concentrated in the dominant shape. The new shape-budget
         rule should reserve at least one entry per distinct shape, up
-        to TAXONOMY_SAMPLE_SHAPE_BUDGET."""
+        to TAXONOMY_SAMPLE_SHAPE_BUDGET.
+
+        Critical for the test's validity: every entry lives in the SAME
+        flat directory so the existing top-level-dir + leaf-dir sampling
+        rules cannot accidentally substitute for the shape-budget rule.
+        Also use a single shared extension. The only diversity signal is
+        the `sections` tuple — any rule that doesn't read `sections`
+        cannot satisfy this test.
+        """
         from fda.organize.classifier import _sample_for_taxonomy
         from fda.organize.models import CatalogEntry
 
         def _e(idx, shape):
             return CatalogEntry(
                 path_id=f"f{idx:03d}",
-                path=f"/tmp/{shape[0] if shape else 'none'}/{idx}.txt",
+                # Flat directory; same extension. Top-level-dir sampling
+                # sees one bucket; extension sampling sees one bucket.
+                path=f"/tmp/flat/file_{idx:03d}.txt",
                 ext=".txt",
-                size_bytes=10,
+                size_bytes=10,  # uniform size; "largest" rule sees no signal
                 summary="similar summary",
                 type_label="text",
                 is_junk=False,
@@ -1213,16 +1223,16 @@ class TestSamplingShapeBudget:
             ("From", "To", "Subject"),
             ("Sheet:Q3", "Date", "Revenue"),
         ]
-        # 150 entries of shape[0], 10 each of the other 5.
+        # 150 entries of shape[0], 10 each of the other 5 — total 200.
         entries = [_e(i, shapes[0]) for i in range(150)]
         for s_idx, shape in enumerate(shapes[1:], start=1):
             entries += [_e(150 + s_idx * 10 + i, shape) for i in range(10)]
 
         sample = _sample_for_taxonomy(entries, "/tmp")
         sample_shapes = {e.sections for e in sample}
-        # All 6 distinct shapes must appear — without the shape-budget
-        # rule, the deterministic stratified sample would over-represent
-        # the dominant shape and miss at least one rare one.
+        # All 6 distinct shapes must appear. With every entry in the same
+        # directory and same extension, only a rule that reads `sections`
+        # can produce this result — the shape-budget rule.
         assert len(sample_shapes) == 6
 ```
 
@@ -1266,12 +1276,18 @@ def _entry_dict(e: CatalogEntry) -> dict[str, Any]:
 
 - [ ] **Step 5: Insert the shape-budget step into `_sample_for_taxonomy`.**
 
-Find `_sample_for_taxonomy` (around lines 113-194). After step 5 ("Up to 5 largest files") and **before** step 6 ("Fill remainder by evenly-spaced indexes"), insert a new step:
+Find `_sample_for_taxonomy` (around lines 113-194). The new step lands **between** step 2 (top-level dir, ~lines 141-156) and step 3 (leaf dir, ~lines 158-165). This placement matters: step 3 (leaf-dir) consumes up to 70 of the 100 target slots and could starve rare shapes if shape-budget ran later. Inserting before step 3 upholds the spec's "guarantees Stage A sees at least one exemplar of each structural shape" language.
 
 ```python
-    # 5b) Up to TAXONOMY_SAMPLE_SHAPE_BUDGET entries chosen by distinct
+    # 2b) Up to TAXONOMY_SAMPLE_SHAPE_BUDGET entries chosen by distinct
     # sections-shape signature. Guarantees rare structural types reach
     # Stage A even when they're a small fraction of the catalog.
+    #
+    # De-dup intent: if the first iter-entry of shape S was already
+    # chosen by step 1 or 2 (extension/top-level-dir), `_add(e)` returns
+    # False but we still mark the shape "seen" — shape S is represented
+    # in `chosen` regardless of which rule put it there, so subsequent
+    # shape-S entries skip via `seen_shapes`.
     seen_shapes: set[tuple[str, ...]] = set()
     shape_added = 0
     for e in entries:
@@ -1287,7 +1303,7 @@ Find `_sample_for_taxonomy` (around lines 113-194). After step 5 ("Up to 5 large
             shape_added += 1
 ```
 
-This is purely additive: it reserves at most 10 of the 100 target slots for distinct shapes, and de-duplicates against everything already chosen via the existing `_add` helper.
+This is purely additive: it reserves at most 10 of the 100 target slots for distinct shapes, and de-duplicates against everything already chosen via the existing `_add` helper. Existing tests that don't exercise shape diversity continue to pass because the rule never removes any entry — it only reserves slots that the leaf-dir / largest / fill rules would otherwise consume.
 
 - [ ] **Step 6: Run the new tests to verify they pass.**
 
@@ -1344,9 +1360,41 @@ cat fda/organize/skills/taxonomy-proposer/SKILL.md
 
 Note where the existing `verbatim_head` / filename guidance lives so the new bullets land alongside.
 
-- [ ] **Step 2: Append the two new prompt rules.**
+- [ ] **Step 2: Update the input-schema block to list `sections`.**
 
-Open `fda/organize/skills/taxonomy-proposer/SKILL.md`. After the existing signal-priority bullets (the section that already mentions `verbatim_head` and basenames), add the following two bullets verbatim. Keep them near the top of the prompt — Stage A is short.
+Open `fda/organize/skills/taxonomy-proposer/SKILL.md`. Find the existing field list:
+
+```markdown
+- CATALOG (JSON): a list of entries. Each entry has fields
+  `path_id`, `path`, `ext`, `size_bytes`, `summary`, `type_label`,
+  `extract_status`, `verbatim_head`.
+  - `summary` is Reader's prose description (truncated to 200 characters).
+  - `verbatim_head` is the raw first ~300 chars of the file's extracted
+    text, with leading whitespace stripped. It is NOT a summary — it's
+    actual file content. Empty string if extraction failed.
+  - The last component of `path` is the filename.
+```
+
+Replace with:
+
+```markdown
+- CATALOG (JSON): a list of entries. Each entry has fields
+  `path_id`, `path`, `ext`, `size_bytes`, `summary`, `type_label`,
+  `extract_status`, `verbatim_head`, `sections`.
+  - `summary` is Reader's prose description (truncated to 200 characters).
+  - `verbatim_head` is the raw first ~300 chars of the file's extracted
+    text, with leading whitespace stripped. It is NOT a summary — it's
+    actual file content. Empty string if extraction failed.
+  - `sections` is a deterministic list of section/field labels extracted
+    from the document by a pure-Python regex pass (not by an LLM). Empty
+    list when extraction failed or the document carries no labeled
+    sections.
+  - The last component of `path` is the filename.
+```
+
+- [ ] **Step 3: Append the two new behavioral rules.**
+
+In the same file, after the existing signal-priority bullets (the section that already mentions `verbatim_head` and basenames), add the following two bullets verbatim. Keep them near the top of the prompt — Stage A is short.
 
 ```markdown
 - **Structural fingerprint as signal.** Each entry has `sections` — a
@@ -1376,7 +1424,7 @@ Open `fda/organize/skills/taxonomy-proposer/SKILL.md`. After the existing signal
 The exact wording above is also reproduced in the spec at
 `docs/superpowers/specs/2026-05-07-classifier-structural-sections-design.md` §5; copy it from there if any whitespace gets mangled.
 
-- [ ] **Step 3: Run the constraints test to confirm the prompt still passes invariants.**
+- [ ] **Step 4: Run the constraints test to confirm the prompt still passes invariants.**
 
 ```bash
 python3 -m pytest tests/test_organize_constraints.py -v
@@ -1384,7 +1432,7 @@ python3 -m pytest tests/test_organize_constraints.py -v
 
 Expected: PASS. The proposer constraint (`Do NOT emit any path_id references` or `DO NOT emit`) is unchanged; the new bullets don't affect it.
 
-- [ ] **Step 4: Run the full suite.**
+- [ ] **Step 5: Run the full suite.**
 
 ```bash
 python3 -m pytest tests/ -x -q --tb=short
@@ -1392,13 +1440,12 @@ python3 -m pytest tests/ -x -q --tb=short
 
 Expected: all tests pass. Existing classifier tests use stub backends that ignore the prompt body, so the prompt change can't break them.
 
-- [ ] **Step 5: Commit.**
+- [ ] **Step 6: Commit.**
 
 ```bash
 git add fda/organize/skills/taxonomy-proposer/SKILL.md
 git commit -m "$(cat <<'EOF'
-organize(prompts): teach taxonomy-proposer to use sections + encode
-structural criteria
+organize(prompts): teach proposer to use sections + structural criteria
 
 Stage A now treats sections-list divergence as a category-splitting
 signal (e.g., simple "Products"-only docs vs detailed shipping docs
@@ -1434,7 +1481,38 @@ cat fda/organize/skills/taxonomy-assigner/SKILL.md
 
 Existing steps are around lines 26-46.
 
-- [ ] **Step 2: Replace the priority-hierarchy block with the new 6-step version.**
+- [ ] **Step 2: Update the input-schema block to list `sections`.**
+
+In `fda/organize/skills/taxonomy-assigner/SKILL.md`, find the existing field list:
+
+```markdown
+- BATCH (JSON): a list of file entries. Each has `path_id`, `path`, `ext`,
+  `size_bytes`, `summary`, `type_label`, `extract_status`, `verbatim_head`.
+  - `path` is the full file path; the last component is the filename.
+  - `summary` is Reader's prose, truncated to 200 chars; may be imprecise
+    about document type.
+  - `verbatim_head` is the raw first ~300 chars of extracted text, leading
+    whitespace stripped. Empty string if extraction failed.
+```
+
+Replace with:
+
+```markdown
+- BATCH (JSON): a list of file entries. Each has `path_id`, `path`, `ext`,
+  `size_bytes`, `summary`, `type_label`, `extract_status`, `verbatim_head`,
+  `sections`.
+  - `path` is the full file path; the last component is the filename.
+  - `summary` is Reader's prose, truncated to 200 chars; may be imprecise
+    about document type.
+  - `verbatim_head` is the raw first ~300 chars of extracted text, leading
+    whitespace stripped. Empty string if extraction failed.
+  - `sections` is a deterministic list of section/field labels extracted
+    from the document by a pure-Python regex pass (not by an LLM). Empty
+    list when extraction failed or the document carries no labeled
+    sections.
+```
+
+- [ ] **Step 3: Replace the priority-hierarchy block with the new 6-step version.**
 
 In `fda/organize/skills/taxonomy-assigner/SKILL.md`, find the section starting `Signal priority for assignment (read this carefully):` and replace its numbered list (current steps 1-4) with this exact text:
 
@@ -1495,7 +1573,7 @@ to the filename-suggested category. Real-world example:
 the user's filename intent overrides the structural drift.
 ```
 
-- [ ] **Step 3: Verify the assigner prompt still mentions `path_id` and `EXACTLY ONCE` (constraint test).**
+- [ ] **Step 4: Verify the assigner prompt still mentions `path_id` and `EXACTLY ONCE` (constraint test).**
 
 ```bash
 python3 -m pytest tests/test_organize_constraints.py::TestSkillContents -v
@@ -1503,7 +1581,7 @@ python3 -m pytest tests/test_organize_constraints.py::TestSkillContents -v
 
 Expected: PASS. The new content doesn't remove any of the existing constraint markers.
 
-- [ ] **Step 4: Run the full suite.**
+- [ ] **Step 5: Run the full suite.**
 
 ```bash
 python3 -m pytest tests/ -x -q --tb=short
@@ -1511,7 +1589,7 @@ python3 -m pytest tests/ -x -q --tb=short
 
 Expected: all tests pass. Existing classifier tests use stub backends; the prompt-text change can't break them.
 
-- [ ] **Step 5: Commit.**
+- [ ] **Step 6: Commit.**
 
 ```bash
 git add fda/organize/skills/taxonomy-assigner/SKILL.md
@@ -1555,13 +1633,13 @@ These tests fail loudly if `sections` is dropped from the wire format or the pri
 
 - [ ] **Step 1: Verify the regex output for the pinned fixture text.**
 
-Before writing the assertion, run this verification snippet (copy-paste into a Python REPL or `python3 -c`):
+Before writing the assertion, run this verification using a quoted heredoc (single-quoted EOF prevents any shell interpolation, so `$1560.00` reaches Python verbatim):
 
 ```bash
-python3 -c "
+python3 <<'PY'
 from fda.organize._sections import extract_sections_from_text
 
-simple_po = '''Purchase Orders
+simple_po = """Purchase Orders
 
 Order ID: 10488
 Order Date: 2024-03-15
@@ -1569,9 +1647,10 @@ Order Date: 2024-03-15
 Products:
   - Widget A x 5
 
-Total: \$1560.00
-'''
-detailed = '''Order ID: 10488
+Total: $1560.00
+"""
+
+detailed = """Order ID: 10488
 
 Shipping Details:
   Frankenversand
@@ -1591,17 +1670,18 @@ Order Details:
 Products:
   - Widget A x 5
 
-Total: \$1560.00
-'''
-print('simple_po =>', extract_sections_from_text(simple_po))
-print('detailed =>', extract_sections_from_text(detailed))
-"
+Total: $1560.00
+"""
+
+print("simple_po =>", extract_sections_from_text(simple_po))
+print("detailed  =>", extract_sections_from_text(detailed))
+PY
 ```
 
 Expected:
 ```
 simple_po => ('Products',)
-detailed => ('Shipping Details', 'Customer Details', 'Employee', 'Shipper', 'Order Details', 'Products')
+detailed  => ('Shipping Details', 'Customer Details', 'Employee', 'Shipper', 'Order Details', 'Products')
 ```
 
 If the output differs, **stop and re-read the spec** before writing the test.
@@ -1684,14 +1764,24 @@ class TestStructuralSectionsRegressions:
         """Fake backend that follows the assigner prompt's documented
         priority order. Reads BATCH from the prompt JSON and decides
         category based on filename → sections → verbatim_head → summary.
+
+        The hash-detection regex anchors on the stem (with extension
+        suffix) to avoid false-positives from filenames that contain
+        embedded 16+ hex substrings by coincidence. This mirrors the
+        intent of the prompt's "long hex string" wording.
         """
         import json
         import re
 
-        HEX_RE = re.compile(r"[0-9a-f]{16,}", re.IGNORECASE)
+        # Anchored: full basename must be hex stem + extension.
+        HASH_BASENAME_RE = re.compile(
+            r"^[0-9a-f]{16,}\.[a-z0-9]+$", re.IGNORECASE,
+        )
 
         class StubBackend:
             def complete(self, *, system, messages, **kwargs):
+                # Use entry["sections"] (not .get) so the test fails
+                # loudly if Task 6's wire-format change is missing.
                 user = messages[0]["content"]
                 payload = json.loads(user)
                 taxonomy = payload["TAXONOMY"]
@@ -1702,10 +1792,10 @@ class TestStructuralSectionsRegressions:
                 for entry in payload["BATCH"]:
                     path = entry["path"]
                     basename = path.rsplit("/", 1)[-1]
-                    sections = entry.get("sections", [])
-                    extract_status = entry.get("extract_status", "ok")
-                    verbatim = entry.get("verbatim_head", "")
-                    summary = entry.get("summary", "")
+                    sections = entry["sections"]   # contract assertion
+                    extract_status = entry["extract_status"]
+                    verbatim = entry["verbatim_head"]
+                    summary = entry["summary"]
 
                     chosen = None
 
@@ -1715,8 +1805,9 @@ class TestStructuralSectionsRegressions:
                         chosen = "Sales-Invoices"
                     elif "purchase" in lower or lower.startswith("po"):
                         chosen = "Purchase-Orders"
-                    # Step 2: ignore filename if hash-like (no override).
-                    elif HEX_RE.search(basename):
+                    # Step 2: ignore filename if it's a pure hash stem
+                    # (anchored regex). Don't override; just don't decide.
+                    elif HASH_BASENAME_RE.match(basename):
                         pass
 
                     # Step 3: structural fingerprint vs criteria
@@ -1877,29 +1968,108 @@ class TestStructuralSectionsRegressions:
         assert assignments["f000"] == "Sales-Invoices"
 ```
 
-The `_DummySkill()` helper above is the same minimal skill stub the file already uses for backend-mocked tests. If it doesn't exist in this file yet, copy it from a sibling test (it's defined near the top of `TestPriorityRegressions`):
+The `_DummySkill` helper is needed for `_run_stage_b`. It does **not** currently exist in `tests/test_organize_classifier.py` — the existing `TestPriorityRegressions` class uses different mocking. Add the stub once at module scope (top of the test file, near other helpers) before defining `TestStructuralSectionsRegressions`:
 
 ```python
 class _DummySkill:
+    """Minimal SkillConfig stub. _run_stage_b only reads `body` and
+    `model` from this object."""
     body = "skill body"
     model = "claude-sonnet-4-6"
 ```
 
-Add it once at module scope if not already present.
+- [ ] **Step 3: Add a Stage A diversity test using a fake proposer backend.**
 
-- [ ] **Step 3: Run the new tests to verify they fail (initially).**
+This closes the chunk-4 coverage gap (the table promises Stage A diversity coverage but the tests above only exercise Stage B). The test uses a fake backend that inspects the catalog payload's `sections` field and returns a taxonomy with one category per distinct shape.
+
+Append to the same `TestStructuralSectionsRegressions` class:
+
+```python
+    def test_stage_a_proposes_distinct_categories_when_shapes_diverge(
+        self, logger,
+    ):
+        """End-to-end Stage A: a sample with two distinct sections-shapes
+        but topic-similar summaries flows through _propose_taxonomy with
+        a fake backend that reads the `sections` field; the resulting
+        taxonomy contains a category per shape, not a single merged one.
+        """
+        import json
+        from fda.organize.classifier import _propose_taxonomy
+
+        sample = [
+            self._entry(
+                path_id=f"f{i:03d}",
+                path=f"/tmp/flat/file_{i:03d}.txt",
+                sections=("Products",),
+                summary="order document",
+            )
+            for i in range(3)
+        ] + [
+            self._entry(
+                path_id=f"f{i:03d}",
+                path=f"/tmp/flat/file_{i:03d}.txt",
+                sections=(
+                    "Shipping Details", "Customer Details",
+                    "Employee", "Shipper", "Order Details", "Products",
+                ),
+                summary="order document",
+            )
+            for i in range(3, 6)
+        ]
+
+        class ProposerBackend:
+            def complete(self, *, system, messages, **kwargs):
+                user = messages[0]["content"]
+                payload = json.loads(user)
+                # Read `sections` directly — fails loudly if Task 6
+                # didn't put it in the proposer payload.
+                shapes = {
+                    tuple(e["sections"]) for e in payload["CATALOG"]
+                }
+                cats = []
+                for i, shape in enumerate(sorted(shapes)):
+                    cats.append({
+                        "category_name": f"Cat-{i}",
+                        "subpath": f"Cat-{i}",
+                        "description": "auto-generated",
+                        "criteria": "Documents with " + ", ".join(shape) + " sections.",
+                    })
+                return json.dumps({
+                    "categories": cats,
+                    "fallback_category": {
+                        "category_name": "Misc",
+                        "subpath": "Misc",
+                        "description": "catch-all",
+                        "criteria": "When no other category fits.",
+                    },
+                })
+
+        taxonomy = _propose_taxonomy(
+            sample, "instructions",
+            backend=ProposerBackend(),
+            logger=logger,
+            skill=_DummySkill(),
+        )
+        assert len(taxonomy.categories) >= 2, (
+            f"expected ≥2 categories from 2 distinct shapes; got "
+            f"{[c.category_name for c in taxonomy.categories]}"
+        )
+```
+
+- [ ] **Step 4: Run the new tests.**
 
 ```bash
 python3 -m pytest tests/test_organize_classifier.py::TestStructuralSectionsRegressions -v
 ```
 
-Expected: depending on implementation order, several may already pass once Tasks 6-8 land. The structural-conflict test in particular should pass cleanly with the wire format from Task 6 plus the prompts from Tasks 7-8 — the fake backend mimics the prompt's behavior in code.
+These are regression-locking tests, not red-green TDD. Tasks 6-8 already wired the data and prompts; the assertions here verify that contract holds. Expected: PASS for all four tests on the first run.
 
-If any test fails, the failure mode tells you what's wrong:
-- `f000` routed to `Misc` → `_entry_dict` isn't carrying `sections` (Task 6 incomplete).
-- Both files routed to the same category → fake backend logic above is misordered, or the criteria don't contain the discriminating section names.
+If any test fails, the failure mode tells you what regressed:
+- Structural-conflict `f000` routed to `Misc` → Task 6's `_entry_dict` isn't carrying `sections`.
+- Both files routed to the same category → fake backend's substring-overlap rule didn't find a winning category. Check that the taxonomy `criteria` actually mention the discriminating section names.
+- Stage A diversity test sees 1 category → `_propose_taxonomy` payload doesn't contain `sections` per entry, OR the fake backend assertion `e["sections"]` raised KeyError. Both failure modes point to incomplete Task 6 wiring.
 
-- [ ] **Step 4: Run the full suite.**
+- [ ] **Step 5: Run the full suite.**
 
 ```bash
 python3 -m pytest tests/ -x -q --tb=short
@@ -1907,25 +2077,30 @@ python3 -m pytest tests/ -x -q --tb=short
 
 Expected: all tests pass.
 
-- [ ] **Step 5: Commit.**
+- [ ] **Step 6: Commit.**
 
 ```bash
 git add tests/test_organize_classifier.py
 git commit -m "$(cat <<'EOF'
 organize(classifier): regression tests for structural-sections priority
 
-Three pinned regression cases for Stage B:
-- Structural-conflict: two hash-named, topic-similar files distinguished
-  ONLY by sections-shape route to different categories.
-- Empty-sections fallback: extract_status="ok"+empty and "failed"+empty
-  both fall through to summary-only without tripping step 3 logic.
-- Filename-vs-sections: informative filename overrides structural
-  overlap (filename keeps highest priority).
+Four pinned regression cases:
+- Stage B structural-conflict: two hash-named, topic-similar files
+  distinguished ONLY by sections-shape route to different categories.
+- Stage B empty-sections fallback: extract_status="ok"+empty and
+  "failed"+empty both fall through to summary-only without tripping
+  step 3 logic.
+- Stage B filename-vs-sections: informative filename overrides
+  structural overlap (filename keeps highest priority).
+- Stage A diversity: a sample with two distinct sections-shapes flows
+  through _propose_taxonomy and produces ≥2 categories — fake backend
+  reads the `sections` field from the payload, asserting the contract
+  fails loudly if the wire format ever drops it.
 
-The pinned fixture text matches single-pass extract_sections_from_text
-output verified manually before writing the assertion. If the wire
-format ever drops sections or the priority hierarchy misorders the
-steps, the structural-conflict test fails loudly.
+The pinned Stage B fixture text matches single-pass
+extract_sections_from_text output verified manually before writing the
+assertion. The fake backend uses anchored hex-basename matching to
+avoid false-positives on embedded hex substrings.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 EOF
@@ -2002,13 +2177,22 @@ EOF
 
 This task is not test-driven; it measures real Sonnet behavior against the test fixture. Run after Chunk 4 lands.
 
-- [ ] **Step 1: Generate a fresh fixture copy** (the existing one may have been mutated by previous runs).
+> **Prerequisite:** at the time of writing this plan, `scripts/` is untracked in git (see `git status` — the directory holds `diag_organize.py` and the fixture-randomization script but neither is committed). Before running this task, **either**:
+>
+> 1. Confirm the user has committed those scripts, **or**
+> 2. Verify the scripts exist on disk via `ls -la scripts/` and proceed using the local copies, **or**
+> 3. Use the Obsidian runbook `00_Me/02_Side_Hustle/Lion_Chemtech/FDA/FDA Test Fixture Randomization Runbook.md` to generate a fixture by hand.
+>
+> If none of those work, stop and ask the user how to proceed. **Do not synthesize a fresh fixture script** as part of this task.
 
-```bash
-python3 scripts/generate_random_company_documents.py 2>&1 | head -20
-```
+- [ ] **Step 1: Generate a fresh fixture copy.**
 
-Or however the project's existing fixture-generation script is invoked — see `[[FDA Test Fixture Randomization Runbook]]` in the user's Obsidian vault, or `tests/` for the canonical command. Output a fresh path under `/tmp/fda-test-sets/`.
+The existing fixture under `/tmp/fda-test-sets/randomized-company-documents-2026-05-05-003` may have been mutated by previous organize runs. Generate a new one. The exact command depends on the prerequisite above:
+
+- If `scripts/randomize_company_documents.py` (or similar) is present, invoke it with the source folder path documented in the Obsidian runbook (typically `/Users/hogyeongkim/Desktop/Projects/doc_agent_test_data/02_company_documents`) and an output path under `/tmp/fda-test-sets/`.
+- If using the Obsidian runbook's manual recipe: follow the documented `cp -r` + rename + `manifest.csv` write-out steps.
+
+Verify the output: `ls /tmp/fda-test-sets/<fresh-fixture-name>/ | wc -l` should show ~10 folders + 1 manifest, and `cat /tmp/fda-test-sets/<fresh-fixture-name>/manifest.csv | wc -l` should show ~101 rows.
 
 - [ ] **Step 2: Run organize with the new fixture, applying the plan.**
 
@@ -2017,6 +2201,8 @@ python3 scripts/diag_organize.py /tmp/fda-test-sets/<fresh-fixture-name> --apply
 ```
 
 The detailed log path will appear in the output (`📝 logging to ~/.fda/logs/organize/...`).
+
+If `scripts/diag_organize.py` is missing, stop and ask the user — do not synthesize an equivalent. The script is a standing diagnostic harness; the project owner controls its shape.
 
 - [ ] **Step 3: Cross-reference against `manifest.csv`.**
 
