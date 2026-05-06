@@ -892,7 +892,7 @@ IMPORTANT RULES:
         return name_or_path
 
     # ------------------------------------------------------------------
-    # File organization — three-phase pipeline (planner+executor+verifier)
+    # File organization — reader+classifier+plan_builder+executor+verifier
     # ------------------------------------------------------------------
 
     def organize_files(
@@ -901,9 +901,10 @@ IMPORTANT RULES:
         instructions: str = "",
         progress_callback: Optional[Callable[[str], None]] = None,
     ) -> dict[str, Any]:
-        """Organize files in `target_path` via the planner+executor+verifier
-        pipeline. Returns the back-compat dict shape used by Telegram, the
-        web UI, and the orchestrator."""
+        """Organize files in `target_path` via the
+        reader+classifier+plan_builder+executor+verifier pipeline. Returns
+        the back-compat dict shape used by Telegram, the web UI, and the
+        orchestrator."""
         from fda.organize import organize as _organize
         from fda.organize.models import PlanResult
 

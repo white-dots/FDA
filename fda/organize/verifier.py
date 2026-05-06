@@ -33,7 +33,7 @@ def verify_plan(
         outcomes=outcomes,
         leftover_empty_dirs=tuple(leftover_empty_dirs),
         discrepancies=tuple(discrepancies),
-        repos_skipped=(),  # populated when planner can report this; left empty for Phase A
+        repos_skipped=(),  # re-stamped by organize() with catalog.git_repos_skipped
         summary=summary,
     )
 

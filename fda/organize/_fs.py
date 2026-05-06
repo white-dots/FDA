@@ -142,8 +142,8 @@ def validate_operation(op: Operation, target: Path) -> None:
 
 def validate_plan_shape(operations: list[Operation]) -> None:
     """Plan-level shape check: a plan that only creates directories does
-    nothing useful — reject it so the planner is forced to include the
-    moves (or junk deletes) that actually organize the directory.
+    nothing useful — reject it so a plan must include at least one move
+    (or junk delete) that actually organizes the directory.
 
     Empty list is NOT this helper's concern; the caller handles that
     separately so it can return its own message.
