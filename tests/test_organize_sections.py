@@ -134,15 +134,15 @@ class TestExtractSectionsFromText:
         # Long label is rejected by the SECTION_HEADER_MAX_CHARS guard.
         assert extract_sections_from_text(text) == ("Short Header",)
 
-    def test_scan_bytes_cap_bounds_work(self):
+    def test_scan_chars_cap_bounds_work(self):
         from fda.organize._sections import (
-            SECTION_SCAN_BYTES,
+            SECTION_SCAN_CHARS,
             extract_sections_from_text,
         )
 
         # Header inside the scan window, decoy header past the cap.
         head = "Real Header:\n" + ("x\n" * 10)
-        padding = "y\n" * (SECTION_SCAN_BYTES + 1024)
+        padding = "y\n" * (SECTION_SCAN_CHARS + 1024)
         decoy = "Decoy Header:\n"
         result = extract_sections_from_text(head + padding + decoy)
         assert "Real Header" in result

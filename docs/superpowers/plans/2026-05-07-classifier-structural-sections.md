@@ -429,15 +429,15 @@ class TestExtractSectionsFromText:
         # Long label is rejected by the SECTION_HEADER_MAX_CHARS guard.
         assert extract_sections_from_text(text) == ("Short Header",)
 
-    def test_scan_bytes_cap_bounds_work(self):
+    def test_scan_chars_cap_bounds_work(self):
         from fda.organize._sections import (
-            SECTION_SCAN_BYTES,
+            SECTION_SCAN_CHARS,
             extract_sections_from_text,
         )
 
         # Header inside the scan window, decoy header past the cap.
         head = "Real Header:\n" + ("x\n" * 10)
-        padding = "y\n" * (SECTION_SCAN_BYTES + 1024)
+        padding = "y\n" * (SECTION_SCAN_CHARS + 1024)
         decoy = "Decoy Header:\n"
         result = extract_sections_from_text(head + padding + decoy)
         assert "Real Header" in result
@@ -472,7 +472,7 @@ import re
 MAX_SECTIONS_PER_FILE = 15
 SECTION_HEADER_MIN_CHARS = 3
 SECTION_HEADER_MAX_CHARS = 40
-SECTION_SCAN_BYTES = 16 * 1024   # only scan first ~16 KB; structure tops most docs
+SECTION_SCAN_CHARS = 16 * 1024   # only scan first ~16 K characters; structure tops most docs
 
 # Pattern A: line that is *just* a section header followed by a colon.
 #   "Shipping Details:" / "Bill To:" / "Order Details:"
@@ -499,7 +499,7 @@ def extract_sections_from_text(text: str) -> tuple[str, ...]:
     """
     if not text:
         return ()
-    head = text[:SECTION_SCAN_BYTES]
+    head = text[:SECTION_SCAN_CHARS]
     seen: dict[str, None] = {}   # ordered set
     for line in head.splitlines():
         for rx in (_HEADER_LINE_RE, _ALLCAPS_LINE_RE):
@@ -547,7 +547,7 @@ organize(sections): add deterministic regex-based section extractor
 
 New module fda/organize/_sections.py exports extract_sections_from_text
 plus four constants (MAX_SECTIONS_PER_FILE, SECTION_HEADER_MIN_CHARS,
-SECTION_HEADER_MAX_CHARS, SECTION_SCAN_BYTES). Single-pass line walk
+SECTION_HEADER_MAX_CHARS, SECTION_SCAN_CHARS). Single-pass line walk
 preserves source order across both patterns (colon-only-on-line headers
 and short ALL-CAPS dividers), with normalization to stable title-cased
 keys. The module is the single home for the structural-extraction
@@ -2125,7 +2125,7 @@ Insert after the existing `READER_*` and `VERBATIM_HEAD_CHARS` entries (so all r
 ```python
         "MAX_SECTIONS_PER_FILE": ("_sections.py", "15"),
         "SECTION_HEADER_MAX_CHARS": ("_sections.py", "40"),
-        "SECTION_SCAN_BYTES": ("_sections.py", "16 * 1024"),
+        "SECTION_SCAN_CHARS": ("_sections.py", "16 * 1024"),
         "TAXONOMY_SAMPLE_SHAPE_BUDGET": ("classifier.py", "10"),
 ```
 
@@ -2156,7 +2156,7 @@ organize(constraints): register new sections constants in CONSTS check
 
 Extends the named-constant-defined check to cover the three
 _sections.py constants (MAX_SECTIONS_PER_FILE, SECTION_HEADER_MAX_CHARS,
-SECTION_SCAN_BYTES) and the new classifier sampling budget
+SECTION_SCAN_CHARS) and the new classifier sampling budget
 (TAXONOMY_SAMPLE_SHAPE_BUDGET). SECTION_HEADER_MIN_CHARS=3 is
 intentionally excluded — its literal value is too generic for a
 uniqueness check, mirroring the exception already in place for

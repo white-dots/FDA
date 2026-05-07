@@ -13,7 +13,7 @@ import re
 MAX_SECTIONS_PER_FILE = 15
 SECTION_HEADER_MIN_CHARS = 3
 SECTION_HEADER_MAX_CHARS = 40
-SECTION_SCAN_BYTES = 16 * 1024   # only scan first ~16 KB; structure tops most docs
+SECTION_SCAN_CHARS = 16 * 1024   # only scan first ~16 K characters; structure tops most docs
 
 # Pattern A: line that is *just* a section header followed by a colon.
 #   "Shipping Details:" / "Bill To:" / "Order Details:"
@@ -40,7 +40,7 @@ def extract_sections_from_text(text: str) -> tuple[str, ...]:
     """
     if not text:
         return ()
-    head = text[:SECTION_SCAN_BYTES]
+    head = text[:SECTION_SCAN_CHARS]
     seen: dict[str, None] = {}   # ordered set
     for line in head.splitlines():
         for rx in (_HEADER_LINE_RE, _ALLCAPS_LINE_RE):
