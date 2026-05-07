@@ -31,6 +31,14 @@ TextExtractor = Callable[[Path], ExtractionResult]
 _PDF_PIPE_CAP_BYTES = 64 * 1024
 _PDF_TIMEOUT_SECONDS = 10
 
+# xlsx serialization caps (memory-bound the in-process row/col walk; do NOT cap
+# `text` — Reader owns the 64 KiB contract cap via READER_TEXT_CAP_BYTES).
+_XLSX_TEXT_ROWS_PER_SHEET = 20
+_XLSX_TEXT_COLS_PER_ROW = 32
+# Synthesized-label thresholds.
+_XLSX_FORMULA_DENSITY_THRESHOLD = 0.05
+_XLSX_MERGED_CELLS_MIN = 3
+
 
 def _which(name: str) -> str | None:
     return shutil.which(name)
