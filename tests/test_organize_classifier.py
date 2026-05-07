@@ -1089,10 +1089,21 @@ class TestSamplingShapeBudget:
             ("From", "To", "Subject"),
             ("Sheet:Q3", "Date", "Revenue"),
         ]
-        # 150 entries of shape[0], 10 each of the other 5 — total 200.
-        entries = [_e(i, shapes[0]) for i in range(150)]
+        # 191 entries of shape[0] + exactly 1 each of the other 5
+        # rare shapes (total 196). The single-rare-entry layout makes
+        # step 2b load-bearing: after steps 1-5 fill chosen with 5
+        # shape-0 entries (f000-f004), step 6's evenly-spaced fill
+        # (stride=2 over 191 remaining) iterates indices [0,2,4,...,190],
+        # which lands on remaining[186/188/190] = f191/f193/f195
+        # (shapes 1/3/5) but skips remaining[187/189] = f192/f194
+        # (shapes 2/4). With 96 iterations of stride-2, we need 96 entries,
+        # leaving room to hit all three even-indexed rare shapes.
+        # Only step 2b's per-shape budget can guarantee all 6 shapes
+        # appear in the sample. Delete step 2b in classifier.py and
+        # this test fails (4 shapes in sample, not 6).
+        entries = [_e(i, shapes[0]) for i in range(191)]
         for s_idx, shape in enumerate(shapes[1:], start=1):
-            entries += [_e(150 + s_idx * 10 + i, shape) for i in range(10)]
+            entries.append(_e(190 + s_idx, shape))
 
         sample = _sample_for_taxonomy(entries, "/tmp")
         sample_shapes = {e.sections for e in sample}
