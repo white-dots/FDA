@@ -70,6 +70,7 @@ class ExtractionResult:
     text: str | None
     status: ExtractStatus
     note: str = ""
+    sections: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

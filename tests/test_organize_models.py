@@ -241,3 +241,21 @@ class TestCatalogEntryVerbatimHead:
             verbatim_head="Order ID: 10488\n\nShipping Details:",
         )
         assert e.verbatim_head == "Order ID: 10488\n\nShipping Details:"
+
+
+class TestExtractionResultSections:
+    def test_default_is_empty_tuple(self):
+        from fda.organize.models import ExtractionResult
+
+        r = ExtractionResult(text=None, status="ok")
+        assert r.sections == ()
+
+    def test_accepts_explicit_value(self):
+        from fda.organize.models import ExtractionResult
+
+        r = ExtractionResult(
+            text="ignored",
+            status="ok",
+            sections=("Shipping Details", "Customer Details"),
+        )
+        assert r.sections == ("Shipping Details", "Customer Details")
