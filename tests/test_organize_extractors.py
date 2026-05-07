@@ -305,3 +305,142 @@ class TestDocxHappyPath:
         r = _extractors.extract(f)
         assert r.status == "ok"
         assert r.sections == ("My Document",)
+
+
+class TestDocxEdgeCases:
+    def test_two_char_heading_filtered_out(self, tmp_path):
+        from fda.organize import _extractors
+
+        f = tmp_path / "short.docx"
+        _build_docx(f, paragraphs=[
+            ("Hi", "Heading 1"),     # 2 chars, below MIN
+            ("Findings", "Heading 1"),
+        ])
+        r = _extractors.extract(f)
+        assert r.sections == ("Findings",)
+
+    def test_whitespace_only_heading_filtered_out(self, tmp_path):
+        """Spec line 144: 'Whitespace-only / 2-char heading text → filtered out'.
+        Pin the whitespace-only branch separately so a regression that drops
+        the `" ".join(body.split())` normalization still gets caught."""
+        from fda.organize import _extractors
+
+        f = tmp_path / "ws.docx"
+        _build_docx(f, paragraphs=[
+            ("   \t  ", "Heading 1"),  # whitespace only -> normalizes to ""
+            ("Findings", "Heading 1"),
+        ])
+        r = _extractors.extract(f)
+        assert r.sections == ("Findings",)
+
+    def test_max_chars_applied_after_whitespace_normalization(self, tmp_path):
+        """The length guard runs AFTER `" ".join(body.split())`. A heading
+        whose raw length exceeds MAX_CHARS but normalizes within bounds must
+        be kept; this pins the order of operations."""
+        from fda.organize import _extractors
+
+        # Raw length 50, normalized "Quarterly Findings" = 18 chars (well within MAX=40).
+        raw = "Quarterly" + (" " * 30) + "Findings"
+        assert len(raw) > 40 and len(" ".join(raw.split())) <= 40
+        f = tmp_path / "norm.docx"
+        _build_docx(f, paragraphs=[
+            (raw, "Heading 1"),
+        ])
+        r = _extractors.extract(f)
+        assert r.sections == ("Quarterly Findings",)
+
+    def test_41_char_heading_filtered_out(self, tmp_path):
+        from fda.organize import _extractors
+
+        f = tmp_path / "long.docx"
+        long_label = "A" + ("b" * 40)  # 41 chars
+        _build_docx(f, paragraphs=[
+            (long_label, "Heading 1"),
+            ("Findings", "Heading 1"),
+        ])
+        r = _extractors.extract(f)
+        assert r.sections == ("Findings",)
+
+    def test_duplicate_headings_deduped_in_first_occurrence_order(self, tmp_path):
+        from fda.organize import _extractors
+
+        f = tmp_path / "dup.docx"
+        _build_docx(f, paragraphs=[
+            ("Findings", "Heading 1"),
+            ("Methods", "Heading 1"),
+            ("Findings", "Heading 1"),  # repeat — dropped
+        ])
+        r = _extractors.extract(f)
+        assert r.sections == ("Findings", "Methods")
+
+    def test_capped_at_max_sections_per_file(self, tmp_path):
+        from fda.organize import _extractors
+        from fda.organize._sections import MAX_SECTIONS_PER_FILE
+
+        f = tmp_path / "many.docx"
+        # 20 unique headings; expect only the first MAX_SECTIONS_PER_FILE retained.
+        paras = [(f"Section {i:02d}", "Heading 1") for i in range(20)]
+        _build_docx(f, paragraphs=paras)
+        r = _extractors.extract(f)
+        assert len(r.sections) == MAX_SECTIONS_PER_FILE
+        assert r.sections[0] == "Section 00"
+        assert r.sections[-1] == f"Section {MAX_SECTIONS_PER_FILE - 1:02d}"
+
+    def test_no_headings_yields_empty_sections(self, tmp_path):
+        from fda.organize import _extractors
+
+        f = tmp_path / "plain.docx"
+        _build_docx(f, paragraphs=[
+            ("just body text, no headings", None),
+            ("more body", None),
+        ])
+        r = _extractors.extract(f)
+        assert r.status == "ok"
+        assert r.sections == ()
+        assert "just body text" in r.text
+
+    def test_empty_doc_yields_empty_text_and_sections(self, tmp_path):
+        from fda.organize import _extractors
+
+        f = tmp_path / "empty.docx"
+        _build_docx(f)  # no paragraphs, no tables
+        r = _extractors.extract(f)
+        assert r.status == "ok"
+        # python-docx always inserts an empty default paragraph whose `.text`
+        # is "". The implementation does `if body: text_parts.append(body)`,
+        # so the empty body is dropped and `"\n".join([])` yields "".
+        assert r.text == ""
+        assert r.sections == ()
+
+    def test_table_cell_text_included_in_text(self, tmp_path):
+        from fda.organize import _extractors
+
+        f = tmp_path / "tables.docx"
+        _build_docx(
+            f,
+            paragraphs=[],
+            table_cells=[
+                ["Invoice No", "Amount"],
+                ["INV-001", "$1,234"],
+            ],
+        )
+        r = _extractors.extract(f)
+        assert r.status == "ok"
+        # No heading-styled paragraphs anywhere in the doc.
+        assert r.sections == ()
+        # Table cell text was harvested into `text`.
+        assert "Invoice No" in r.text
+        assert "INV-001" in r.text
+        assert "$1,234" in r.text
+
+    def test_corrupt_bytes_returns_failed(self, tmp_path):
+        from fda.organize import _extractors
+
+        f = tmp_path / "bad.docx"
+        # python-docx requires a valid .docx ZIP package; raw bytes raise
+        # PackageNotFoundError, caught by extract()'s outer try/except.
+        f.write_bytes(b"this is not a docx file")
+        r = _extractors.extract(f)
+        assert r.status == "failed"
+        assert r.text is None
+        assert r.sections == ()
