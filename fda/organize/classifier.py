@@ -43,6 +43,7 @@ logger = logging.getLogger(__name__)
 TAXONOMY_SAMPLE_FULL_THRESHOLD = 150
 TAXONOMY_SAMPLE_TARGET_SIZE = 100
 TAXONOMY_SAMPLE_FALLBACK_BUDGET = 100
+TAXONOMY_SAMPLE_SHAPE_BUDGET = 10
 ASSIGNER_BATCH_TARGET_TOKENS = 45_000
 MAX_ASSIGNER_INPUT_TOKENS = 50_000
 MAX_CLASSIFIER_CONCURRENCY = 4
@@ -98,6 +99,7 @@ def _entry_dict(e: CatalogEntry) -> dict[str, Any]:
         "type_label": e.type_label,
         "extract_status": e.extract_status,
         "verbatim_head": e.verbatim_head,
+        "sections": e.sections,
     }
 
 
@@ -154,6 +156,29 @@ def _sample_for_taxonomy(
             break
         for e in group[:2]:
             _add(e)
+
+    # 2b) Up to TAXONOMY_SAMPLE_SHAPE_BUDGET entries chosen by distinct
+    # sections-shape signature. Guarantees rare structural types reach
+    # Stage A even when they're a small fraction of the catalog.
+    #
+    # De-dup intent: if the first iter-entry of shape S was already
+    # chosen by step 1 or 2 (extension/top-level-dir), `_add(e)` returns
+    # False but we still mark the shape "seen" — shape S is represented
+    # in `chosen` regardless of which rule put it there, so subsequent
+    # shape-S entries skip via `seen_shapes`.
+    seen_shapes: set[tuple[str, ...]] = set()
+    shape_added = 0
+    for e in entries:
+        if shape_added >= TAXONOMY_SAMPLE_SHAPE_BUDGET:
+            break
+        if len(chosen) >= TAXONOMY_SAMPLE_TARGET_SIZE:
+            break
+        sig = e.sections
+        if sig in seen_shapes:
+            continue
+        seen_shapes.add(sig)
+        if _add(e):
+            shape_added += 1
 
     # 3) Up to 1 per unique leaf directory until 70 slots filled.
     by_leaf: dict[str, list[CatalogEntry]] = {}

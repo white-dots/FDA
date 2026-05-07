@@ -939,3 +939,164 @@ class TestPriorityRegressions:
             _catalog([e]), "sort", backend=backend, logger=logger,
         )
         assert any(g.category == "Stock-Reports" for g in result.items)
+
+
+# ---------------------------------------------------------------------------
+# sections: visible in both Stage A (proposer) and Stage B (assigner) wire
+# payloads; sampling reserves slots per distinct sections-shape
+# ---------------------------------------------------------------------------
+
+
+class TestSectionsWireFormat:
+    def _make_entry(
+        self, *, path_id: str, path: str = "/x.txt",
+        sections: tuple[str, ...] = (),
+        verbatim_head: str = "",
+        summary: str = "summary",
+    ):
+        from fda.organize.models import CatalogEntry
+        return CatalogEntry(
+            path_id=path_id,
+            path=path,
+            ext=".txt",
+            size_bytes=10,
+            summary=summary,
+            type_label="text",
+            is_junk=False,
+            summary_failed=False,
+            extract_status="ok",
+            verbatim_head=verbatim_head,
+            sections=sections,
+        )
+
+    def test_entry_dict_includes_sections(self):
+        from fda.organize.classifier import _entry_dict
+
+        e = self._make_entry(
+            path_id="f000",
+            sections=("Shipping Details", "Customer Details"),
+        )
+        d = _entry_dict(e)
+        assert d["sections"] == ("Shipping Details", "Customer Details")
+
+    def test_entry_dict_sections_default_empty_tuple(self):
+        from fda.organize.classifier import _entry_dict
+
+        e = self._make_entry(path_id="f000")
+        assert _entry_dict(e)["sections"] == ()
+
+    def test_proposer_payload_carries_sections(self):
+        import json
+        from fda.organize.classifier import _build_proposer_prompt
+
+        sample = [
+            self._make_entry(
+                path_id="f000",
+                sections=("Shipping Details", "Customer Details"),
+            ),
+            self._make_entry(path_id="f001", sections=("Products",)),
+        ]
+        raw = _build_proposer_prompt(sample, "instructions")
+        payload = json.loads(raw)
+        assert payload["CATALOG"][0]["sections"] == [
+            "Shipping Details", "Customer Details"
+        ]
+        assert payload["CATALOG"][1]["sections"] == ["Products"]
+
+    def test_assigner_payload_carries_sections(self):
+        import json
+        from fda.organize.classifier import _build_assigner_prompt
+        from fda.organize.models import Taxonomy, TaxonomyCategory
+
+        taxonomy = Taxonomy(
+            categories=(
+                TaxonomyCategory(
+                    category_name="Purchase-Orders",
+                    subpath="POs",
+                    description="Simple POs",
+                    criteria="Documents with Products section.",
+                ),
+                TaxonomyCategory(
+                    category_name="Shipping-Orders",
+                    subpath="Shipping",
+                    description="Detailed shipping docs",
+                    criteria="Documents with Shipping Details, Customer Details, and Shipper section.",
+                ),
+            ),
+            fallback_category=TaxonomyCategory(
+                category_name="Misc",
+                subpath="Misc",
+                description="Catch-all",
+                criteria="When no other category fits.",
+            ),
+        )
+        batch = [
+            self._make_entry(
+                path_id="f000",
+                sections=("Shipping Details", "Customer Details"),
+            ),
+        ]
+        raw = _build_assigner_prompt(batch, taxonomy, "instructions")
+        payload = json.loads(raw)
+        assert payload["BATCH"][0]["sections"] == [
+            "Shipping Details", "Customer Details"
+        ]
+
+
+class TestSamplingShapeBudget:
+    def test_constant_exists(self):
+        from fda.organize.classifier import TAXONOMY_SAMPLE_SHAPE_BUDGET
+
+        assert TAXONOMY_SAMPLE_SHAPE_BUDGET == 10
+
+    def test_rare_shapes_reserved_in_sample(self):
+        """Construct a 200-entry catalog with 6 distinct sections-shapes,
+        most concentrated in the dominant shape. The new shape-budget
+        rule should reserve at least one entry per distinct shape, up
+        to TAXONOMY_SAMPLE_SHAPE_BUDGET.
+
+        Critical for the test's validity: every entry lives in the SAME
+        flat directory so the existing top-level-dir + leaf-dir sampling
+        rules cannot accidentally substitute for the shape-budget rule.
+        Also use a single shared extension. The only diversity signal is
+        the `sections` tuple — any rule that doesn't read `sections`
+        cannot satisfy this test.
+        """
+        from fda.organize.classifier import _sample_for_taxonomy
+        from fda.organize.models import CatalogEntry
+
+        def _e(idx, shape):
+            return CatalogEntry(
+                path_id=f"f{idx:03d}",
+                # Flat directory; same extension. Top-level-dir sampling
+                # sees one bucket; extension sampling sees one bucket.
+                path=f"/tmp/flat/file_{idx:03d}.txt",
+                ext=".txt",
+                size_bytes=10,  # uniform size; "largest" rule sees no signal
+                summary="similar summary",
+                type_label="text",
+                is_junk=False,
+                summary_failed=False,
+                extract_status="ok",
+                sections=shape,
+            )
+
+        shapes = [
+            ("Products",),
+            ("Shipping Details", "Customer Details", "Products"),
+            ("Quote", "Items", "Valid Until"),
+            ("Patient Name", "Diagnosis", "Treatment"),
+            ("From", "To", "Subject"),
+            ("Sheet:Q3", "Date", "Revenue"),
+        ]
+        # 150 entries of shape[0], 10 each of the other 5 — total 200.
+        entries = [_e(i, shapes[0]) for i in range(150)]
+        for s_idx, shape in enumerate(shapes[1:], start=1):
+            entries += [_e(150 + s_idx * 10 + i, shape) for i in range(10)]
+
+        sample = _sample_for_taxonomy(entries, "/tmp")
+        sample_shapes = {e.sections for e in sample}
+        # All 6 distinct shapes must appear. With every entry in the same
+        # directory and same extension, only a rule that reads `sections`
+        # can produce this result — the shape-budget rule.
+        assert len(sample_shapes) == 6
