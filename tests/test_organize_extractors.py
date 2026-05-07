@@ -38,6 +38,7 @@ class TestUnknownExtension:
         r = _extractors.extract(p)
         assert r.status == "no_extractor"
         assert r.text is None
+        assert r.sections == ()
 
 
 class TestPdf:
@@ -74,6 +75,7 @@ class TestPdf:
                 r = _extractors.extract(p)
         assert r.status == "failed"
         assert r.text is None
+        assert r.sections == ()
 
     def test_pipe_cap_applied_internally(self, tmp_path):
         """The PDF subprocess cap is the extractor's own memory-safety
@@ -105,6 +107,7 @@ class TestExtractorFailureIsolation:
             r = _extractors.extract(p)
         assert r.status == "failed"
         assert "bad extractor" in r.note
+        assert r.sections == ()
 
 
 class TestRegistryAdditions:
@@ -165,18 +168,40 @@ class TestSectionsWiredIntoExtractors:
         assert result.status == "ok"
         assert result.sections == ()
 
-    def test_v1_csv_with_no_colon_headers_yields_empty_sections(self, tmp_path):
-        """Pin v1 CSV behavior: regex runs, finds no colon-headers or
-        ALL-CAPS dividers in typical CSV content, returns (). Format-native
-        column-header extraction is v2 (see spec's Future format coverage)."""
+    @pytest.mark.parametrize(
+        "filename, body",
+        [
+            (
+                "data.csv",
+                "customer_id,order_date,amount,status\n"
+                "1,2024-01-01,100.00,paid\n"
+                "2,2024-01-02,200.00,pending\n",
+            ),
+            (
+                "data.json",
+                '{"customer_id": 1, "order_date": "2024-01-01", '
+                '"amount": 100.0, "status": "paid"}\n',
+            ),
+            (
+                "data.xml",
+                "<orders>\n"
+                "  <order id=\"1\"><amount>100.00</amount></order>\n"
+                "  <order id=\"2\"><amount>200.00</amount></order>\n"
+                "</orders>\n",
+            ),
+        ],
+    )
+    def test_v1_structured_text_with_no_colon_headers_yields_empty_sections(
+        self, tmp_path, filename, body
+    ):
+        """Pin v1 structured-text behavior: typical CSV/JSON/XML content has
+        no colon-only-on-line headers and no ALL-CAPS dividers, so the regex
+        helper returns (). Format-native column-header / element-name
+        extraction is v2 (see spec's Future format coverage)."""
         from fda.organize._extractors import _read_text
 
-        f = tmp_path / "data.csv"
-        f.write_text(
-            "customer_id,order_date,amount,status\n"
-            "1,2024-01-01,100.00,paid\n"
-            "2,2024-01-02,200.00,pending\n"
-        )
+        f = tmp_path / filename
+        f.write_text(body)
         result = _read_text(f)
         assert result.status == "ok"
         assert result.sections == ()
