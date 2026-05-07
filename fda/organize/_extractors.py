@@ -194,6 +194,7 @@ def _extract_xlsx(path: Path) -> ExtractionResult:
     non_empty_cells = 0
     formula_cells = 0
     merged_count = 0
+    formulas_by_addr: dict[tuple[str, int, int], str] = {}
     wb2 = openpyxl.load_workbook(path, data_only=False, read_only=False)
     try:
         for ws in wb2.worksheets:
@@ -205,6 +206,15 @@ def _extract_xlsx(path: Path) -> ExtractionResult:
                     non_empty_cells += 1
                     if cell.data_type == "f":
                         formula_cells += 1
+                        # openpyxl returns formula values that already start
+                        # with "=" (e.g., "=A2*10"). Defensive prefix only if
+                        # missing — never f"={cell.value}" blindly, which
+                        # would double-prefix and produce "==A2*10".
+                        raw = str(cell.value)
+                        formula_str = raw if raw.startswith("=") else f"={raw}"
+                        formulas_by_addr[(ws.title, cell.row, cell.column)] = (
+                            formula_str
+                        )
     finally:
         wb2.close()
 
@@ -243,11 +253,20 @@ def _extract_xlsx(path: Path) -> ExtractionResult:
                 schema_seen[s] = None
                 schema_labels.append(s)
             text_parts.append(f"Sheet: {sheet_name}\n")
-            for row in ws.iter_rows(
-                values_only=True, max_row=_XLSX_TEXT_ROWS_PER_SHEET
+            for r_idx, row in enumerate(
+                ws.iter_rows(values_only=True, max_row=_XLSX_TEXT_ROWS_PER_SHEET),
+                start=1,
             ):
                 row_slice = list(row[:_XLSX_TEXT_COLS_PER_ROW])
-                cells_str = ["" if c is None else str(c) for c in row_slice]
+                cells_str: list[str] = []
+                for c_idx, value in enumerate(row_slice, start=1):
+                    if value is None:
+                        formula = formulas_by_addr.get(
+                            (sheet_name, r_idx, c_idx)
+                        )
+                        cells_str.append(formula if formula is not None else "")
+                    else:
+                        cells_str.append(str(value))
                 while cells_str and cells_str[-1] == "":
                     cells_str.pop()
                 text_parts.append("\t".join(cells_str) + "\n")

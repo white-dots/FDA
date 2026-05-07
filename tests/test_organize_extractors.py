@@ -827,3 +827,69 @@ class TestXlsxSynthesizedLabels:
         # Schema portion was truncated to MAX_SECTIONS_PER_FILE - 2 = 13.
         schema_portion = r.sections[:-2]
         assert len(schema_portion) == MAX_SECTIONS_PER_FILE - 2
+
+
+class TestXlsxFormulaFallback:
+    def test_cached_none_falls_back_to_formula_string(self, tmp_path):
+        from fda.organize import _extractors
+        import openpyxl
+
+        f = tmp_path / "spec.xlsx"
+        # openpyxl-saved formulas have cached value None on pass 1.
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Calc"
+        ws["A1"] = 10
+        ws["A2"] = 20
+        ws["A3"] = "=A1+A2"
+        wb.save(str(f))
+        wb.close()
+
+        r = _extractors.extract(f)
+        # The formula cell appears in `text` as the formula string, not as
+        # an empty cell.
+        assert "=A1+A2" in r.text
+        # The "=" prefix is single, not double — defensive against
+        # implementations that incorrectly do f"={cell.value}" when
+        # cell.value already starts with "=".
+        assert "==A1+A2" not in r.text
+
+    def test_trailing_empty_trim_does_not_swallow_formula_fallback(self, tmp_path):
+        from fda.organize import _extractors
+        import openpyxl
+
+        f = tmp_path / "trail_formula.xlsx"
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "S"
+        ws["A1"] = "x"
+        ws["B1"] = "=A1"  # cached None on pass 1; substituted from pass 2
+        wb.save(str(f))
+        wb.close()
+
+        r = _extractors.extract(f)
+        # The substituted formula is non-empty, so the trailing-trim must
+        # leave it in.
+        assert "=A1" in r.text
+
+    def test_formula_fallback_aligned_with_sparse_row_layout(self, tmp_path):
+        """Pin that pass-1's `enumerate(start=1)` row index matches pass-2's
+        `cell.row`/`cell.column` when leading rows are entirely empty.
+        Read-only-mode `iter_rows(max_row=N)` returns N rows including
+        empty ones, so the index alignment must hold without offset bugs."""
+        from fda.organize import _extractors
+        import openpyxl
+
+        f = tmp_path / "sparse_formula.xlsx"
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Sparse"
+        # Leave rows 1-9 entirely empty; only B10 has a formula.
+        ws["B10"] = "=1+1"
+        wb.save(str(f))
+        wb.close()
+
+        r = _extractors.extract(f)
+        # The formula string must appear in `text` — i.e., the fallback
+        # lookup at (sheet="Sparse", row=10, col=2) succeeds.
+        assert "=1+1" in r.text
