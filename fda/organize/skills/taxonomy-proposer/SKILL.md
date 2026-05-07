@@ -10,11 +10,15 @@ You will receive (in the user message):
 - USER_INSTRUCTIONS: free-form guidance from the operator (may be empty)
 - CATALOG (JSON): a list of entries. Each entry has fields
   `path_id`, `path`, `ext`, `size_bytes`, `summary`, `type_label`,
-  `extract_status`, `verbatim_head`.
+  `extract_status`, `verbatim_head`, `sections`.
   - `summary` is Reader's prose description (truncated to 200 characters).
   - `verbatim_head` is the raw first ~300 chars of the file's extracted
     text, with leading whitespace stripped. It is NOT a summary — it's
     actual file content. Empty string if extraction failed.
+  - `sections` is a deterministic list of section/field labels extracted
+    from the document by a pure-Python regex pass (not by an LLM). Empty
+    list when extraction failed or the document carries no labeled
+    sections.
   - The last component of `path` is the filename.
 
 How to use these signals when proposing categories:
@@ -33,6 +37,29 @@ How to use these signals when proposing categories:
   accordingly.
 - **Trust verbatim over prose.** When `summary` and `verbatim_head` disagree
   about what kind of document this is, the slice is the source of truth.
+
+- **Structural fingerprint as signal.** Each entry has `sections` — a
+  list of section/field labels extracted directly from the document
+  (not by an LLM). When sampled documents share similar topics or
+  summaries but their `sections` lists are clearly different in size
+  or content, propose them as **distinct categories**. Two "order
+  documents" with `sections=["Products"]` and
+  `sections=["Shipping Details", "Customer Details", "Employee",
+  "Shipper", "Order Details", "Products"]` are not the same document
+  type — the second has structural fields the first doesn't. Look for
+  this kind of structural diversity in the sample and reflect it in
+  the taxonomy.
+
+- **When categories are structurally distinct, encode that in
+  `criteria`.** Stage B has access to the same `sections` lists you
+  do, but it can only compare them to your category criteria — and
+  `criteria` is free prose. When two categories differ structurally,
+  write the discriminating section names directly into `criteria`
+  (e.g., `"criteria": "Documents with Shipping Details, Customer
+  Details, Employee, and Shipper sections in addition to Products."`).
+  Stage B will then have something concrete to match. Categories
+  whose discriminator is purely topical (no structural distinction)
+  need no section names in `criteria`.
 
 Your job is to produce a TAXONOMY: a flat list of categories plus exactly one
 fallback category. You DO NOT assign files to categories — that happens in a
