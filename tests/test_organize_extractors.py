@@ -705,3 +705,125 @@ class TestXlsxText:
         # that drops the trailing "\n".
         assert "\n\nSheet: S2\n" in r.text
         assert r.text.index("Sheet: S1") < r.text.index("Sheet: S2")
+
+
+class TestXlsxSynthesizedLabels:
+    def test_formula_heavy_appended_above_threshold(self, tmp_path):
+        from fda.organize import _extractors
+        import openpyxl
+
+        f = tmp_path / "calc.xlsx"
+        # 5 non-empty cells, 1 formula → 1/5 = 0.20 > 0.05 → FormulaHeavy.
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Calc"
+        ws["A1"] = 1
+        ws["A2"] = 2
+        ws["A3"] = 3
+        ws["A4"] = 4
+        ws["A5"] = "=SUM(A1:A4)"
+        wb.save(str(f))
+        wb.close()
+
+        r = _extractors.extract(f)
+        assert "FormulaHeavy" in r.sections
+        # Tail position: synthesized labels come last.
+        assert r.sections[-1] == "FormulaHeavy"
+
+    def test_formula_heavy_not_appended_at_or_below_threshold(self, tmp_path):
+        from fda.organize import _extractors
+        import openpyxl
+
+        f = tmp_path / "data.xlsx"
+        # 20 non-empty cells, 1 formula → 1/20 = 0.05 NOT > 0.05 → not appended.
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Data"
+        for i in range(19):
+            ws.cell(row=i + 1, column=1, value=i)
+        ws.cell(row=20, column=1, value="=SUM(A1:A19)")
+        wb.save(str(f))
+        wb.close()
+
+        r = _extractors.extract(f)
+        assert "FormulaHeavy" not in r.sections
+
+    def test_formula_heavy_zero_guard(self, tmp_path):
+        from fda.organize import _extractors
+
+        f = tmp_path / "totally_empty.xlsx"
+        _build_xlsx(f, [("Empty", [])])
+        r = _extractors.extract(f)
+        # non_empty_cells == 0 → not formula-heavy by definition.
+        assert "FormulaHeavy" not in r.sections
+
+    def test_merged_cells_appended_at_or_above_min(self, tmp_path):
+        from fda.organize import _extractors
+        import openpyxl
+
+        f = tmp_path / "merged.xlsx"
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "M"
+        ws["A1"] = "x"
+        ws.merge_cells("B1:C1")
+        ws.merge_cells("B2:C2")
+        ws.merge_cells("B3:C3")
+        wb.save(str(f))
+        wb.close()
+
+        r = _extractors.extract(f)
+        assert "MergedCells" in r.sections
+
+    def test_merged_cells_not_appended_below_min(self, tmp_path):
+        from fda.organize import _extractors
+        import openpyxl
+
+        f = tmp_path / "two_merged.xlsx"
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "M"
+        ws["A1"] = "x"
+        ws.merge_cells("B1:C1")
+        ws.merge_cells("B2:C2")
+        wb.save(str(f))
+        wb.close()
+
+        r = _extractors.extract(f)
+        assert "MergedCells" not in r.sections
+
+    def test_synthesized_in_tail_after_schema_cap(self, tmp_path):
+        from fda.organize import _extractors
+        import openpyxl
+        from fda.organize._sections import MAX_SECTIONS_PER_FILE
+
+        f = tmp_path / "wide_with_formulas.xlsx"
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Wide"
+        # 20 unique header columns in row 1 — more than the schema cap.
+        headers = [f"Header{i:02d}" for i in range(20)]
+        ws.append(headers)
+        # Trigger FormulaHeavy. With 20 header cells already non-empty, we
+        # need formula_count / non_empty > 0.05. Use enough formulas that
+        # the ratio comfortably exceeds the threshold even after counting
+        # all 20 headers as non-empty: 5 formulas / 25 total = 0.20 > 0.05.
+        ws["A2"] = "=SUM(A1)"
+        ws["B2"] = "=SUM(B1)"
+        ws["C2"] = "=SUM(C1)"
+        ws["D2"] = "=SUM(D1)"
+        ws["E2"] = "=SUM(E1)"
+        # Trigger MergedCells (>= _XLSX_MERGED_CELLS_MIN = 3).
+        ws.merge_cells("F2:G2")
+        ws.merge_cells("F3:G3")
+        ws.merge_cells("F4:G4")
+        wb.save(str(f))
+        wb.close()
+
+        r = _extractors.extract(f)
+        # Both synthesized labels triggered → two reserved tail slots.
+        assert r.sections[-2:] == ("FormulaHeavy", "MergedCells")
+        assert len(r.sections) == MAX_SECTIONS_PER_FILE
+        # Schema portion was truncated to MAX_SECTIONS_PER_FILE - 2 = 13.
+        schema_portion = r.sections[:-2]
+        assert len(schema_portion) == MAX_SECTIONS_PER_FILE - 2

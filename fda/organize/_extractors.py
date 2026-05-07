@@ -188,9 +188,34 @@ def _extract_xlsx(path: Path) -> ExtractionResult:
     """
     import openpyxl
 
-    # Pass 2 — formula counts, merged-range counts, formula-string lookup.
-    # Filled in Task 6; for this task we just do pass 1 and leave synthesized=[].
+    # Pass 2 — formula counts, merged-range counts. ReadOnlyWorksheet does
+    # NOT expose merged_cells in openpyxl 3.0.9, so this pass uses the
+    # default read_only=False.
+    non_empty_cells = 0
+    formula_cells = 0
+    merged_count = 0
+    wb2 = openpyxl.load_workbook(path, data_only=False, read_only=False)
+    try:
+        for ws in wb2.worksheets:
+            merged_count += len(ws.merged_cells.ranges)
+            for row in ws.iter_rows():
+                for cell in row:
+                    if cell.value is None:
+                        continue
+                    non_empty_cells += 1
+                    if cell.data_type == "f":
+                        formula_cells += 1
+    finally:
+        wb2.close()
+
     synthesized: list[str] = []
+    if (
+        non_empty_cells > 0
+        and formula_cells / non_empty_cells > _XLSX_FORMULA_DENSITY_THRESHOLD
+    ):
+        synthesized.append("FormulaHeavy")
+    if merged_count >= _XLSX_MERGED_CELLS_MIN:
+        synthesized.append("MergedCells")
 
     schema_labels: list[str] = []
     schema_seen: dict[str, None] = {}
