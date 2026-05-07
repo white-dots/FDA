@@ -59,6 +59,13 @@ def _assignment_payload(assignments):
     })
 
 
+class _DummySkill:
+    """Minimal SkillConfig stub. _run_stage_b only reads `body` and
+    `model` from this object."""
+    body = "skill body"
+    model = "claude-sonnet-4-6"
+
+
 @pytest.fixture
 def logger(tmp_path):
     from fda.organize._logger import OrganizeLogger
@@ -1113,3 +1120,350 @@ class TestSamplingShapeBudget:
         # directory and same extension, only a rule that reads `sections`
         # can produce this result — the shape-budget rule.
         assert len(sample_shapes) == 6
+
+
+# ---------------------------------------------------------------------------
+# Stage B regression: sections drives category choice when topic is shared
+# ---------------------------------------------------------------------------
+
+
+class TestStructuralSectionsRegressions:
+    """Three pinned cases:
+      1. Topic-similar files with different sections-shapes route to
+         different categories.
+      2. Empty sections falls through cleanly regardless of extract_status.
+      3. Filename overrides sections when they conflict.
+    """
+
+    def _entry(
+        self, *, path_id: str, path: str,
+        sections: tuple[str, ...] = (),
+        verbatim_head: str = "",
+        summary: str = "summary",
+        extract_status: str = "ok",
+    ):
+        from fda.organize.models import CatalogEntry
+        return CatalogEntry(
+            path_id=path_id,
+            path=path,
+            ext=".pdf",
+            size_bytes=10,
+            summary=summary,
+            type_label="text",
+            is_junk=False,
+            summary_failed=False,
+            extract_status=extract_status,
+            verbatim_head=verbatim_head,
+            sections=sections,
+        )
+
+    def _taxonomy(self):
+        from fda.organize.models import Taxonomy, TaxonomyCategory
+        return Taxonomy(
+            categories=(
+                TaxonomyCategory(
+                    category_name="Purchase-Orders",
+                    subpath="POs",
+                    description="Simple purchase orders",
+                    criteria="Documents with Products section.",
+                ),
+                TaxonomyCategory(
+                    category_name="Shipping-Orders",
+                    subpath="Shipping",
+                    description="Detailed shipping documents",
+                    criteria=(
+                        "Documents with Shipping Details, Customer Details, "
+                        "Employee, Shipper, and Order Details sections."
+                    ),
+                ),
+                TaxonomyCategory(
+                    category_name="Sales-Invoices",
+                    subpath="Invoices",
+                    description="Invoices",
+                    criteria="Sales invoices.",
+                ),
+            ),
+            fallback_category=TaxonomyCategory(
+                category_name="Misc",
+                subpath="Misc",
+                description="Catch-all",
+                criteria="When no other category fits.",
+            ),
+        )
+
+    def _make_backend(self):
+        """Fake backend that follows the assigner prompt's documented
+        priority order. Reads BATCH from the prompt JSON and decides
+        category based on filename → sections → verbatim_head → summary.
+
+        The hash-detection regex anchors on the stem (with extension
+        suffix) to avoid false-positives from filenames that contain
+        embedded 16+ hex substrings by coincidence. This mirrors the
+        intent of the prompt's "long hex string" wording.
+        """
+        import json
+        import re
+
+        # Anchored: full basename must be hex stem + extension.
+        HASH_BASENAME_RE = re.compile(
+            r"^[0-9a-f]{16,}\.[a-z0-9]+$", re.IGNORECASE,
+        )
+
+        class StubBackend:
+            def complete(self, *, system, messages, **kwargs):
+                # Use entry["sections"] (not .get) so the test fails
+                # loudly if Task 6's wire-format change is missing.
+                user = messages[0]["content"]
+                payload = json.loads(user)
+                taxonomy = payload["TAXONOMY"]
+                cats = taxonomy["categories"]
+                fallback = taxonomy["fallback_category"]["category_name"]
+                assignments = []
+
+                for entry in payload["BATCH"]:
+                    path = entry["path"]
+                    basename = path.rsplit("/", 1)[-1]
+                    sections = entry["sections"]   # contract assertion
+                    extract_status = entry["extract_status"]
+                    verbatim = entry["verbatim_head"]
+                    summary = entry["summary"]
+
+                    chosen = None
+
+                    # Step 1: informative filename.
+                    lower = basename.lower()
+                    if "invoice" in lower:
+                        chosen = "Sales-Invoices"
+                    elif "purchase" in lower or lower.startswith("po"):
+                        chosen = "Purchase-Orders"
+                    # Step 2: ignore filename if it's a pure hash stem
+                    # (anchored regex). Don't override; just don't decide.
+                    elif HASH_BASENAME_RE.match(basename):
+                        pass
+
+                    # Step 3: structural fingerprint vs criteria
+                    # (only when extract_status == "ok" AND sections nonempty).
+                    if (
+                        chosen is None
+                        and extract_status == "ok"
+                        and sections
+                    ):
+                        best = None
+                        best_score = 0
+                        for c in cats:
+                            score = sum(
+                                1 for s in sections if s in c["criteria"]
+                            )
+                            if score > best_score:
+                                best = c["category_name"]
+                                best_score = score
+                        if best:
+                            chosen = best
+
+                    # Step 4: verbatim_head literal type labels.
+                    if chosen is None:
+                        if "Purchase Orders" in verbatim:
+                            chosen = "Purchase-Orders"
+                        elif "Invoice" in verbatim:
+                            chosen = "Sales-Invoices"
+
+                    # Step 5/6: summary only.
+                    if chosen is None:
+                        if "invoice" in summary.lower():
+                            chosen = "Sales-Invoices"
+                        elif "shipping" in summary.lower():
+                            chosen = "Shipping-Orders"
+
+                    if chosen is None:
+                        chosen = fallback
+
+                    assignments.append({
+                        "path_id": entry["path_id"],
+                        "category_name": chosen,
+                    })
+
+                return json.dumps({"assignments": assignments})
+
+        return StubBackend()
+
+    def test_structural_conflict_routes_correctly(self, logger):
+        """Both files have hash filenames and topic-similar summaries.
+        Only the sections list distinguishes them. The fake backend must
+        follow the prompt's substring-overlap rule and route them to
+        DIFFERENT categories."""
+        from fda.organize.classifier import _run_stage_b
+
+        # Per spec §7: pinned fixture text. The literal regex output
+        # was verified manually before writing this test (see Step 1).
+        entry_a = self._entry(
+            path_id="f000",
+            path="/tmp/0fa84d61b3158eaba46dee96.pdf",
+            sections=("Products",),  # from "Purchase Orders" doc text
+            verbatim_head="Purchase Orders\n\nOrder ID: 10488",
+            summary="order document",
+        )
+        entry_b = self._entry(
+            path_id="f001",
+            path="/tmp/7c2adef94015b1d65d2c8a3f.pdf",
+            sections=(  # from "Order ID: ... + Shipping Details + ..."
+                "Shipping Details", "Customer Details",
+                "Employee", "Shipper", "Order Details", "Products",
+            ),
+            verbatim_head="Order ID: 10488\n\nShipping Details:",
+            summary="order document",
+        )
+        assignments = _run_stage_b(
+            [entry_a, entry_b],
+            self._taxonomy(),
+            "instructions",
+            backend=self._make_backend(),
+            logger=logger,
+            skill=_DummySkill(),
+        )
+        assert assignments["f000"] == "Purchase-Orders"
+        assert assignments["f001"] == "Shipping-Orders"
+
+    def test_empty_sections_ok_status_falls_through(self, logger):
+        """extract_status == 'ok' and sections == () means doc has no
+        labeled sections — step 3 is skipped, summary alone decides."""
+        from fda.organize.classifier import _run_stage_b
+
+        entry = self._entry(
+            path_id="f000",
+            path="/tmp/0fa84d61b3158eaba46dee96.pdf",
+            sections=(),
+            verbatim_head="",
+            summary="invoice for ACME",
+            extract_status="ok",
+        )
+        assignments = _run_stage_b(
+            [entry],
+            self._taxonomy(),
+            "instructions",
+            backend=self._make_backend(),
+            logger=logger,
+            skill=_DummySkill(),
+        )
+        # Falls through to summary-only logic; "invoice" in summary
+        # routes to Sales-Invoices via step 5/6 of the priority list.
+        assert assignments["f000"] == "Sales-Invoices"
+
+    def test_empty_sections_failed_status_falls_through(self, logger):
+        """extract_status == 'failed' and sections == () should behave
+        identically to the 'ok'+empty case — both fall through to
+        summary-only."""
+        from fda.organize.classifier import _run_stage_b
+
+        entry = self._entry(
+            path_id="f000",
+            path="/tmp/0fa84d61b3158eaba46dee96.pdf",
+            sections=(),
+            verbatim_head="",
+            summary="invoice for ACME",
+            extract_status="failed",
+        )
+        assignments = _run_stage_b(
+            [entry],
+            self._taxonomy(),
+            "instructions",
+            backend=self._make_backend(),
+            logger=logger,
+            skill=_DummySkill(),
+        )
+        assert assignments["f000"] == "Sales-Invoices"
+
+    def test_filename_overrides_sections_conflict(self, logger):
+        """Informative filename ('Invoice_...') wins over a sections list
+        that overlaps better with a different category's criteria."""
+        from fda.organize.classifier import _run_stage_b
+
+        entry = self._entry(
+            path_id="f000",
+            path="/tmp/Invoice_old_template.pdf",
+            sections=(
+                "Shipping Details", "Customer Details",
+                "Employee", "Shipper", "Order Details",
+            ),
+            verbatim_head="Order ID: 10488",
+            summary="order document",
+        )
+        assignments = _run_stage_b(
+            [entry],
+            self._taxonomy(),
+            "instructions",
+            backend=self._make_backend(),
+            logger=logger,
+            skill=_DummySkill(),
+        )
+        # Filename wins; structural overlap with Shipping-Orders is ignored.
+        assert assignments["f000"] == "Sales-Invoices"
+
+    def test_stage_a_proposes_distinct_categories_when_shapes_diverge(
+        self, logger,
+    ):
+        """End-to-end Stage A: a sample with two distinct sections-shapes
+        but topic-similar summaries flows through _propose_taxonomy with
+        a fake backend that reads the `sections` field; the resulting
+        taxonomy contains a category per shape, not a single merged one.
+        """
+        import json
+        from fda.organize.classifier import _propose_taxonomy
+
+        sample = [
+            self._entry(
+                path_id=f"f{i:03d}",
+                path=f"/tmp/flat/file_{i:03d}.txt",
+                sections=("Products",),
+                summary="order document",
+            )
+            for i in range(3)
+        ] + [
+            self._entry(
+                path_id=f"f{i:03d}",
+                path=f"/tmp/flat/file_{i:03d}.txt",
+                sections=(
+                    "Shipping Details", "Customer Details",
+                    "Employee", "Shipper", "Order Details", "Products",
+                ),
+                summary="order document",
+            )
+            for i in range(3, 6)
+        ]
+
+        class ProposerBackend:
+            def complete(self, *, system, messages, **kwargs):
+                user = messages[0]["content"]
+                payload = json.loads(user)
+                # Read `sections` directly — fails loudly if Task 6
+                # didn't put it in the proposer payload.
+                shapes = {
+                    tuple(e["sections"]) for e in payload["CATALOG"]
+                }
+                cats = []
+                for i, shape in enumerate(sorted(shapes)):
+                    cats.append({
+                        "category_name": f"Cat-{i}",
+                        "subpath": f"Cat-{i}",
+                        "description": "auto-generated",
+                        "criteria": "Documents with " + ", ".join(shape) + " sections.",
+                    })
+                return json.dumps({
+                    "categories": cats,
+                    "fallback_category": {
+                        "category_name": "Misc",
+                        "subpath": "Misc",
+                        "description": "catch-all",
+                        "criteria": "When no other category fits.",
+                    },
+                })
+
+        taxonomy = _propose_taxonomy(
+            sample, "instructions",
+            backend=ProposerBackend(),
+            logger=logger,
+            skill=_DummySkill(),
+        )
+        assert len(taxonomy.categories) >= 2, (
+            f"expected ≥2 categories from 2 distinct shapes; got "
+            f"{[c.category_name for c in taxonomy.categories]}"
+        )
