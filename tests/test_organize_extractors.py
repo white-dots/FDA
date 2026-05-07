@@ -131,3 +131,92 @@ class TestRegistryAdditions:
         assert ".docx" not in _extractors.EXTRACTORS
         r = _extractors.extract(p)
         assert r.status == "no_extractor"
+
+
+# ---------------------------------------------------------------------------
+# Section extraction is wired into the text-based extractors
+# ---------------------------------------------------------------------------
+
+
+class TestSectionsWiredIntoExtractors:
+    def test_read_text_populates_sections(self, tmp_path):
+        from fda.organize._extractors import _read_text
+
+        f = tmp_path / "doc.txt"
+        f.write_text(
+            "Order ID: 10488\n"
+            "\n"
+            "Shipping Details:\n"
+            "ACME Corp\n"
+            "\n"
+            "Customer Details:\n"
+            "Hanna Moos\n"
+        )
+        result = _read_text(f)
+        assert result.status == "ok"
+        assert result.sections == ("Shipping Details", "Customer Details")
+
+    def test_read_text_empty_file_yields_empty_sections(self, tmp_path):
+        from fda.organize._extractors import _read_text
+
+        f = tmp_path / "empty.txt"
+        f.write_text("")
+        result = _read_text(f)
+        assert result.status == "ok"
+        assert result.sections == ()
+
+    def test_v1_csv_with_no_colon_headers_yields_empty_sections(self, tmp_path):
+        """Pin v1 CSV behavior: regex runs, finds no colon-headers or
+        ALL-CAPS dividers in typical CSV content, returns (). Format-native
+        column-header extraction is v2 (see spec's Future format coverage)."""
+        from fda.organize._extractors import _read_text
+
+        f = tmp_path / "data.csv"
+        f.write_text(
+            "customer_id,order_date,amount,status\n"
+            "1,2024-01-01,100.00,paid\n"
+            "2,2024-01-02,200.00,pending\n"
+        )
+        result = _read_text(f)
+        assert result.status == "ok"
+        assert result.sections == ()
+
+    def test_extract_pdf_text_populates_sections(self, tmp_path, monkeypatch):
+        """Mock pdftotext to emit a known structural document; assert
+        sections are populated from its text."""
+        from fda.organize import _extractors
+        from fda.organize._extractors import _extract_pdf_text
+
+        # Make _which return a real-looking path so the early bailout
+        # doesn't trip; stub _run_pdftotext to return the canned text.
+        monkeypatch.setattr(_extractors, "_which", lambda name: "/usr/bin/pdftotext")
+        canned = (
+            "Order ID: 10488\n"
+            "\n"
+            "Shipping Details:\n"
+            "ACME Corp\n"
+            "\n"
+            "Customer Details:\n"
+            "Hanna Moos\n"
+        ).encode("utf-8")
+        monkeypatch.setattr(_extractors, "_run_pdftotext", lambda path: canned)
+
+        f = tmp_path / "doc.pdf"
+        f.write_bytes(b"%PDF-1.4\n%fake\n")
+        result = _extract_pdf_text(f)
+        assert result.status == "ok"
+        assert result.sections == ("Shipping Details", "Customer Details")
+
+    def test_failed_pdf_extraction_leaves_sections_empty(self, tmp_path, monkeypatch):
+        """When pdftotext is missing, ExtractionResult.status is
+        'tool_missing' and sections stays ()."""
+        from fda.organize import _extractors
+        from fda.organize._extractors import _extract_pdf_text
+
+        monkeypatch.setattr(_extractors, "_which", lambda name: None)
+
+        f = tmp_path / "doc.pdf"
+        f.write_bytes(b"%PDF-1.4\n%fake\n")
+        result = _extract_pdf_text(f)
+        assert result.status == "tool_missing"
+        assert result.sections == ()

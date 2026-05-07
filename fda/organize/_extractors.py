@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Callable
 
 from fda.organize.models import ExtractionResult
+from fda.organize._sections import extract_sections_from_text
 
 TextExtractor = Callable[[Path], ExtractionResult]
 
@@ -40,7 +41,11 @@ def _read_text(path: Path) -> ExtractionResult:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError as e:
         return ExtractionResult(text=None, status="failed", note=str(e))
-    return ExtractionResult(text=text, status="ok")
+    return ExtractionResult(
+        text=text,
+        status="ok",
+        sections=extract_sections_from_text(text),
+    )
 
 
 def _run_pdftotext(path: Path) -> bytes:
@@ -94,7 +99,11 @@ def _extract_pdf_text(path: Path) -> ExtractionResult:
             status="failed",
             note="pdftotext produced no text (image-only PDF?)",
         )
-    return ExtractionResult(text=text, status="ok")
+    return ExtractionResult(
+        text=text,
+        status="ok",
+        sections=extract_sections_from_text(text),
+    )
 
 
 EXTRACTORS: dict[str, TextExtractor] = {
