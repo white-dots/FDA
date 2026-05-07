@@ -689,3 +689,76 @@ class TestSectionsPropagation:
         e = catalog.entries[0]
         assert e.summary_failed is True
         assert e.sections == ("Shipping Details",)
+
+
+class TestSectionsPropagationDocxXlsx:
+    def test_docx_sections_flow_through_reader(
+        self, workspace, fake_backend, logger
+    ):
+        from fda.organize import reader
+        from docx import Document
+
+        f = workspace / "doc.docx"
+        d = Document()
+        p = d.add_paragraph("My Title")
+        p.style = d.styles["Title"]
+        p2 = d.add_paragraph("Findings")
+        p2.style = d.styles["Heading 1"]
+        d.add_paragraph("body content")
+        d.save(str(f))
+
+        catalog = reader.read(workspace, backend=fake_backend, logger=logger)
+        e = next(c for c in catalog.entries if c.path.endswith("doc.docx"))
+        assert e.extract_status == "ok"
+        assert e.sections == ("My Title", "Findings")
+        assert e.verbatim_head.startswith("My Title")
+
+    def test_xlsx_sections_flow_through_reader(
+        self, workspace, fake_backend, logger
+    ):
+        from fda.organize import reader
+        import openpyxl
+
+        f = workspace / "wb.xlsx"
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Orders"
+        ws.append(["Order ID", "Customer"])
+        ws.append([1, "ACME"])
+        wb.save(str(f))
+        wb.close()
+
+        catalog = reader.read(workspace, backend=fake_backend, logger=logger)
+        e = next(c for c in catalog.entries if c.path.endswith("wb.xlsx"))
+        assert e.extract_status == "ok"
+        assert "Sheet:Orders" in e.sections
+        assert "Order ID" in e.sections
+        assert "Customer" in e.sections
+
+    def test_docx_failed_extraction_yields_empty_sections_in_catalog(
+        self, workspace, fake_backend, logger
+    ):
+        """Parallel to existing PDF/text coverage: when an extractor fails,
+        the catalog entry's sections is preserved as ()."""
+        from fda.organize import reader
+
+        f = workspace / "broken.docx"
+        f.write_bytes(b"not a real docx")
+        catalog = reader.read(workspace, backend=fake_backend, logger=logger)
+        e = next(c for c in catalog.entries if c.path.endswith("broken.docx"))
+        assert e.extract_status == "failed"
+        assert e.sections == ()
+
+    def test_xlsx_failed_extraction_yields_empty_sections_in_catalog(
+        self, workspace, fake_backend, logger
+    ):
+        """Spec line 166: reader failure preservation applies to both formats.
+        Pin xlsx alongside docx."""
+        from fda.organize import reader
+
+        f = workspace / "broken.xlsx"
+        f.write_bytes(b"not a real xlsx")
+        catalog = reader.read(workspace, backend=fake_backend, logger=logger)
+        e = next(c for c in catalog.entries if c.path.endswith("broken.xlsx"))
+        assert e.extract_status == "failed"
+        assert e.sections == ()

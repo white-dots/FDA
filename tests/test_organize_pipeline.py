@@ -20,6 +20,26 @@ def workspace(tmp_path):
     (root / "a.txt").write_text("aaa")
     (root / "b.txt").write_text("bbb")
     (root / ".DS_Store").write_bytes(b"\x00")
+
+    # Minimal .docx (one Title paragraph) so the integration corpus exercises
+    # the new format end-to-end.
+    from docx import Document
+    docx_path = root / "report.docx"
+    d = Document()
+    p = d.add_paragraph("Report Title")
+    p.style = d.styles["Title"]
+    d.save(str(docx_path))
+
+    # Minimal .xlsx (one sheet, one header row).
+    import openpyxl
+    xlsx_path = root / "data.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Data"
+    ws.append(["Order ID", "Customer"])
+    wb.save(str(xlsx_path))
+    wb.close()
+
     return root
 
 
@@ -81,6 +101,10 @@ class TestOrganize:
         assert (workspace / "Texts" / "b.txt").exists()
         # Junk deleted
         assert not (workspace / ".DS_Store").exists()
+        # New format files were also categorized (the scripted backend
+        # assigns every entry to "Texts", so they all land in the same dir).
+        assert (workspace / "Texts" / "report.docx").exists()
+        assert (workspace / "Texts" / "data.xlsx").exists()
         assert result.log_path is not None
         assert "Texts" in result.summary or "text-shaped" in result.summary
 
@@ -96,6 +120,8 @@ class TestOrganize:
         assert isinstance(plan, Plan)
         assert (workspace / "a.txt").exists()
         assert (workspace / ".DS_Store").exists()
+        assert (workspace / "report.docx").exists()
+        assert (workspace / "data.xlsx").exists()
         assert plan.log_path is not None
 
     def test_invalid_target_raises(self, workspace):
