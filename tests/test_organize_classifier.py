@@ -1288,25 +1288,62 @@ class TestStructuralSectionsRegressions:
         """Both files have hash filenames and topic-similar summaries.
         Only the sections list distinguishes them. The fake backend must
         follow the prompt's substring-overlap rule and route them to
-        DIFFERENT categories."""
+        DIFFERENT categories.
+
+        The pinned fixture text is run through extract_sections_from_text
+        at test time, so a regex change that alters its output also
+        changes what gets sent to Stage B — keeping the assertion honest.
+        """
+        from fda.organize._sections import extract_sections_from_text
         from fda.organize.classifier import _run_stage_b
 
-        # Per spec §7: pinned fixture text. The literal regex output
-        # was verified manually before writing this test (see Step 1).
+        simple_po = (
+            "Purchase Orders\n\n"
+            "Order ID: 10488\n"
+            "Order Date: 2024-03-15\n\n"
+            "Products:\n"
+            "  - Widget A x 5\n\n"
+            "Total: $1560.00\n"
+        )
+        detailed = (
+            "Order ID: 10488\n\n"
+            "Shipping Details:\n"
+            "  Frankenversand\n\n"
+            "Customer Details:\n"
+            "  Hanna Moos\n\n"
+            "Employee:\n"
+            "  Janet Leverling\n\n"
+            "Shipper:\n"
+            "  Speedy Express\n\n"
+            "Order Details:\n"
+            "  Date: 2024-03-15\n\n"
+            "Products:\n"
+            "  - Widget A x 5\n\n"
+            "Total: $1560.00\n"
+        )
+        simple_sections = extract_sections_from_text(simple_po)
+        detailed_sections = extract_sections_from_text(detailed)
+        # Pin the regex's current output. If extract_sections_from_text
+        # changes for this text, this assertion fires before the routing
+        # assertions further down — surfacing the real drift instead of
+        # silently exercising a different shape.
+        assert simple_sections == ("Products",)
+        assert detailed_sections == (
+            "Shipping Details", "Customer Details",
+            "Employee", "Shipper", "Order Details", "Products",
+        )
+
         entry_a = self._entry(
             path_id="f000",
             path="/tmp/0fa84d61b3158eaba46dee96.pdf",
-            sections=("Products",),  # from "Purchase Orders" doc text
+            sections=simple_sections,
             verbatim_head="Purchase Orders\n\nOrder ID: 10488",
             summary="order document",
         )
         entry_b = self._entry(
             path_id="f001",
             path="/tmp/7c2adef94015b1d65d2c8a3f.pdf",
-            sections=(  # from "Order ID: ... + Shipping Details + ..."
-                "Shipping Details", "Customer Details",
-                "Employee", "Shipper", "Order Details", "Products",
-            ),
+            sections=detailed_sections,
             verbatim_head="Order ID: 10488\n\nShipping Details:",
             summary="order document",
         )
