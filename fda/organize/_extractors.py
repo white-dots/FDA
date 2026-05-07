@@ -218,7 +218,14 @@ def _extract_xlsx(path: Path) -> ExtractionResult:
                 schema_seen[s] = None
                 schema_labels.append(s)
             text_parts.append(f"Sheet: {sheet_name}\n")
-            # Text-row serialization stub — Task 5 fills this in.
+            for row in ws.iter_rows(
+                values_only=True, max_row=_XLSX_TEXT_ROWS_PER_SHEET
+            ):
+                row_slice = list(row[:_XLSX_TEXT_COLS_PER_ROW])
+                cells_str = ["" if c is None else str(c) for c in row_slice]
+                while cells_str and cells_str[-1] == "":
+                    cells_str.pop()
+                text_parts.append("\t".join(cells_str) + "\n")
             text_parts.append("\n")
     finally:
         wb1.close()

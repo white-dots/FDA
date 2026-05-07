@@ -631,3 +631,77 @@ class TestXlsxSchema:
         # text contains the Sheet: <name> banners even when sheets are empty.
         assert "Sheet: S1" in r.text
         assert "Sheet: S2" in r.text
+
+
+class TestXlsxText:
+    def test_text_contains_tab_joined_rows(self, tmp_path):
+        from fda.organize import _extractors
+
+        f = tmp_path / "rows.xlsx"
+        _build_xlsx(f, [("Orders", [
+            ("Order ID", "Customer", "Amount"),
+            (1, "ACME", 100),
+            (2, "Globex", 200),
+        ])])
+        r = _extractors.extract(f)
+        assert "Sheet: Orders" in r.text
+        assert "Order ID\tCustomer\tAmount" in r.text
+        assert "1\tACME\t100" in r.text
+        assert "2\tGlobex\t200" in r.text
+
+    def test_text_caps_rows_per_sheet(self, tmp_path):
+        from fda.organize import _extractors
+
+        f = tmp_path / "tall.xlsx"
+        # 50 rows; cap is 20.
+        rows = [(f"row{i}",) for i in range(50)]
+        _build_xlsx(f, [("Tall", rows)])
+        r = _extractors.extract(f)
+        assert "row0" in r.text
+        assert "row19" in r.text
+        assert "row20" not in r.text
+
+    def test_text_caps_cols_per_row(self, tmp_path):
+        from fda.organize import _extractors
+
+        f = tmp_path / "wide.xlsx"
+        # 50 columns. _XLSX_TEXT_COLS_PER_ROW is 32.
+        wide_row = tuple(f"c{i}" for i in range(50))
+        _build_xlsx(f, [("Wide", [wide_row])])
+        r = _extractors.extract(f)
+        assert "c0" in r.text
+        assert "c31" in r.text
+        # Anything beyond column 31 (0-indexed) is dropped.
+        assert "c32" not in r.text
+        assert "c49" not in r.text
+
+    def test_trailing_empty_cells_trimmed(self, tmp_path):
+        from fda.organize import _extractors
+
+        f = tmp_path / "trail.xlsx"
+        # Row "A,B,None,None,None" — trailing Nones should be trimmed.
+        _build_xlsx(f, [("S", [("A", "B", None, None, None)])])
+        r = _extractors.extract(f)
+        # The serialized row is "A\tB\n", not "A\tB\t\t\t\n".
+        # Use \n to make the assertion robust to other rows being empty.
+        assert "A\tB\n" in r.text
+        # Negative: no run of trailing tabs on this row.
+        for line in r.text.splitlines():
+            if "A\tB" in line:
+                assert not line.endswith("\t")
+
+    def test_blank_line_between_sheets(self, tmp_path):
+        from fda.organize import _extractors
+
+        f = tmp_path / "two.xlsx"
+        _build_xlsx(f, [
+            ("S1", [("a",)]),
+            ("S2", [("b",)]),
+        ])
+        r = _extractors.extract(f)
+        # Each sheet's serialization ends with a "\n" separator after the
+        # last row, producing a literal blank line ("\n\n") before the next
+        # sheet's banner. Pin that — order alone wouldn't catch a regression
+        # that drops the trailing "\n".
+        assert "\n\nSheet: S2\n" in r.text
+        assert r.text.index("Sheet: S1") < r.text.index("Sheet: S2")
