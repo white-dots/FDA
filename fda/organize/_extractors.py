@@ -169,6 +169,80 @@ def _extract_docx(path: Path) -> ExtractionResult:
     )
 
 
+def _extract_xlsx(path: Path) -> ExtractionResult:
+    """Extract text + sections from an .xlsx workbook.
+
+    Two passes are required: pass 1 (data_only=True, read_only=True) for cached
+    values and the row-1 column headers; pass 2 (data_only=False, read_only=False)
+    for formula counts and merged-range counts. Workbook is NOT a context manager
+    in openpyxl 3.0.9 — close via try/finally.
+
+    Sections layout: schema labels first (Sheet:<name> + row-1 headers, in
+    workbook order, deduped, length-guarded, capped to
+    MAX_SECTIONS_PER_FILE - len(synthesized)), then synthesized labels in the
+    tail.
+
+    Text layout: per sheet, "Sheet: <name>\\n", then up to
+    _XLSX_TEXT_ROWS_PER_SHEET rows of \\t-joined cells (left-trimmed to
+    _XLSX_TEXT_COLS_PER_ROW), then a blank line. No extractor-side byte cap.
+    """
+    import openpyxl
+
+    # Pass 2 — formula counts, merged-range counts, formula-string lookup.
+    # Filled in Task 6; for this task we just do pass 1 and leave synthesized=[].
+    synthesized: list[str] = []
+
+    schema_labels: list[str] = []
+    schema_seen: dict[str, None] = {}
+    text_parts: list[str] = []
+
+    wb1 = openpyxl.load_workbook(path, data_only=True, read_only=True)
+    try:
+        for sheet_name in wb1.sheetnames:
+            ws = wb1[sheet_name]
+            sheet_label = f"Sheet:{sheet_name}"
+            if sheet_label not in schema_seen:
+                schema_seen[sheet_label] = None
+                schema_labels.append(sheet_label)
+            row1 = next(ws.iter_rows(values_only=True, max_row=1), ())
+            for v in row1:
+                if v is None:
+                    continue
+                s = " ".join(str(v).split())
+                if not s:
+                    continue
+                if not (SECTION_HEADER_MIN_CHARS <= len(s) <= SECTION_HEADER_MAX_CHARS):
+                    continue
+                if s in schema_seen:
+                    continue
+                schema_seen[s] = None
+                schema_labels.append(s)
+            text_parts.append(f"Sheet: {sheet_name}\n")
+            # Text-row serialization stub — Task 5 fills this in.
+            text_parts.append("\n")
+    finally:
+        wb1.close()
+
+    schema_cap = MAX_SECTIONS_PER_FILE - len(synthesized)
+    schema_capped = schema_labels[: max(0, schema_cap)]
+    # Final ordered-set pass over `schema_capped + synthesized` so a column
+    # header literally named "FormulaHeavy" or "MergedCells" doesn't appear
+    # twice when its synthesized counterpart triggers.
+    final_seen: dict[str, None] = {}
+    sections_list: list[str] = []
+    for label in schema_capped + synthesized:
+        if label not in final_seen:
+            final_seen[label] = None
+            sections_list.append(label)
+    sections = tuple(sections_list)
+
+    return ExtractionResult(
+        text="".join(text_parts),
+        status="ok",
+        sections=sections,
+    )
+
+
 EXTRACTORS: dict[str, TextExtractor] = {
     ".txt": _read_text,
     ".md": _read_text,
@@ -178,6 +252,7 @@ EXTRACTORS: dict[str, TextExtractor] = {
     ".xml": _read_text,
     ".pdf": _extract_pdf_text,
     ".docx": _extract_docx,
+    ".xlsx": _extract_xlsx,
 }
 
 

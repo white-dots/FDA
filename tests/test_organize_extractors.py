@@ -444,3 +444,190 @@ class TestDocxEdgeCases:
         assert r.status == "failed"
         assert r.text is None
         assert r.sections == ()
+
+
+# ---------------------------------------------------------------------------
+# .xlsx — sheet names + row-1 headers + synthesized purpose labels
+# ---------------------------------------------------------------------------
+
+
+def _build_xlsx(path, sheets):
+    """Build a minimal .xlsx at `path`.
+
+    sheets: list of (name, list-of-row-tuples). First entry replaces the
+    default sheet so we don't end up with a stray "Sheet" tab.
+    """
+    import openpyxl
+    wb = openpyxl.Workbook()
+    default = wb.active
+    if not sheets:
+        wb.save(str(path))
+        wb.close()
+        return
+    name, rows = sheets[0]
+    default.title = name
+    for row in rows:
+        default.append(list(row))
+    for name, rows in sheets[1:]:
+        ws = wb.create_sheet(title=name)
+        for row in rows:
+            ws.append(list(row))
+    wb.save(str(path))
+    wb.close()
+
+
+class TestXlsxSchema:
+    def test_single_sheet_with_headers(self, tmp_path):
+        from fda.organize import _extractors
+
+        f = tmp_path / "orders.xlsx"
+        _build_xlsx(f, [("Orders", [
+            ("Order ID", "Customer", "Amount"),
+            (1, "ACME", 100),
+        ])])
+        r = _extractors.extract(f)
+        assert r.status == "ok"
+        assert r.sections[:4] == ("Sheet:Orders", "Order ID", "Customer", "Amount")
+
+    def test_multi_sheet_workbook(self, tmp_path):
+        from fda.organize import _extractors
+
+        f = tmp_path / "multi.xlsx"
+        _build_xlsx(f, [
+            ("Orders", [("Order ID", "Customer")]),
+            ("Customers", [("Email", "Phone")]),
+        ])
+        r = _extractors.extract(f)
+        assert r.status == "ok"
+        # Workbook is well under MAX_SECTIONS_PER_FILE; assert the exact tuple
+        # so every header (Customer, Phone) is pinned, not just a subset.
+        assert r.sections == (
+            "Sheet:Orders", "Order ID", "Customer",
+            "Sheet:Customers", "Email", "Phone",
+        )
+
+    def test_duplicate_headers_across_sheets_deduped_in_first_seen_order(self, tmp_path):
+        """Spec line 92: ordered-set dedupe on schema labels. Two sheets
+        sharing a column name must only emit it once, in first-seen order."""
+        from fda.organize import _extractors
+
+        f = tmp_path / "dup_headers.xlsx"
+        _build_xlsx(f, [
+            ("S1", [("Customer", "Amount")]),
+            ("S2", [("Customer", "Region")]),  # "Customer" repeated
+        ])
+        r = _extractors.extract(f)
+        assert r.sections == (
+            "Sheet:S1", "Customer", "Amount",
+            "Sheet:S2", "Region",
+        )
+
+    def test_empty_cells_in_row1_skipped(self, tmp_path):
+        from fda.organize import _extractors
+
+        f = tmp_path / "sparse.xlsx"
+        # Use valid-length headers (>= SECTION_HEADER_MIN_CHARS=3); "A"/"C"
+        # would be silently dropped by the length guard.
+        _build_xlsx(f, [("Sheet1", [("Alpha", None, "Charlie")])])
+        r = _extractors.extract(f)
+        assert r.sections == ("Sheet:Sheet1", "Alpha", "Charlie")
+
+    def test_short_row1_value_filtered_by_min_chars(self, tmp_path):
+        from fda.organize import _extractors
+
+        f = tmp_path / "short_hdr.xlsx"
+        _build_xlsx(f, [("Sheet1", [("A", "Customer")])])
+        r = _extractors.extract(f)
+        # "A" is below SECTION_HEADER_MIN_CHARS (3); dropped.
+        assert "A" not in r.sections
+        assert "Customer" in r.sections
+
+    def test_long_row1_value_filtered_by_max_chars(self, tmp_path):
+        from fda.organize import _extractors
+
+        f = tmp_path / "long_hdr.xlsx"
+        long_hdr = "x" * 41  # exceeds SECTION_HEADER_MAX_CHARS
+        _build_xlsx(f, [("Sheet1", [(long_hdr, "Customer")])])
+        r = _extractors.extract(f)
+        assert long_hdr not in r.sections
+        assert "Customer" in r.sections
+
+    def test_sheet_with_no_row1_content(self, tmp_path):
+        from fda.organize import _extractors
+
+        f = tmp_path / "empty_sheet.xlsx"
+        _build_xlsx(f, [("Solo", [])])
+        r = _extractors.extract(f)
+        assert r.status == "ok"
+        assert r.sections == ("Sheet:Solo",)
+
+    def test_hidden_sheet_included(self, tmp_path):
+        from fda.organize import _extractors
+        import openpyxl
+
+        f = tmp_path / "hidden.xlsx"
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Visible"
+        ws.append(["A", "B"])
+        ws2 = wb.create_sheet("Secret")
+        ws2.sheet_state = "hidden"
+        ws2.append(["X", "Y"])
+        wb.save(str(f))
+        wb.close()
+
+        r = _extractors.extract(f)
+        assert "Sheet:Visible" in r.sections
+        assert "Sheet:Secret" in r.sections
+
+    def test_corrupt_xlsx_returns_failed(self, tmp_path):
+        from fda.organize import _extractors
+
+        f = tmp_path / "bad.xlsx"
+        f.write_bytes(b"not an xlsx")
+        r = _extractors.extract(f)
+        assert r.status == "failed"
+        assert r.text is None
+        assert r.sections == ()
+
+    def test_sheet_iteration_failure_fails_whole_file(self, tmp_path, monkeypatch):
+        """Spec line 109: 'Sheet-level exception during iteration → propagates
+        to outer try/except; one bad sheet fails the whole file rather than
+        producing partial state.' Patch openpyxl.load_workbook so its returned
+        Workbook's iter_rows raises mid-walk; assert extract() catches it via
+        its outer try/except and returns status='failed' with empty sections."""
+        from fda.organize import _extractors
+        import openpyxl
+
+        f = tmp_path / "boom.xlsx"
+        _build_xlsx(f, [("Orders", [("A", "B"), (1, 2)])])
+
+        original_load = openpyxl.load_workbook
+
+        def boom_iter_rows(*_args, **_kwargs):
+            raise RuntimeError("simulated sheet iteration failure")
+
+        def patched_load(path, **kwargs):
+            wb = original_load(path, **kwargs)
+            for ws in wb.worksheets:
+                ws.iter_rows = boom_iter_rows
+            return wb
+
+        monkeypatch.setattr(openpyxl, "load_workbook", patched_load)
+        r = _extractors.extract(f)
+        assert r.status == "failed"
+        assert r.text is None
+        assert r.sections == ()
+
+    def test_workbook_with_only_empty_sheets(self, tmp_path):
+        from fda.organize import _extractors
+
+        f = tmp_path / "all_empty.xlsx"
+        _build_xlsx(f, [("S1", []), ("S2", [])])
+        r = _extractors.extract(f)
+        assert r.status == "ok"
+        assert "Sheet:S1" in r.sections
+        assert "Sheet:S2" in r.sections
+        # text contains the Sheet: <name> banners even when sheets are empty.
+        assert "Sheet: S1" in r.text
+        assert "Sheet: S2" in r.text
