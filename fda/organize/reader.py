@@ -127,13 +127,19 @@ def _summarize_one(
         )
     except TimeoutError as e:
         return (
-            _fail_entry(path, size, extraction.status, str(e), verbatim_head=head),
+            _fail_entry(
+                path, size, extraction.status, str(e),
+                verbatim_head=head, sections=extraction.sections,
+            ),
             "timeout",
             str(e),
         )
     except Exception as e:  # noqa: BLE001 — never abort a run because one file fails
         return (
-            _fail_entry(path, size, extraction.status, str(e), verbatim_head=head),
+            _fail_entry(
+                path, size, extraction.status, str(e),
+                verbatim_head=head, sections=extraction.sections,
+            ),
             "fail",
             str(e),
         )
@@ -146,7 +152,7 @@ def _summarize_one(
         return (
             _fail_entry(
                 path, size, extraction.status, "unparseable summary",
-                verbatim_head=head,
+                verbatim_head=head, sections=extraction.sections,
             ),
             "fail",
             "unparseable summary",
@@ -164,6 +170,7 @@ def _summarize_one(
             summary_failed=False,
             extract_status=extraction.status,
             verbatim_head=head,
+            sections=extraction.sections,
         ),
         "done",
         "",
@@ -177,6 +184,7 @@ def _fail_entry(
     _why: str,
     *,
     verbatim_head: str = "",
+    sections: tuple[str, ...] = (),
 ) -> CatalogEntry:
     return CatalogEntry(
         path_id="",
@@ -189,6 +197,7 @@ def _fail_entry(
         summary_failed=True,
         extract_status=extract_status,
         verbatim_head=verbatim_head,
+        sections=sections,
     )
 
 
@@ -306,6 +315,7 @@ def read(
             summary_failed=e.summary_failed,
             extract_status=e.extract_status,
             verbatim_head=e.verbatim_head,
+            sections=e.sections,
         )
         for idx, e in enumerate(ordered)
     )

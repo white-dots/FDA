@@ -581,3 +581,111 @@ class TestVerbatimHead:
         e = catalog.entries[0]
         assert e.extract_status == "no_extractor"
         assert e.verbatim_head == ""
+
+
+# ---------------------------------------------------------------------------
+# sections: copied from ExtractionResult through Reader to CatalogEntry,
+# preserved across summarizer failure
+# ---------------------------------------------------------------------------
+
+
+class TestSectionsPropagation:
+    def test_populated_from_extracted_text(
+        self, workspace, fake_backend, logger
+    ):
+        """Reader copies extraction.sections into CatalogEntry.sections."""
+        from fda.organize import reader
+
+        body = (
+            "Order ID: 10488\n"
+            "\n"
+            "Shipping Details:\n"
+            "ACME Corp\n"
+            "\n"
+            "Customer Details:\n"
+            "Hanna Moos\n"
+        )
+        (workspace / "a.txt").write_text(body)
+        catalog = reader.read(workspace, backend=fake_backend, logger=logger)
+        e = catalog.entries[0]
+        assert e.sections == ("Shipping Details", "Customer Details")
+
+    def test_empty_when_extraction_returns_no_sections(
+        self, workspace, fake_backend, logger
+    ):
+        """A CSV (or any text without colon-headers / ALL-CAPS dividers)
+        yields sections=()."""
+        from fda.organize import reader
+
+        (workspace / "data.csv").write_text(
+            "customer_id,order_date\n1,2024-01-01\n"
+        )
+        catalog = reader.read(workspace, backend=fake_backend, logger=logger)
+        e = catalog.entries[0]
+        assert e.sections == ()
+
+    def test_preserved_through_summarizer_timeout(
+        self, workspace, logger, monkeypatch
+    ):
+        """Mirrors the existing verbatim_head preservation contract:
+        when the Haiku summarizer call times out, the deterministic
+        sections list is still attached to the failed CatalogEntry."""
+        from fda.organize import reader
+
+        body = (
+            "Shipping Details:\n"
+            "ACME Corp\n"
+            "\n"
+            "Customer Details:\n"
+            "Hanna Moos\n"
+        )
+        (workspace / "a.txt").write_text(body)
+
+        class TimeoutBackend:
+            def complete(self, **kwargs):
+                raise TimeoutError("simulated backend timeout")
+
+        catalog = reader.read(
+            workspace, backend=TimeoutBackend(), logger=logger,
+        )
+        e = catalog.entries[0]
+        assert e.summary_failed is True
+        assert e.sections == ("Shipping Details", "Customer Details")
+
+    def test_preserved_through_summarizer_exception(
+        self, workspace, logger
+    ):
+        from fda.organize import reader
+
+        body = "Shipping Details:\nProduct XYZ\n"
+        (workspace / "a.txt").write_text(body)
+
+        class BoomBackend:
+            def complete(self, **kwargs):
+                raise RuntimeError("boom")
+
+        catalog = reader.read(
+            workspace, backend=BoomBackend(), logger=logger,
+        )
+        e = catalog.entries[0]
+        assert e.summary_failed is True
+        assert e.sections == ("Shipping Details",)
+
+    def test_preserved_through_unparseable_summary(
+        self, workspace, logger
+    ):
+        from fda.organize import reader
+
+        body = "Shipping Details:\nProduct XYZ\n"
+        (workspace / "a.txt").write_text(body)
+
+        class GarbageBackend:
+            def complete(self, **kwargs):
+                return "this is not JSON"
+
+        catalog = reader.read(
+            workspace, backend=GarbageBackend(), logger=logger,
+        )
+        e = catalog.entries[0]
+        assert e.summary_failed is True
+        assert e.sections == ("Shipping Details",)
