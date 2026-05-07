@@ -128,10 +128,10 @@ class TestRegistryAdditions:
     def test_unregistered_extension_falls_back(self, tmp_path):
         from fda.organize import _extractors
 
-        p = tmp_path / "a.docx"
+        p = tmp_path / "a.zzz"
         p.write_bytes(b"\x00")
         # No registration -> no_extractor
-        assert ".docx" not in _extractors.EXTRACTORS
+        assert ".zzz" not in _extractors.EXTRACTORS
         r = _extractors.extract(p)
         assert r.status == "no_extractor"
 
@@ -245,3 +245,63 @@ class TestSectionsWiredIntoExtractors:
         result = _extract_pdf_text(f)
         assert result.status == "tool_missing"
         assert result.sections == ()
+
+
+# ---------------------------------------------------------------------------
+# .docx — heading styles drive sections; paragraphs+tables drive text
+# ---------------------------------------------------------------------------
+
+
+def _build_docx(path, *, paragraphs=None, table_cells=None):
+    """Build a minimal .docx at `path`.
+
+    paragraphs: list of (text, style_name|None). style_name=None uses default.
+    table_cells: list of list of strings (rows of cells), or None.
+    """
+    from docx import Document
+    paragraphs = paragraphs or []
+    doc = Document()
+    for body, style in paragraphs:
+        p = doc.add_paragraph(body)
+        if style is not None:
+            p.style = doc.styles[style]
+    if table_cells:
+        rows = len(table_cells)
+        cols = max((len(r) for r in table_cells), default=0)
+        if rows and cols:
+            t = doc.add_table(rows=rows, cols=cols)
+            for r, row in enumerate(table_cells):
+                for c, cell_text in enumerate(row):
+                    t.cell(r, c).text = cell_text
+    doc.save(str(path))
+
+
+class TestDocxHappyPath:
+    def test_headings_become_sections_in_document_order(self, tmp_path):
+        from fda.organize import _extractors
+
+        f = tmp_path / "doc.docx"
+        _build_docx(f, paragraphs=[
+            ("Quarterly Report", "Title"),
+            ("Executive Summary", "Heading 1"),
+            ("Findings", "Heading 2"),
+            ("body text here", None),
+        ])
+        r = _extractors.extract(f)
+        assert r.status == "ok"
+        assert r.sections == ("Quarterly Report", "Executive Summary", "Findings")
+        # text contains every paragraph body, joined by newlines.
+        assert "Quarterly Report" in r.text
+        assert "body text here" in r.text
+
+    def test_title_alone_captured(self, tmp_path):
+        from fda.organize import _extractors
+
+        f = tmp_path / "title_only.docx"
+        _build_docx(f, paragraphs=[
+            ("My Document", "Title"),
+            ("body", None),
+        ])
+        r = _extractors.extract(f)
+        assert r.status == "ok"
+        assert r.sections == ("My Document",)

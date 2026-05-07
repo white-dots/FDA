@@ -14,6 +14,7 @@ unknown extensions.
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import time
@@ -21,7 +22,12 @@ from pathlib import Path
 from typing import Callable
 
 from fda.organize.models import ExtractionResult
-from fda.organize._sections import extract_sections_from_text
+from fda.organize._sections import (
+    MAX_SECTIONS_PER_FILE,
+    SECTION_HEADER_MAX_CHARS,
+    SECTION_HEADER_MIN_CHARS,
+    extract_sections_from_text,
+)
 
 TextExtractor = Callable[[Path], ExtractionResult]
 
@@ -38,6 +44,8 @@ _XLSX_TEXT_COLS_PER_ROW = 32
 # Synthesized-label thresholds.
 _XLSX_FORMULA_DENSITY_THRESHOLD = 0.05
 _XLSX_MERGED_CELLS_MIN = 3
+
+_DOCX_HEADING_RE = re.compile(r"^Heading [1-9]$")
 
 
 def _which(name: str) -> str | None:
@@ -114,6 +122,53 @@ def _extract_pdf_text(path: Path) -> ExtractionResult:
     )
 
 
+def _extract_docx(path: Path) -> ExtractionResult:
+    """Extract text + heading-style sections from a .docx file.
+
+    Sections: paragraphs whose style name is "Title" or matches "Heading [1-9]",
+    in document order, deduped, length-guarded, capped at MAX_SECTIONS_PER_FILE.
+
+    Text: every paragraph body plus every table cell body, joined by "\n".
+    No extractor-side byte cap — Reader owns the 64 KiB contract cap.
+    """
+    from docx import Document
+
+    doc = Document(str(path))
+    sections: list[str] = []
+    seen: dict[str, None] = {}
+    text_parts: list[str] = []
+
+    for p in doc.paragraphs:
+        body = p.text
+        if body:
+            text_parts.append(body)
+        if len(sections) >= MAX_SECTIONS_PER_FILE:
+            continue
+        style_name = getattr(p.style, "name", "") or ""
+        if style_name != "Title" and not _DOCX_HEADING_RE.match(style_name):
+            continue
+        label = " ".join(body.split())
+        if not (SECTION_HEADER_MIN_CHARS <= len(label) <= SECTION_HEADER_MAX_CHARS):
+            continue
+        if label in seen:
+            continue
+        seen[label] = None
+        sections.append(label)
+
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                cell_text = cell.text
+                if cell_text:
+                    text_parts.append(cell_text)
+
+    return ExtractionResult(
+        text="\n".join(text_parts),
+        status="ok",
+        sections=tuple(sections),
+    )
+
+
 EXTRACTORS: dict[str, TextExtractor] = {
     ".txt": _read_text,
     ".md": _read_text,
@@ -122,6 +177,7 @@ EXTRACTORS: dict[str, TextExtractor] = {
     ".json": _read_text,
     ".xml": _read_text,
     ".pdf": _extract_pdf_text,
+    ".docx": _extract_docx,
 }
 
 
