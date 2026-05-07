@@ -186,7 +186,7 @@ Expected: FAIL — `r.status == "no_extractor"` (no `.pptx` in the dispatch tabl
 
 - [ ] **Step 3: Implement `_extract_pptx` skeleton with sections only**
 
-Edit `fda/organize/_extractors.py`. Add the new function below `_extract_xlsx` (after the `wb1.close()` block ends, around line 295):
+Edit `fda/organize/_extractors.py`. Add the new function below `_extract_xlsx` (after the `return ExtractionResult(...)` at the end of `_extract_xlsx`, around line 295):
 
 ```python
 def _extract_pptx(path: Path) -> ExtractionResult:
@@ -198,7 +198,8 @@ def _extract_pptx(path: Path) -> ExtractionResult:
 
     Text: per slide, "Slide N: <title>\\n" banner + shape text from every
     text-bearing shape + speaker notes (when present, with all guards).
-    No extractor-side byte cap — Reader owns the 64 KiB contract cap.
+    Banner omits title when title fails the length guard or is empty after
+    trim. No extractor-side byte cap — Reader owns the 64 KiB contract cap.
     """
     from pptx import Presentation
 
@@ -212,20 +213,18 @@ def _extract_pptx(path: Path) -> ExtractionResult:
             break
 
         title_shape = slide.shapes.title
-        title_text = ""
+        title_for_banner = ""  # set ONLY when title passes length guard
         if title_shape is not None:
             raw = title_shape.text or ""
-            title_text = " ".join(raw.split())
-            if (
-                SECTION_HEADER_MIN_CHARS <= len(title_text) <= SECTION_HEADER_MAX_CHARS
-                and title_text not in seen
-                and len(sections) < MAX_SECTIONS_PER_FILE
-            ):
-                seen[title_text] = None
-                sections.append(title_text)
+            candidate = " ".join(raw.split())
+            if SECTION_HEADER_MIN_CHARS <= len(candidate) <= SECTION_HEADER_MAX_CHARS:
+                title_for_banner = candidate
+                if candidate not in seen and len(sections) < MAX_SECTIONS_PER_FILE:
+                    seen[candidate] = None
+                    sections.append(candidate)
 
-        if title_text:
-            text_parts.append(f"Slide {slide_idx}: {title_text}\n")
+        if title_for_banner:
+            text_parts.append(f"Slide {slide_idx}: {title_for_banner}\n")
         else:
             text_parts.append(f"Slide {slide_idx}:\n")
 
@@ -274,12 +273,14 @@ git commit -m "organize(extractors): _extract_pptx slide-title sections"
 
 ---
 
-## Task 3: `_extract_pptx` sections edge cases — length guards, no-title slides, MAX cap
+## Task 3: `_extract_pptx` sections — regression coverage for length guards, no-title slides, MAX cap, and banner-omission
+
+**Note on TDD discipline:** Task 2's implementation already satisfies the length-guard, dedupe, MAX-cap, and banner-omission contracts (the implementation was written to spec, not bare-minimum-to-pass). Task 3 is **regression coverage** — it locks the contracts in tests so future refactors can't quietly violate them. The tests in this task are expected to PASS the first time they run.
 
 **Files:**
-- Modify: `tests/test_organize_extractors.py` (extend `TestPptxSections` with edge cases)
+- Modify: `tests/test_organize_extractors.py` (extend `TestPptxSections` with regression cases)
 
-- [ ] **Step 1: Append edge-case tests to `TestPptxSections`**
+- [ ] **Step 1: Append regression tests to `TestPptxSections`**
 
 Add these methods inside the existing `TestPptxSections` class:
 
@@ -304,18 +305,26 @@ Add these methods inside the existing `TestPptxSections` class:
         _build_pptx(p, slides=[{"title": "OK"}, {"title": "Real Title"}])
         r = _extractors.extract(p)
         assert r.sections == ("Real Title",)
+        # Banner must NOT include the guard-failing title (spec: "If title
+        # fails the length guard, append `Slide N:\n` with no title").
+        assert "Slide 1: OK" not in r.text
+        assert "Slide 1:\n" in r.text
 
     def test_long_title_filtered_by_max_chars(self, tmp_path):
         from fda.organize import _extractors
 
         p = tmp_path / "long.pptx"
         # 41 chars > SECTION_HEADER_MAX_CHARS (40)
+        long_title = "x" * 41
         _build_pptx(p, slides=[
-            {"title": "x" * 41},
+            {"title": long_title},
             {"title": "Kept"},
         ])
         r = _extractors.extract(p)
         assert r.sections == ("Kept",)
+        # Banner must NOT include the guard-failing title.
+        assert long_title not in r.text
+        assert "Slide 1:\n" in r.text
 
     def test_whitespace_only_title_filtered(self, tmp_path):
         from fda.organize import _extractors
@@ -353,10 +362,10 @@ Add these methods inside the existing `TestPptxSections` class:
         assert r.text == ""
 ```
 
-- [ ] **Step 2: Run the new tests to verify they pass**
+- [ ] **Step 2: Run the new tests**
 
 Run: `/Users/john/.pyenv/versions/3.12.8/bin/python -m pytest tests/test_organize_extractors.py::TestPptxSections -v`
-Expected: PASS (9 tests total — 3 from Task 2 + 6 new).
+Expected: PASS (9 tests total — 3 from Task 2 + 6 new). If any test fails, the Task 2 implementation deviated from the spec — fix the implementation, do not loosen the test.
 
 - [ ] **Step 3: Run the full suite**
 
@@ -446,20 +455,18 @@ Edit `fda/organize/_extractors.py`. Inside the existing `_extract_pptx` slide lo
             break
 
         title_shape = slide.shapes.title
-        title_text = ""
+        title_for_banner = ""
         if title_shape is not None:
             raw = title_shape.text or ""
-            title_text = " ".join(raw.split())
-            if (
-                SECTION_HEADER_MIN_CHARS <= len(title_text) <= SECTION_HEADER_MAX_CHARS
-                and title_text not in seen
-                and len(sections) < MAX_SECTIONS_PER_FILE
-            ):
-                seen[title_text] = None
-                sections.append(title_text)
+            candidate = " ".join(raw.split())
+            if SECTION_HEADER_MIN_CHARS <= len(candidate) <= SECTION_HEADER_MAX_CHARS:
+                title_for_banner = candidate
+                if candidate not in seen and len(sections) < MAX_SECTIONS_PER_FILE:
+                    seen[candidate] = None
+                    sections.append(candidate)
 
-        if title_text:
-            text_parts.append(f"Slide {slide_idx}: {title_text}\n")
+        if title_for_banner:
+            text_parts.append(f"Slide {slide_idx}: {title_for_banner}\n")
         else:
             text_parts.append(f"Slide {slide_idx}:\n")
 
@@ -529,27 +536,38 @@ class TestPptxNotes:
         assert truncated in r.text
         assert long_notes not in r.text
 
-    def test_no_notes_no_side_effect(self, tmp_path):
-        """Critical: extracting from a deck with no notes must NOT cause
-        slide.notes_slide to be created on disk."""
+    def test_no_notes_does_not_access_notes_slide(self, tmp_path, monkeypatch):
+        """Critical: extracting from a deck with no notes must NOT touch
+        slide.notes_slide at all — accessing it has a creation side effect.
+
+        The extractor does not save the in-memory presentation back to disk,
+        so a round-trip read-back wouldn't catch the violation. Instead,
+        monkeypatch Slide.notes_slide to raise on access. If the extractor
+        accidentally accesses it (i.e., violates the has_notes_slide gate),
+        the property will raise and bubble up as status='failed'."""
         from fda.organize import _extractors
-        from pptx import Presentation
+        from pptx.slide import Slide
 
         p = tmp_path / "no_notes.pptx"
         _build_pptx(p, slides=[{"title": "T"}])  # no `notes` key
-        # Sanity check: the deck on disk has no notes slide before extraction.
-        prs_before = Presentation(str(p))
-        assert prs_before.slides[0].has_notes_slide is False
+
+        def _no_access(self):
+            raise AssertionError(
+                "extractor accessed slide.notes_slide on a no-notes slide "
+                "without gating on has_notes_slide"
+            )
+
+        monkeypatch.setattr(Slide, "notes_slide", property(_no_access))
 
         r = _extractors.extract(p)
-        assert r.status == "ok"
+        # Status must be ok — the extractor walked the slide without ever
+        # touching the patched property. If the extractor accessed it,
+        # AssertionError is caught by extract()'s outer try/except and the
+        # violation message ends up in r.note.
+        assert r.status == "ok", (
+            f"extractor accessed notes_slide without guard: r.note={r.note!r}"
+        )
         assert "Notes:" not in r.text
-
-        # Re-open after extraction; assert notes slide was NOT created.
-        # (Extraction does not write back to disk, but this also catches any
-        # accidental in-process mutation that could leak to a future writer.)
-        prs_after = Presentation(str(p))
-        assert prs_after.slides[0].has_notes_slide is False
 
     def test_whitespace_only_notes_skipped(self, tmp_path):
         """PowerPoint commonly creates notes slides containing only a stray
@@ -613,20 +631,18 @@ The full slide-loop body, in its final form, is now:
             break
 
         title_shape = slide.shapes.title
-        title_text = ""
+        title_for_banner = ""
         if title_shape is not None:
             raw = title_shape.text or ""
-            title_text = " ".join(raw.split())
-            if (
-                SECTION_HEADER_MIN_CHARS <= len(title_text) <= SECTION_HEADER_MAX_CHARS
-                and title_text not in seen
-                and len(sections) < MAX_SECTIONS_PER_FILE
-            ):
-                seen[title_text] = None
-                sections.append(title_text)
+            candidate = " ".join(raw.split())
+            if SECTION_HEADER_MIN_CHARS <= len(candidate) <= SECTION_HEADER_MAX_CHARS:
+                title_for_banner = candidate
+                if candidate not in seen and len(sections) < MAX_SECTIONS_PER_FILE:
+                    seen[candidate] = None
+                    sections.append(candidate)
 
-        if title_text:
-            text_parts.append(f"Slide {slide_idx}: {title_text}\n")
+        if title_for_banner:
+            text_parts.append(f"Slide {slide_idx}: {title_for_banner}\n")
         else:
             text_parts.append(f"Slide {slide_idx}:\n")
 
@@ -672,12 +688,14 @@ git commit -m "organize(extractors): pptx speaker notes with has_notes_slide gua
 
 ---
 
-## Task 6: `_extract_pptx` — slide and shape caps + corrupt-file failure path
+## Task 6: `_extract_pptx` — regression coverage for slide/shape caps and corrupt-file failure path
+
+**Note on TDD discipline:** The slide cap (`_PPTX_SLIDES_MAX`) was implemented in Task 2 and the shape cap (`_PPTX_SHAPES_PER_SLIDE_MAX`) in Task 4. The corrupt-file path is already covered by the outer `extract()` try/except (existing `TestExtractorFailureIsolation` proves the mechanism). This task adds **regression coverage** that locks the cap contracts and the corrupt-pptx code path explicitly so future refactors can't violate them. The tests are expected to PASS the first time they run.
 
 **Files:**
-- Modify: `tests/test_organize_extractors.py` (new `TestPptxCaps` and `TestPptxFailure` classes — caps already enforced by code from Tasks 2–5; this task locks the contracts in tests)
+- Modify: `tests/test_organize_extractors.py` (new `TestPptxCaps` and `TestPptxFailure` classes)
 
-- [ ] **Step 1: Write the failing tests (caps + corrupt file)**
+- [ ] **Step 1: Write the regression tests (caps + corrupt file)**
 
 Append to `tests/test_organize_extractors.py`:
 
@@ -737,9 +755,7 @@ class TestPptxFailure:
 - [ ] **Step 2: Run the new tests**
 
 Run: `/Users/john/.pyenv/versions/3.12.8/bin/python -m pytest tests/test_organize_extractors.py::TestPptxCaps tests/test_organize_extractors.py::TestPptxFailure -v`
-Expected: PASS (3 tests). The caps were implemented in Tasks 2 and 4; this task adds explicit regression coverage. The corrupt path is caught by the outer `extract()` try/except.
-
-If any test fails, the cap implementation needs to be re-checked against the spec — do **not** loosen the test; fix the code.
+Expected: PASS (3 tests). If any test fails, the Task 2/4 implementation deviated from the spec — fix the implementation, do not loosen the test.
 
 - [ ] **Step 3: Run the full suite**
 
