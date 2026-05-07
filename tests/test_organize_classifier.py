@@ -1050,7 +1050,7 @@ class TestSamplingShapeBudget:
         assert TAXONOMY_SAMPLE_SHAPE_BUDGET == 10
 
     def test_rare_shapes_reserved_in_sample(self):
-        """Construct a 200-entry catalog with 6 distinct sections-shapes,
+        """Construct a 196-entry catalog with 6 distinct sections-shapes,
         most concentrated in the dominant shape. The new shape-budget
         rule should reserve at least one entry per distinct shape, up
         to TAXONOMY_SAMPLE_SHAPE_BUDGET.
@@ -1100,7 +1100,9 @@ class TestSamplingShapeBudget:
         # leaving room to hit all three even-indexed rare shapes.
         # Only step 2b's per-shape budget can guarantee all 6 shapes
         # appear in the sample. Delete step 2b in classifier.py and
-        # this test fails (4 shapes in sample, not 6).
+        # this test fails (3 shapes in sample, not 6 — step 6's
+        # 96th stride-2 iteration is skipped by the chosen-budget
+        # cap, so f195/shape 5 never lands).
         entries = [_e(i, shapes[0]) for i in range(191)]
         for s_idx, shape in enumerate(shapes[1:], start=1):
             entries.append(_e(190 + s_idx, shape))
