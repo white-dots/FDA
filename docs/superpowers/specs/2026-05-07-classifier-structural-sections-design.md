@@ -97,7 +97,7 @@ import re
 MAX_SECTIONS_PER_FILE = 15
 SECTION_HEADER_MIN_CHARS = 3
 SECTION_HEADER_MAX_CHARS = 40
-SECTION_SCAN_BYTES = 16 * 1024   # only scan first ~16 KB; structure tops most docs
+SECTION_SCAN_CHARS = 16 * 1024   # only scan first ~16 K characters; structure tops most docs
 
 # Pattern A: line that is *just* a section header followed by a colon.
 #   "Shipping Details:" / "Bill To:" / "Order Details:"
@@ -124,7 +124,7 @@ def extract_sections_from_text(text: str) -> tuple[str, ...]:
     """
     if not text:
         return ()
-    head = text[:SECTION_SCAN_BYTES]
+    head = text[:SECTION_SCAN_CHARS]
     seen: dict[str, None] = {}   # ordered set
     for line in head.splitlines():
         for rx in (_HEADER_LINE_RE, _ALLCAPS_LINE_RE):
@@ -296,7 +296,7 @@ The structural step sits between filename and prose because it is more reliable 
 - `tests/test_organize_constraints.py` — extend `CONSTS` with the new tunables:
   - `"MAX_SECTIONS_PER_FILE": ("_sections.py", "15")`
   - `"SECTION_HEADER_MAX_CHARS": ("_sections.py", "40")`
-  - `"SECTION_SCAN_BYTES": ("_sections.py", "16 * 1024")`
+  - `"SECTION_SCAN_CHARS": ("_sections.py", "16 * 1024")`
   - `"TAXONOMY_SAMPLE_SHAPE_BUDGET": ("classifier.py", "10")`
   - `SECTION_HEADER_MIN_CHARS = 3` — value `3` is too generic for a literal-uniqueness check; rely on the named-constant-defined check only (same exception we made for `VERBATIM_HEAD_CHARS = 300`). Per Codex review #5, do **not** add `15` or `40` to `DISTINCTIVE_LITERALS` either — they are too generic and risk false-positives elsewhere in the package.
 
@@ -337,7 +337,7 @@ In `fda/organize/_sections.py`, single home, covered by `tests/test_organize_con
 - `MAX_SECTIONS_PER_FILE = 15`
 - `SECTION_HEADER_MIN_CHARS = 3`
 - `SECTION_HEADER_MAX_CHARS = 40`
-- `SECTION_SCAN_BYTES = 16 * 1024`
+- `SECTION_SCAN_CHARS = 16 * 1024`
 
 In `fda/organize/classifier.py`:
 
@@ -389,8 +389,8 @@ Each format's `sections` extraction is best-effort: if the underlying library or
 - **Regex over-matches.** A line like `Note:` or `Re:` could be picked up as a section. Mitigation: the prompt instructs the model to weigh `sections` against `summary` and category criteria, not to trust structure alone. If over-match becomes a frequent problem, tighten the regex (require ≥2 words, or require non-content-line context). Cheap to iterate.
 - **Regex under-matches.** PDFs where headers don't follow the colon/ALL-CAPS conventions (e.g., headers in a distinct font but not punctuated) won't match. Mitigation: this regression is no worse than today; `summary` and `verbatim_head` continue to do their job. The structural channel is additive, never subtractive.
 - **Garbage extraction → garbage sections.** If `pdftotext` produces noise, the regex will match noise. Mitigation: noise rarely matches the `[A-Z]…:$` pattern, so empirically the list stays short or empty. Worst case: a few junk labels per file, which the model can ignore by cross-referencing `summary`.
-- **Regex too aggressive at scanning.** `SECTION_SCAN_BYTES = 16 KB` bounds the scan; even pathological 100-MB plaintext logs cost only the regex on the first 16 KB.
-- **Token cost at scale.** Stage A: ~10 KB of extra payload per run (~2.5K tokens) — one call. Stage B: ~250K tokens distributed across batches at typical 5 sections/file × 10K files (upper bound ~750K tokens at the cap). Modest. If it becomes a concern, drop `MAX_SECTIONS_PER_FILE` to 10 or `SECTION_SCAN_BYTES` to 8 KB — both isolated changes.
+- **Regex too aggressive at scanning.** `SECTION_SCAN_CHARS = 16384` (characters, not bytes — for non-ASCII text the actual byte size is larger) bounds the scan; even pathological 100-MB plaintext logs cost only the regex on the first ~16 K characters of decoded text.
+- **Token cost at scale.** Stage A: ~10 KB of extra payload per run (~2.5K tokens) — one call. Stage B: ~250K tokens distributed across batches at typical 5 sections/file × 10K files (upper bound ~750K tokens at the cap). Modest. If it becomes a concern, drop `MAX_SECTIONS_PER_FILE` to 10 or `SECTION_SCAN_CHARS` to 8192 — both isolated changes.
 - **Future-format extractors lie about structure.** Same risk profile as today's `pdftotext` failures. The catalog entry simply gets an empty `sections`; the model falls back to existing signals.
 
 ## Backward compatibility
@@ -413,7 +413,7 @@ Each format's `sections` extraction is best-effort: if the underlying library or
 9. `fda/organize/classifier.py` + `taxonomy-proposer/SKILL.md`: Stage A payload + sampling-shape budget + prompt update (structural fingerprint signal + structural-criteria requirement). Add `TAXONOMY_SAMPLE_SHAPE_BUDGET = 10` constant.
 10. `fda/organize/classifier.py` + `taxonomy-assigner/SKILL.md`: Stage B payload + prompt update with the renumbered priority hierarchy and `extract_status`-aware fallback.
 11. `tests/test_organize_classifier.py`: four regression cases (Stage B structural-conflict with pinned fixture text, Stage B empty-sections-by-extract_status, Stage A structural-diversity + sampling budget, filename-vs-sections conflict).
-12. `tests/test_organize_constraints.py`: extend `CONSTS` with `MAX_SECTIONS_PER_FILE`, `SECTION_HEADER_MAX_CHARS`, `SECTION_SCAN_BYTES` (in `_sections.py`) and `TAXONOMY_SAMPLE_SHAPE_BUDGET` (in `classifier.py`).
+12. `tests/test_organize_constraints.py`: extend `CONSTS` with `MAX_SECTIONS_PER_FILE`, `SECTION_HEADER_MAX_CHARS`, `SECTION_SCAN_CHARS` (in `_sections.py`) and `TAXONOMY_SAMPLE_SHAPE_BUDGET` (in `classifier.py`).
 13. Manual validation against the Northwind fixture.
 
 Each step is one commit; pre-commit hook enforces the test suite.
