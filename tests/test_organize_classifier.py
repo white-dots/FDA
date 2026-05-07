@@ -1020,7 +1020,7 @@ class TestSectionsWireFormat:
                     category_name="Shipping-Orders",
                     subpath="Shipping",
                     description="Detailed shipping docs",
-                    criteria="Documents with Shipping Details, Customer Details, and Shipper section.",
+                    criteria="Documents with Shipping Details, Customer Details, and Shipper sections.",
                 ),
             ),
             fallback_category=TaxonomyCategory(
