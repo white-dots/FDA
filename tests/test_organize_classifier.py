@@ -1201,9 +1201,6 @@ class TestStructuralSectionsRegressions:
         embedded 16+ hex substrings by coincidence. This mirrors the
         intent of the prompt's "long hex string" wording.
         """
-        import json
-        import re
-
         # Anchored: full basename must be hex stem + extension.
         HASH_BASENAME_RE = re.compile(
             r"^[0-9a-f]{16,}\.[a-z0-9]+$", re.IGNORECASE,
@@ -1224,6 +1221,7 @@ class TestStructuralSectionsRegressions:
                     path = entry["path"]
                     basename = path.rsplit("/", 1)[-1]
                     sections = entry["sections"]   # contract assertion
+                    assert entry["extract_status"] in ("ok", "no_extractor", "tool_missing", "failed"), entry
                     extract_status = entry["extract_status"]
                     verbatim = entry["verbatim_head"]
                     summary = entry["summary"]
