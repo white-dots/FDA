@@ -85,6 +85,7 @@ class CatalogEntry:
     summary_failed: bool
     extract_status: ExtractStatus
     verbatim_head: str = ""
+    sections: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

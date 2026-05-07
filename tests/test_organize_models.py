@@ -259,3 +259,38 @@ class TestExtractionResultSections:
             sections=("Shipping Details", "Customer Details"),
         )
         assert r.sections == ("Shipping Details", "Customer Details")
+
+
+class TestCatalogEntrySections:
+    def test_default_is_empty_tuple(self):
+        from fda.organize.models import CatalogEntry
+
+        e = CatalogEntry(
+            path_id="f000",
+            path="/tmp/a.txt",
+            ext=".txt",
+            size_bytes=10,
+            summary="text",
+            type_label="text",
+            is_junk=False,
+            summary_failed=False,
+            extract_status="ok",
+        )
+        assert e.sections == ()
+
+    def test_accepts_explicit_value(self):
+        from fda.organize.models import CatalogEntry
+
+        e = CatalogEntry(
+            path_id="f000",
+            path="/tmp/a.txt",
+            ext=".txt",
+            size_bytes=10,
+            summary="text",
+            type_label="text",
+            is_junk=False,
+            summary_failed=False,
+            extract_status="ok",
+            sections=("Shipping Details", "Products"),
+        )
+        assert e.sections == ("Shipping Details", "Products")
