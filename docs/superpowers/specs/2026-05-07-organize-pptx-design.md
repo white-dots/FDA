@@ -26,8 +26,8 @@ For `.pptx`, `sections` is the ordered list of slide titles read from the title 
 Faithful extension of the v1 docx/xlsx format-onboarding pattern: one extractor function per format, registered in the `EXTRACTORS` dict. No new modules, no protocol abstraction, no rewrite of existing extractors.
 
 **Files touched:**
-- `pyproject.toml` — add `python-pptx>=1.0.2` as a required runtime dependency. (Older `0.6.x` line predates a `collections.abc` fix that matters under our Python 3.9+ floor.)
-- `fda/organize/_extractors.py` — add `_extract_pptx`; register `.pptx` in `EXTRACTORS`; add three new pptx-specific constants. Existing extractors and constants are untouched.
+- `pyproject.toml` — add `python-pptx>=1.0.2` as a required runtime dependency. (1.0.2 is the current stable release on the actively-maintained 1.0.x line, validated against the project's Python 3.12 pyenv target.)
+- `fda/organize/_extractors.py` — add `_extract_pptx`; register `".pptx": _extract_pptx` in `EXTRACTORS` immediately after the `".xlsx": _extract_xlsx` entry; add three new pptx-specific constants. Existing extractors and constants are untouched.
 - `tests/test_organize_extractors.py` — synthetic in-test fixtures and case coverage.
 - `tests/test_organize_reader.py` — reader passes `sections` through for pptx (parallel to existing PDF/text/docx/xlsx coverage).
 - `tests/test_organize_constraints.py` — register the three new constants in the CONSTS check.
@@ -51,8 +51,8 @@ Loader: `pptx.Presentation(str(path))`.
 
 **`sections`** — slide titles in slide order:
 - Iterate `presentation.slides`, capped at `_PPTX_SLIDES_MAX`.
-- Per slide: read `slide.shapes.title` if present (the placeholder is `None` when the slide layout has no title placeholder, or when the title placeholder exists but holds no text frame).
-- Extract the title text via `title.text_frame.text` (or `title.text`, whichever is the supported python-pptx accessor on the targeted version).
+- Per slide: read `slide.shapes.title` if present (returns `None`, does not raise, when the slide layout has no title placeholder).
+- Extract the title text via `title.text` (which is defined as `self.text_frame.text` in the python-pptx public API — these are identical, and `title.text` is the canonical short form).
 - Trim whitespace; collapse internal whitespace via `" ".join(s.split())`.
 - Apply both length guards from `_sections.py`: `SECTION_HEADER_MIN_CHARS` (3) ≤ `len(label)` ≤ `SECTION_HEADER_MAX_CHARS` (40). Drop labels that fall outside.
 - Preserve slide order; dedupe via ordered-set pattern (parallel to `_sections.py` and `_extract_docx`).
@@ -63,7 +63,7 @@ Loader: `pptx.Presentation(str(path))`.
 - Per slide (still capped at `_PPTX_SLIDES_MAX`):
   - Append `f"Slide {n}: {title_text}\n"` banner where `n` is 1-indexed slide number. If no title (or title fails the length guard / is empty after trim), append `f"Slide {n}:\n"` with no title.
   - Iterate `slide.shapes`, capped at `_PPTX_SHAPES_PER_SLIDE_MAX`. For each shape with `shape.has_text_frame`: append `shape.text_frame.text` if non-empty, then `\n`. (Title placeholder text will appear both in the banner and again as a shape; this duplication is acceptable — the banner makes slide order legible, the shape pass keeps the iteration uniform.)
-  - If `slide.has_notes_slide` (gated, no side effect): append `"Notes: "` + `slide.notes_slide.notes_text_frame.text[:_PPTX_NOTES_CHARS_PER_SLIDE_MAX]` + `\n`. Never access `slide.notes_slide` without the `has_notes_slide` guard.
+  - If `slide.has_notes_slide` (gated, no side effect): obtain `notes_tf = slide.notes_slide.notes_text_frame`. If `notes_tf is not None` (the notes placeholder can be removed from the notes slide layout even when the notes slide itself exists, in which case `notes_text_frame` is `None`), read `notes_text = notes_tf.text`. If `notes_text.strip()` is non-empty (PowerPoint commonly creates notes slides containing only a stray newline), append `"Notes: " + notes_text[:_PPTX_NOTES_CHARS_PER_SLIDE_MAX] + "\n"`. Never access `slide.notes_slide` without the `has_notes_slide` guard.
   - Trailing blank line between slides for readability.
 - No extractor-side byte cap. Reader applies `READER_TEXT_CAP_BYTES`. The three caps above bound in-process memory while building the string.
 - Drives `verbatim_head` (first 300 chars seen by classifier) + Haiku summary.
@@ -112,6 +112,8 @@ Synthetic fixtures generated in-test via `python-pptx` (no binary fixtures check
 - Speaker notes present → included in `text`, prefixed `Notes: `.
 - Speaker notes longer than `_PPTX_NOTES_CHARS_PER_SLIDE_MAX` → truncated to that cap.
 - Slide with `has_notes_slide=False` → no `Notes:` line; **regression test**: re-open the saved file with `Presentation(...)` and assert `slide.has_notes_slide` is still `False` (proves we didn't trigger the creation side effect).
+- Slide where `has_notes_slide=True` but `notes_text_frame is None` (notes slide exists, notes placeholder removed from its layout) → no `Notes:` line, no exception.
+- Slide where notes text is whitespace-only (e.g., a lone `"\n"`) → no `Notes:` line emitted (would otherwise produce a spurious `Notes: \n`).
 - Empty deck (no slides) → `text=""`, `sections=()`, `status="ok"`.
 - Corrupt file (bytes that aren't a pptx) → `status="failed"`.
 
