@@ -1181,3 +1181,55 @@ class TestPptxNotes:
         r = _extractors.extract(p)
         assert r.status == "ok"
         assert "Notes:" not in r.text
+
+
+class TestPptxCaps:
+    def test_slides_beyond_cap_not_in_text(self, tmp_path):
+        from fda.organize import _extractors
+        from fda.organize._extractors import _PPTX_SLIDES_MAX
+
+        p = tmp_path / "many_slides.pptx"
+        # Build _PPTX_SLIDES_MAX + 3 slides, each with a unique body shape.
+        slide_specs = [
+            {"title": None, "layout": 6, "body_shapes": [f"BODY_{i}"]}
+            for i in range(_PPTX_SLIDES_MAX + 3)
+        ]
+        _build_pptx(p, slides=slide_specs)
+
+        r = _extractors.extract(p)
+        assert r.status == "ok"
+        # Slides 1.._PPTX_SLIDES_MAX serialized; slides beyond are not.
+        assert f"BODY_{_PPTX_SLIDES_MAX - 1}" in r.text
+        assert f"BODY_{_PPTX_SLIDES_MAX}" not in r.text
+        assert f"BODY_{_PPTX_SLIDES_MAX + 2}" not in r.text
+
+    def test_shapes_beyond_cap_not_in_text(self, tmp_path):
+        from fda.organize import _extractors
+        from fda.organize._extractors import _PPTX_SHAPES_PER_SLIDE_MAX
+
+        p = tmp_path / "many_shapes.pptx"
+        # One slide with > _PPTX_SHAPES_PER_SLIDE_MAX text shapes.
+        bodies = [f"SHAPE_{i}" for i in range(_PPTX_SHAPES_PER_SLIDE_MAX + 5)]
+        _build_pptx(p, slides=[{"layout": 6, "title": None, "body_shapes": bodies}])
+
+        r = _extractors.extract(p)
+        assert r.status == "ok"
+        # The shape iteration index is bounded by _PPTX_SHAPES_PER_SLIDE_MAX,
+        # but the shape iterator may include the title placeholder etc., so
+        # we cannot assert exactly which late shapes are dropped — just that
+        # *some* late shapes are dropped and *some* early shapes are kept.
+        kept = sum(1 for i in range(_PPTX_SHAPES_PER_SLIDE_MAX + 5) if f"SHAPE_{i}" in r.text)
+        assert kept < _PPTX_SHAPES_PER_SLIDE_MAX + 5
+        assert "SHAPE_0" in r.text
+
+
+class TestPptxFailure:
+    def test_corrupt_pptx_returns_failed(self, tmp_path):
+        from fda.organize import _extractors
+
+        p = tmp_path / "broken.pptx"
+        p.write_bytes(b"not a real pptx")
+        r = _extractors.extract(p)
+        assert r.status == "failed"
+        assert r.text is None
+        assert r.sections == ()
