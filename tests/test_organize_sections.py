@@ -197,3 +197,108 @@ class TestContainsHangul:
         from fda.organize._sections import contains_hangul
 
         assert contains_hangul("ＫＰＩ 지표") is True
+
+
+# ---------------------------------------------------------------------------
+# Korean bracketed banners — [발주서] / 【계약서】 / 《제품 정보》 / 〔공지〕 / 「인용」
+# ---------------------------------------------------------------------------
+
+
+class TestKoreanBracketBanners:
+    def test_square_bracket_banner_matches(self, ):
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("[발주서]\n") == ("발주서",)
+
+    def test_lenticular_bracket_banner_matches(self):
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("【계약서】\n") == ("계약서",)
+
+    def test_double_angle_bracket_banner_matches(self):
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("《제품 정보》\n") == ("제품 정보",)
+
+    def test_tortoise_bracket_banner_matches(self):
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("〔공지〕\n") == ("공지",)
+
+    def test_corner_bracket_banner_matches(self):
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("「인용」\n") == ("인용",)
+
+    def test_mixed_pair_brackets_match(self):
+        """Spec stance: tolerate mismatched opener/closer pairs (the
+        alternative — five paired regexes — adds surface area for marginal
+        benefit; mismatched pairs in real Korean docs are rare but harmless
+        when caught)."""
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("[발주서》\n") == ("발주서",)
+
+    def test_u3000_inside_brackets_handled(self):
+        """U+3000 ideographic space immediately after opener and before closer
+        — common in Korean templates that pad banner content for visual
+        alignment. Leading and trailing U+3000 are consumed by the
+        whitespace-tolerant inner anchors (or stripped post-match)."""
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("[　발주서　]\n") == ("발주서",)
+
+    def test_inline_bracket_in_middle_of_line_does_not_match(self):
+        """Anchored to line start/end — a bracketed phrase embedded in
+        prose must not produce a section."""
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("가나 [다라] 마바\n") == ()
+
+    def test_internal_dash_preserved_in_label(self):
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("[발주서 - 2024]\n") == ("발주서 - 2024",)
+
+    def test_two_syllable_label_passes_min_2(self):
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("[발주]\n") == ("발주",)
+
+    def test_one_syllable_label_dropped_by_min_2(self):
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("[가]\n") == ()
+
+    def test_label_over_max_chars_dropped(self):
+        from fda.organize._sections import extract_sections_from_text
+
+        long_label = "한" * 41
+        assert extract_sections_from_text(f"[{long_label}]\n") == ()
+
+    def test_english_only_bracketed_does_not_match(self):
+        """English bracketed lines like [INVOICE] are explicitly out of v1
+        scope — the lookahead requires Hangul somewhere in the inner content."""
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("[INVOICE]\n") == ()
+
+    def test_q_and_a_does_not_match(self):
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("[Q&A]\n") == ()
+
+    def test_unbalanced_open_does_not_match(self):
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("[발주서\n") == ()
+
+    def test_unbalanced_close_does_not_match(self):
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("발주서]\n") == ()
+
+    def test_content_after_closer_does_not_match(self):
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("[발주서] 2024\n") == ()

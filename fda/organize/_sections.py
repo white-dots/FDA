@@ -54,6 +54,23 @@ _ALLCAPS_LINE_RE = re.compile(
     r"^[ \t]*([A-Z][A-Z0-9 \-/&]{2,38}[A-Z0-9])[ \t]*$"
 )
 
+# Bounded char-class repetition ({0,40} / {2,40}) caps regex work at
+# ~SECTION_HEADER_MAX_CHARS per match attempt, eliminating the
+# catastrophic-backtracking risk on long malformed Hangul lines (e.g.,
+# a 16K all-Hangul bracketed line missing its closer would otherwise
+# cost ~6.7s with an unbounded *? capture; bounded is ~10µs). The
+# lookahead ensures at least one Hangul appears within the bounded
+# window so English-only bracketed lines fail the lookahead immediately.
+# ASCII space, tab, and U+3000 ideographic space are accepted at line
+# leading/trailing/inside-bracket positions; the latter is common in
+# Korean templates.
+_KOREAN_BRACKET_RE = re.compile(
+    r"^[ \t　]*[\[【《〔「][ \t　]*"
+    rf"(?=[^\[\]【】《》〔〕「」]{{0,40}}[{HANGUL_RANGE}])"
+    rf"([^\[\]【】《》〔〕「」]{{2,40}})"
+    r"[ \t　]*[\]】》〕」][ \t　]*$"
+)
+
 # (regex, min_chars, normalize_case)
 # Tuple-driven iteration so each pattern carries its own length guard and
 # whether the existing ALL-CAPS-to-Title-case rule should fire. Korean
@@ -69,6 +86,7 @@ _ALLCAPS_LINE_RE = re.compile(
 _PATTERNS: tuple[tuple[re.Pattern[str], int, bool], ...] = (
     (_HEADER_LINE_RE, SECTION_HEADER_MIN_CHARS, True),
     (_ALLCAPS_LINE_RE, SECTION_HEADER_MIN_CHARS, True),
+    (_KOREAN_BRACKET_RE, KOREAN_LABEL_MIN_CHARS, False),
 )
 
 
