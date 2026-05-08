@@ -795,3 +795,38 @@ class TestSectionsPropagationDocxXlsx:
         e = next(c for c in catalog.entries if c.path.endswith("broken.pptx"))
         assert e.extract_status == "failed"
         assert e.sections == ()
+
+    def test_csv_sections_flow_through_reader(
+        self, workspace, fake_backend, logger
+    ):
+        from fda.organize import reader
+
+        f = workspace / "data.csv"
+        f.write_text(
+            "customer_id,order_date,amount\n"
+            "1,2024-01-01,100.00\n"
+            "2,2024-01-02,200.00\n"
+        )
+
+        catalog = reader.read(workspace, backend=fake_backend, logger=logger)
+        e = next(c for c in catalog.entries if c.path.endswith("data.csv"))
+        assert e.extract_status == "ok"
+        assert e.sections == ("customer_id", "order_date", "amount")
+        # Verbatim head reflects the tab-normalized grid (delimiter normalized).
+        assert e.verbatim_head.startswith("customer_id\torder_date\tamount")
+
+    def test_csv_failed_extraction_yields_empty_sections_in_catalog(
+        self, workspace, fake_backend, logger
+    ):
+        """Parallel to docx/xlsx/pptx: when the csv extractor fails (e.g. NUL
+        byte triggers csv.Error mid-iteration), the catalog entry's sections
+        is preserved as ()."""
+        from fda.organize import reader
+
+        f = workspace / "broken.csv"
+        # NUL byte forces csv.reader to raise csv.Error('line contains NUL').
+        f.write_bytes(b"name,age\nalice,30\n\x00bob,25\n")
+        catalog = reader.read(workspace, backend=fake_backend, logger=logger)
+        e = next(c for c in catalog.entries if c.path.endswith("broken.csv"))
+        assert e.extract_status == "failed"
+        assert e.sections == ()
