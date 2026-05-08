@@ -74,6 +74,8 @@ class TestEachConstantHasOneHome:
         "READER_FAILED_SUMMARY_THRESHOLD": ("classifier.py", "0.25"),
         "SUMMARY_TRUNCATE_CHARS": ("classifier.py", "200"),
         "SECTION_HEADER_MIN_CHARS": ("_sections.py", "3"),
+        "KOREAN_LABEL_MIN_CHARS": ("_sections.py", "2"),
+        "HANGUL_RANGE": ("_sections.py", '"가-힣"'),
         "_XLSX_TEXT_ROWS_PER_SHEET": ("_extractors.py", "20"),
         "_XLSX_TEXT_COLS_PER_ROW": ("_extractors.py", "32"),
         "_XLSX_FORMULA_DENSITY_THRESHOLD": ("_extractors.py", "0.05"),

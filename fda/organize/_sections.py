@@ -15,6 +15,18 @@ SECTION_HEADER_MIN_CHARS = 3
 SECTION_HEADER_MAX_CHARS = 40
 SECTION_SCAN_CHARS = 16 * 1024   # only scan first ~16 K characters; structure tops most docs
 
+# Korean structural-fingerprint coverage. Korean syllables are morpheme-dense:
+# 2-syllable labels like 이름 (name), 직위 (position), 부서 (department) are
+# routine and meaningful. English keeps min 3 via SECTION_HEADER_MIN_CHARS.
+KOREAN_LABEL_MIN_CHARS = 2
+
+# Assigned Hangul Syllables range (U+AC00..U+D7A3). Public so other modules
+# (e.g., the csv extractor's per-cell length guard) can reuse it via
+# contains_hangul() instead of duplicating the regex char class. Modern
+# Korean business-doc text uses precomposed Hangul; Jamo and CJK Hanja are
+# intentionally excluded — see spec Non-goals.
+HANGUL_RANGE = "가-힣"
+
 # Pattern A: line that is *just* a section header followed by a colon.
 #   "Shipping Details:" / "Bill To:" / "Order Details:"
 _HEADER_LINE_RE = re.compile(
