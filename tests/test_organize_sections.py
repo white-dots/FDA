@@ -368,3 +368,74 @@ class TestKoreanColonLabels:
         from fda.organize._sections import extract_sections_from_text
 
         assert extract_sections_from_text("ＫＰＩ 지표:\n") == ("ＫＰＩ 지표",)
+
+
+# ---------------------------------------------------------------------------
+# Korean bullet banners — ■ 회사 정보 / ◆ 계약 조건 / ● 주의사항
+# ---------------------------------------------------------------------------
+
+
+class TestKoreanBulletBanners:
+    def test_filled_square_bullet_matches(self):
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("■ 회사 정보\n") == ("회사 정보",)
+
+    def test_filled_diamond_bullet_matches(self):
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("◆ 계약 조건\n") == ("계약 조건",)
+
+    def test_filled_circle_bullet_matches(self):
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("● 주의사항\n") == ("주의사항",)
+
+    def test_hollow_square_bullet_matches(self):
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("□ 부속 합의\n") == ("부속 합의",)
+
+    def test_hollow_diamond_bullet_matches(self):
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("◇ 변경 사항\n") == ("변경 사항",)
+
+    def test_hollow_circle_bullet_matches(self):
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("○ 비고\n") == ("비고",)
+
+    def test_bullet_without_whitespace_does_not_match(self):
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("■회사 정보\n") == ()
+
+    def test_bullet_with_english_only_does_not_match(self):
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("■ Company Info\n") == ()
+
+    def test_one_syllable_after_bullet_dropped_by_min_2(self):
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("■ 가\n") == ()
+
+    def test_out_of_set_marker_does_not_match(self):
+        """Triangles aren't in the v1 marker set — documented limitation."""
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("▶ 회사 정보\n") == ()
+
+    def test_label_over_max_chars_dropped(self):
+        from fda.organize._sections import extract_sections_from_text
+
+        long_label = "한" * 41
+        assert extract_sections_from_text(f"■ {long_label}\n") == ()
+
+    def test_u3000_separator_handled(self):
+        """U+3000 ideographic space between marker and label — common in Korean
+        templates that align text via ideographic-width spaces."""
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("■　회사 정보\n") == ("회사 정보",)
