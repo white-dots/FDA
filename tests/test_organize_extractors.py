@@ -1325,3 +1325,93 @@ class TestCsvEncoding:
         assert r.status == "failed"
         assert r.text is None
         assert r.sections == ()
+
+
+class TestCsvDelimiter:
+    def test_semicolon_delimited_eu_locale(self, tmp_path):
+        from fda.organize import _extractors
+
+        p = tmp_path / "eu.csv"
+        # Excel-EU locale exports use ';'. Multiple data rows so the sniffer
+        # has signal to pick ';' over ','.
+        p.write_text(
+            "name;age;city\n"
+            "alice;30;Paris\n"
+            "bob;25;Berlin\n"
+            "carol;35;Madrid\n"
+        )
+        r = _extractors.extract(p)
+        assert r.status == "ok"
+        assert r.sections == ("name", "age", "city")
+        # Delimiter normalized to tab in serialized output.
+        assert "name\tage\tcity\n" in r.text
+        assert ";" not in r.text
+
+    def test_tab_delimited_csv_filename(self, tmp_path):
+        from fda.organize import _extractors
+
+        p = tmp_path / "tabbed.csv"
+        # Mis-named TSV: content uses tabs, filename ends in .csv.
+        p.write_text(
+            "name\tage\tcity\n"
+            "alice\t30\tParis\n"
+            "bob\t25\tBerlin\n"
+        )
+        r = _extractors.extract(p)
+        assert r.status == "ok"
+        assert r.sections == ("name", "age", "city")
+
+    def test_pipe_delimited(self, tmp_path):
+        from fda.organize import _extractors
+
+        p = tmp_path / "piped.csv"
+        p.write_text(
+            "name|age|city\n"
+            "alice|30|Paris\n"
+            "bob|25|Berlin\n"
+            "carol|35|Madrid\n"
+        )
+        r = _extractors.extract(p)
+        assert r.status == "ok"
+        assert r.sections == ("name", "age", "city")
+
+    def test_single_column_yields_no_header_label(self, tmp_path):
+        """v1 limitation: single-column CSVs fail rule (1) "≥ 2 non-empty cells"
+        in the fallback scan, so they always land as NoHeader. Documented in
+        the spec's Non-goals.
+
+        has_header is mocked to False here to keep the test deterministic
+        regardless of stdlib heuristic mood — the v1 limitation only applies
+        when the fallback scan path runs."""
+        from fda.organize import _extractors
+        from unittest.mock import patch
+
+        p = tmp_path / "single.csv"
+        p.write_text("name\nalice\nbob\ncarol\n")
+        with patch("csv.Sniffer.has_header", return_value=False):
+            r = _extractors.extract(p)
+        assert r.status == "ok"
+        assert r.sections == ("NoHeader",)
+
+    def test_sniff_csv_error_falls_back_to_comma(self, tmp_path):
+        """When csv.Sniffer.sniff() raises csv.Error (degenerate sample),
+        the implementation must fall back to csv.excel (comma) and parse
+        the file as a regular comma CSV — covers the explicit failure mode
+        in spec 'Step 2 — sniff the delimiter'."""
+        from fda.organize import _extractors
+        from unittest.mock import patch
+
+        p = tmp_path / "sniff_fail.csv"
+        p.write_text(
+            "name,age,city\n"
+            "alice,30,Paris\n"
+            "bob,25,Berlin\n"
+        )
+        with patch(
+            "csv.Sniffer.sniff",
+            side_effect=__import__("csv").Error("could not determine delimiter"),
+        ):
+            r = _extractors.extract(p)
+        assert r.status == "ok"
+        # Comma-fallback parsed the headers correctly.
+        assert r.sections == ("name", "age", "city")
