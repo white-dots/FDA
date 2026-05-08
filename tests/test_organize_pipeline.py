@@ -48,6 +48,10 @@ def workspace(tmp_path):
     slide.shapes.title.text = "Pipeline Demo"
     prs.save(str(pptx_path))
 
+    # Minimal .csv (one header row, one data row).
+    csv_path = root / "data.csv"
+    csv_path.write_text("customer_id,order_date\n1,2024-01-01\n")
+
     return root
 
 
@@ -114,6 +118,7 @@ class TestOrganize:
         assert (workspace / "Texts" / "report.docx").exists()
         assert (workspace / "Texts" / "data.xlsx").exists()
         assert (workspace / "Texts" / "deck.pptx").exists()
+        assert (workspace / "Texts" / "data.csv").exists()
         assert result.log_path is not None
         assert "Texts" in result.summary or "text-shaped" in result.summary
 
@@ -132,6 +137,7 @@ class TestOrganize:
         assert (workspace / "report.docx").exists()
         assert (workspace / "data.xlsx").exists()
         assert (workspace / "deck.pptx").exists()
+        assert (workspace / "data.csv").exists()
         assert plan.log_path is not None
 
     def test_invalid_target_raises(self, workspace):
