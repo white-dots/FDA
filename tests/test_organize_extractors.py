@@ -1735,3 +1735,58 @@ class TestCsvText:
         assert r.sections == ("name", "age")
         assert "name\tage\n" in r.text
         assert "alice\t30\n" in r.text
+
+
+class TestCsvEdgeCases:
+    def test_zero_byte_file(self, tmp_path):
+        from fda.organize import _extractors
+
+        p = tmp_path / "empty.csv"
+        p.write_bytes(b"")
+        r = _extractors.extract(p)
+        assert r.status == "ok"
+        assert r.text == ""
+        assert r.sections == ()
+
+    def test_whitespace_only_file_yields_no_header_label(self, tmp_path):
+        """A file whose decoded content is only whitespace short-circuits to
+        text="" and sections=("NoHeader",) before csv.reader is invoked
+        (spec: 'Decoded but parses to zero rows (whitespace-only)')."""
+        from fda.organize import _extractors
+
+        p = tmp_path / "ws.csv"
+        p.write_text("   \n\n   \n")
+        r = _extractors.extract(p)
+        assert r.status == "ok"
+        assert r.text == ""
+        assert r.sections == ("NoHeader",)
+
+    def test_nul_byte_yields_failed_status(self, tmp_path):
+        """csv.reader raises csv.Error('line contains NUL') mid-iteration;
+        outer extract() catches → status='failed'."""
+        from fda.organize import _extractors
+
+        p = tmp_path / "nul.csv"
+        p.write_bytes(b"name,age\nalice,30\n\x00bob,25\n")
+        r = _extractors.extract(p)
+        assert r.status == "failed"
+        assert r.text is None
+        assert r.sections == ()
+
+    def test_file_larger_than_read_cap_uses_prefix(self, tmp_path):
+        """Files > _CSV_READ_BYTES_MAX are silently truncated at the
+        extractor; the prefix is processed. No failure."""
+        from fda.organize import _extractors
+        from fda.organize._extractors import _CSV_READ_BYTES_MAX
+
+        p = tmp_path / "huge.csv"
+        # Header in the prefix; pad with trailing data rows past the cap.
+        prefix = "name,age\n"
+        # Build a body whose total length exceeds _CSV_READ_BYTES_MAX.
+        body_row = "alice,30\n"
+        n_rows = (_CSV_READ_BYTES_MAX // len(body_row)) + 100
+        p.write_text(prefix + body_row * n_rows)
+        r = _extractors.extract(p)
+        assert r.status == "ok"
+        assert r.sections == ("name", "age")
+        assert "alice\t30\n" in r.text
