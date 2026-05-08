@@ -81,6 +81,12 @@ class TestEachConstantHasOneHome:
         "_PPTX_SLIDES_MAX": ("_extractors.py", "100"),
         "_PPTX_SHAPES_PER_SLIDE_MAX": ("_extractors.py", "50"),
         "_PPTX_NOTES_CHARS_PER_SLIDE_MAX": ("_extractors.py", "2000"),
+        "_CSV_READ_BYTES_MAX": ("_extractors.py", "4 * 1024 * 1024"),
+        "_CSV_SNIFF_SAMPLE_CHARS": ("_extractors.py", "8 * 1024"),
+        "_CSV_HEADER_SCAN_ROWS": ("_extractors.py", "5"),
+        "_CSV_TEXT_ROWS_MAX": ("_extractors.py", "20"),
+        "_CSV_TEXT_COLS_PER_ROW": ("_extractors.py", "32"),
+        "_CSV_NO_HEADER_LABEL": ("_extractors.py", '"NoHeader"'),
     }
 
     def test_constant_defined_in_owning_module(self):

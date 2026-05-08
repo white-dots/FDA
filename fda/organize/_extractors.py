@@ -52,6 +52,18 @@ _PPTX_SLIDES_MAX = 100
 _PPTX_SHAPES_PER_SLIDE_MAX = 50
 _PPTX_NOTES_CHARS_PER_SLIDE_MAX = 2000
 
+# csv extractor caps and fallback label. The five _CSV_* numeric caps
+# memory-bound the in-process read/sniff/scan/serialize walk; do NOT cap
+# `text` — Reader owns the 64 KiB contract cap via READER_TEXT_CAP_BYTES.
+# _CSV_NO_HEADER_LABEL is the synthesized fallback section label appended
+# when no usable header is found (parallel to xlsx's "FormulaHeavy").
+_CSV_READ_BYTES_MAX = 4 * 1024 * 1024
+_CSV_SNIFF_SAMPLE_CHARS = 8 * 1024
+_CSV_HEADER_SCAN_ROWS = 5
+_CSV_TEXT_ROWS_MAX = 20
+_CSV_TEXT_COLS_PER_ROW = 32
+_CSV_NO_HEADER_LABEL = "NoHeader"
+
 _DOCX_HEADING_RE = re.compile(r"^Heading [1-9]$")
 
 
