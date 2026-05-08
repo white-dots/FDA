@@ -530,3 +530,92 @@ class TestMixedLanguage:
         from fda.organize._sections import extract_sections_from_text
 
         assert extract_sections_from_text("■ 회사 정보:\n") == ()
+
+
+# ---------------------------------------------------------------------------
+# Length-guard + cap regression pins
+# ---------------------------------------------------------------------------
+
+
+class TestKoreanLengthGuard:
+    def test_korean_bracket_at_min_2_passes(self):
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("[발주]\n") == ("발주",)
+
+    def test_korean_bracket_at_min_minus_1_dropped(self):
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("[가]\n") == ()
+
+    def test_korean_colon_at_min_2_passes(self):
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("이름:\n") == ("이름",)
+
+    def test_korean_colon_at_min_minus_1_dropped(self):
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("가:\n") == ()
+
+    def test_korean_bullet_at_min_2_passes(self):
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("■ 비고\n") == ("비고",)
+
+    def test_korean_bullet_at_min_minus_1_dropped(self):
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("■ 가\n") == ()
+
+    def test_korean_bracket_at_max_40_passes(self):
+        from fda.organize._sections import extract_sections_from_text
+
+        label = "한" * 40
+        assert extract_sections_from_text(f"[{label}]\n") == (label,)
+
+    def test_korean_bracket_at_max_plus_1_dropped(self):
+        from fda.organize._sections import extract_sections_from_text
+
+        label = "한" * 41
+        assert extract_sections_from_text(f"[{label}]\n") == ()
+
+    def test_korean_colon_at_max_40_passes(self):
+        from fda.organize._sections import extract_sections_from_text
+
+        label = "한" * 40
+        assert extract_sections_from_text(f"{label}:\n") == (label,)
+
+    def test_korean_colon_at_max_plus_1_dropped(self):
+        from fda.organize._sections import extract_sections_from_text
+
+        label = "한" * 41
+        assert extract_sections_from_text(f"{label}:\n") == ()
+
+    def test_korean_bullet_at_max_40_passes(self):
+        from fda.organize._sections import extract_sections_from_text
+
+        label = "한" * 40
+        assert extract_sections_from_text(f"■ {label}\n") == (label,)
+
+    def test_korean_bullet_at_max_plus_1_dropped(self):
+        from fda.organize._sections import extract_sections_from_text
+
+        label = "한" * 41
+        assert extract_sections_from_text(f"■ {label}\n") == ()
+
+    def test_korean_labels_capped_at_max_sections_per_file(self):
+        from fda.organize._sections import (
+            MAX_SECTIONS_PER_FILE,
+            extract_sections_from_text,
+        )
+
+        # 30 distinct Korean labels via repeated bracket lines.
+        # Use 2-syllable labels constructed from distinct Hangul digits to
+        # stay simple and unambiguously distinct.
+        labels = [f"발{i:02d}주" for i in range(30)]
+        text = "\n".join(f"[{lbl}]" for lbl in labels) + "\n"
+        result = extract_sections_from_text(text)
+        assert len(result) == MAX_SECTIONS_PER_FILE
+        assert result[0] == labels[0]
+        assert result[-1] == labels[MAX_SECTIONS_PER_FILE - 1]
