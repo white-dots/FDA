@@ -1181,6 +1181,28 @@ git commit -m "organize(spec): record korean real-corpus validation results"
 
 ---
 
+## After this plan ships — what's next
+
+Once Tasks 1–11 land on `dev_branch`, three follow-ups are queued. None of them is part of *this* plan.
+
+1. **Cleanup PR — replace csv's private Hangul helpers with imports from `_sections.py`.**
+   The in-flight csv extractor (now merged) carries temporary `_CSV_KOREAN_LABEL_MIN_CHARS` and `_contains_hangul()` inside `fda/organize/_extractors.py`. After this plan ships, open a small PR that imports the public `KOREAN_LABEL_MIN_CHARS` and `contains_hangul()` from `fda.organize._sections`, removes the private csv copies, and deletes the corresponding entry from `tests/test_organize_constraints.py` `CONSTS`. Trivial — typically 4 file edits and one commit.
+
+2. **Brainstorm sub-project B — `.hwpx` extractor.**
+   `.hwpx` is the modern ZIP+XML Hangul format (analogous to `.docx`). Format-native heading discovery; **does not need this plan's regex changes**. Was blocked on the csv `_extractors.py` conflict — that's now cleared. Run `/superpowers:brainstorming` with: "implement `.hwpx` extractor for the organize pipeline; format-native paragraph styles like `.docx`; library candidates: zip + lxml, or python-hwpx if maintained."
+
+3. **Brainstorm sub-project C — `.hwp` extractor.**
+   `.hwp` is the legacy binary OLE Hangul format. Goes plaintext → regex via `hwp5txt` or `pyhwp`, so it **depends on this plan** to produce non-empty `sections` for Korean headers. Adds a runtime dependency. Run `/superpowers:brainstorming` with: "implement `.hwp` extractor for the organize pipeline; binary OLE format; needs hwp5txt or pyhwp; depends on Korean regex from sub-project A which has shipped."
+
+**Possible v2 follow-ups (corpus-driven, not blocking):**
+- Numbered Korean headers (`1. 제품 정보`, `제 1 장`) — skipped in v1 due to false-positive risk with ordered-list bodies; revisit if Task 11's real-corpus pass shows them as a major false-negative source.
+- Hanja / CJK Unified Ideographs in headers — excluded in v1; revisit per corpus evidence.
+- English bracketed banners (`[INVOICE]`) — would generalize `_KOREAN_BRACKET_RE` and require renaming.
+
+**Source of truth for the broader backlog:** Obsidian `00_Me/02_Side_Hustle/Lion_Chemtech/FDA/Future Plan - Structural Sections Across Formats.md`. Update it after each sub-project ships.
+
+---
+
 ## Done condition
 
 - `fda/organize/_sections.py` defines `KOREAN_LABEL_MIN_CHARS`, `HANGUL_RANGE`, `contains_hangul()`, the three new compiled regexes (`_KOREAN_BRACKET_RE`, `_KOREAN_COLON_RE`, `_KOREAN_BULLET_RE`), and the `_PATTERNS` tuple. `extract_sections_from_text` iterates `_PATTERNS` with pattern-aware min-length and pattern-aware case-normalization.
