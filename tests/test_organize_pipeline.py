@@ -40,6 +40,14 @@ def workspace(tmp_path):
     wb.save(str(xlsx_path))
     wb.close()
 
+    # Minimal .pptx (one titled slide).
+    from pptx import Presentation
+    pptx_path = root / "deck.pptx"
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[0])
+    slide.shapes.title.text = "Pipeline Demo"
+    prs.save(str(pptx_path))
+
     return root
 
 
@@ -105,6 +113,7 @@ class TestOrganize:
         # assigns every entry to "Texts", so they all land in the same dir).
         assert (workspace / "Texts" / "report.docx").exists()
         assert (workspace / "Texts" / "data.xlsx").exists()
+        assert (workspace / "Texts" / "deck.pptx").exists()
         assert result.log_path is not None
         assert "Texts" in result.summary or "text-shaped" in result.summary
 
@@ -122,6 +131,7 @@ class TestOrganize:
         assert (workspace / ".DS_Store").exists()
         assert (workspace / "report.docx").exists()
         assert (workspace / "data.xlsx").exists()
+        assert (workspace / "deck.pptx").exists()
         assert plan.log_path is not None
 
     def test_invalid_target_raises(self, workspace):
