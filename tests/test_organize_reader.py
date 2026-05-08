@@ -830,3 +830,30 @@ class TestSectionsPropagationDocxXlsx:
         e = next(c for c in catalog.entries if c.path.endswith("broken.csv"))
         assert e.extract_status == "failed"
         assert e.sections == ()
+
+
+class TestKoreanSectionsThroughReader:
+    """Korean structural-fingerprint coverage: a plaintext file containing
+    Korean banners flows through Reader, and CatalogEntry.sections holds
+    the expected Korean labels. Separate top-level class (not appended to
+    TestSectionsPropagationDocxXlsx) so this PR doesn't collide with the
+    in-flight CSV PR's edits to that class.
+    """
+
+    def test_korean_plaintext_sections_flow_through_reader(
+        self, workspace, fake_backend, logger
+    ):
+        from fda.organize import reader
+
+        f = workspace / "korean_doc.txt"
+        f.write_text(
+            "[발주서]\n"
+            "회사 정보:\n"
+            "■ 주의사항\n"
+            "본문 내용...\n"
+        )
+
+        catalog = reader.read(workspace, backend=fake_backend, logger=logger)
+        e = next(c for c in catalog.entries if c.path.endswith("korean_doc.txt"))
+        assert e.extract_status == "ok"
+        assert e.sections == ("발주서", "회사 정보", "주의사항")
