@@ -14,6 +14,9 @@ unknown extensions.
 
 from __future__ import annotations
 
+import csv
+import io
+import itertools
 import re
 import shutil
 import subprocess
@@ -381,10 +384,148 @@ def _extract_pptx(path: Path) -> ExtractionResult:
     )
 
 
+def _extract_csv(path: Path) -> ExtractionResult:
+    """Extract text + column-header sections from a .csv file.
+
+    Sections: row-1 column headers under csv.Sniffer.has_header(), or the
+    first row in the first _CSV_HEADER_SCAN_ROWS that satisfies all five
+    header-shape rules when has_header() is False. Length-guarded, deduped,
+    capped at MAX_SECTIONS_PER_FILE. When no usable header is found,
+    sections=(_CSV_NO_HEADER_LABEL,).
+
+    Text: up to _CSV_TEXT_ROWS_MAX physical rows from the start, each
+    truncated to _CSV_TEXT_COLS_PER_ROW cells, "\\t"-joined with a trailing
+    "\\n". Sniffed delimiter is normalized to tab so the classifier sees a
+    uniform shape across .csv and .xlsx. No banner. No extractor-side byte
+    cap — Reader owns the 64 KiB contract cap.
+
+    Encoding: utf-8-sig (BOM-tolerant) → cp949 (Excel-Korean exports).
+    Both decode failures → status="failed".
+    """
+    with path.open("rb") as f:
+        raw = f.read(_CSV_READ_BYTES_MAX)
+
+    try:
+        decoded = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        try:
+            decoded = raw.decode("cp949")
+        except UnicodeDecodeError as e:
+            return ExtractionResult(text=None, status="failed", note=str(e))
+
+    if not decoded:
+        return ExtractionResult(text="", status="ok", sections=())
+    if not decoded.strip():
+        # Whitespace-only decoded content: csv.reader would yield rows of
+        # whitespace cells, but spec requires text="" and sections=("NoHeader",).
+        return ExtractionResult(
+            text="", status="ok", sections=(_CSV_NO_HEADER_LABEL,)
+        )
+
+    sample = decoded[:_CSV_SNIFF_SAMPLE_CHARS]
+    try:
+        # Restrict candidate delimiters so the sniffer cannot pick a stray
+        # alphabetic byte (e.g. "n" from "name") on short single-column samples.
+        dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+    except csv.Error:
+        dialect = csv.excel
+    try:
+        has_header = csv.Sniffer().has_header(sample)
+    except csv.Error:
+        has_header = False
+
+    # Bounded two-pass iteration. Pass 1: read up to _CSV_HEADER_SCAN_ROWS + 1
+    # rows for header detection (the +1 is rule 5's lookahead). Pass 2:
+    # re-iterate from the start and read up to _CSV_TEXT_ROWS_MAX rows for
+    # serialization. A malformed row past those windows does not affect
+    # extraction — only mid-window corruption propagates as status="failed".
+    header_iter = csv.reader(io.StringIO(decoded), dialect)
+    scan_window = list(itertools.islice(header_iter, _CSV_HEADER_SCAN_ROWS + 1))
+
+    header_cells: list[str] | None = None
+    if has_header and scan_window:
+        header_cells = scan_window[0]
+    elif scan_window:
+        scan_limit = min(_CSV_HEADER_SCAN_ROWS, len(scan_window))
+        for i in range(scan_limit):
+            r = scan_window[i]
+            non_empty = [c for c in r if c and c.strip()]
+            if len(non_empty) < 2:
+                continue
+            normalized = [" ".join(c.split()) for c in non_empty]
+            if not all(
+                SECTION_HEADER_MIN_CHARS <= len(s) <= SECTION_HEADER_MAX_CHARS
+                for s in normalized
+            ):
+                continue
+            if any(_is_pure_number(s) for s in normalized):
+                continue
+            if len(set(normalized)) != len(normalized):
+                continue
+            # rule 5: cell count matches the next row, OR R is the final row.
+            # The scan_window size is _CSV_HEADER_SCAN_ROWS + 1, so for i in
+            # 0..scan_limit-1 the lookahead scan_window[i+1] is in-bounds
+            # whenever the file has more rows than the scan window. When
+            # i + 1 == len(scan_window), the file had ≤ scan+1 rows total and
+            # R is the final row — accept it (no cell-count constraint).
+            if i + 1 < len(scan_window) and len(r) != len(scan_window[i + 1]):
+                continue
+            header_cells = r
+            break
+
+    if header_cells is None:
+        sections = (_CSV_NO_HEADER_LABEL,) if scan_window else ()
+    else:
+        labels: list[str] = []
+        seen: dict[str, None] = {}
+        for cell in header_cells:
+            if cell is None:
+                continue
+            label = " ".join(str(cell).split())
+            if not label:
+                continue
+            if not (SECTION_HEADER_MIN_CHARS <= len(label) <= SECTION_HEADER_MAX_CHARS):
+                continue
+            if label in seen:
+                continue
+            seen[label] = None
+            labels.append(label)
+            if len(labels) >= MAX_SECTIONS_PER_FILE:
+                break
+        sections = tuple(labels) if labels else (_CSV_NO_HEADER_LABEL,)
+
+    text_iter = csv.reader(io.StringIO(decoded), dialect)
+    text_parts: list[str] = []
+    for row in itertools.islice(text_iter, _CSV_TEXT_ROWS_MAX):
+        cells = [str(c) if c is not None else "" for c in row[:_CSV_TEXT_COLS_PER_ROW]]
+        text_parts.append("\t".join(cells) + "\n")
+
+    return ExtractionResult(
+        text="".join(text_parts),
+        status="ok",
+        sections=sections,
+    )
+
+
+def _is_pure_number(s: str) -> bool:
+    """True iff s parses as int or float (no exception). Used by the
+    has_header-False fallback scan to reject all-numeric rows."""
+    try:
+        int(s)
+        return True
+    except ValueError:
+        pass
+    try:
+        float(s)
+        return True
+    except ValueError:
+        return False
+
+
 EXTRACTORS: dict[str, TextExtractor] = {
     ".txt": _read_text,
     ".md": _read_text,
-    ".csv": _read_text,
+    ".csv": _extract_csv,
     ".log": _read_text,
     ".json": _read_text,
     ".xml": _read_text,

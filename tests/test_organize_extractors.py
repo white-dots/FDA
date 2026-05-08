@@ -1233,3 +1233,47 @@ class TestPptxFailure:
         assert r.status == "failed"
         assert r.text is None
         assert r.sections == ()
+
+
+# ---------------------------------------------------------------------------
+# .csv — column headers drive sections; tab-normalized grid drives text
+# ---------------------------------------------------------------------------
+
+
+class TestCsvSections:
+    def test_simple_ascii_csv_yields_row1_headers(self, tmp_path):
+        from fda.organize import _extractors
+
+        p = tmp_path / "a.csv"
+        p.write_text(
+            "customer_id,order_date,amount\n"
+            "1,2024-01-01,100.00\n"
+            "2,2024-01-02,200.00\n"
+        )
+        r = _extractors.extract(p)
+        assert r.status == "ok"
+        assert r.sections == ("customer_id", "order_date", "amount")
+
+    def test_duplicate_headers_deduped(self, tmp_path):
+        from fda.organize import _extractors
+
+        p = tmp_path / "dups.csv"
+        # Use 5+-char headers so they pass SECTION_HEADER_MIN_CHARS=3 length
+        # guard; "id" (2 chars) would otherwise be dropped before dedupe.
+        p.write_text("order,order,name\n1,1,alice\n")
+        r = _extractors.extract(p)
+        assert r.status == "ok"
+        assert r.sections == ("order", "name")
+
+    def test_text_is_tab_normalized_grid(self, tmp_path):
+        from fda.organize import _extractors
+
+        p = tmp_path / "grid.csv"
+        p.write_text(
+            "customer_id,order_date\n"
+            "1,2024-01-01\n"
+        )
+        r = _extractors.extract(p)
+        # delimiter normalized to tab in serialized output
+        assert "customer_id\torder_date\n" in r.text
+        assert "1\t2024-01-01\n" in r.text
