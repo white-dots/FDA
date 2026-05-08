@@ -67,6 +67,15 @@ _CSV_TEXT_ROWS_MAX = 20
 _CSV_TEXT_COLS_PER_ROW = 32
 _CSV_NO_HEADER_LABEL = "NoHeader"
 
+# Per-script length-guard floor for csv column headers. SECTION_HEADER_MIN_CHARS
+# (= 3) was chosen for English where 1- and 2-char strings are usually noise.
+# Korean column headers are syllable-dense — `이름` (name), `나이` (age), `부서`
+# (department) are 2-char and routine. Apply this floor when the label contains
+# Hangul. Mirrors the design pattern in the in-flight Korean sections sub-project
+# (`KOREAN_LABEL_MIN_CHARS = 2` in `_sections.py`); replace this private csv copy
+# with an import once that work merges.
+_CSV_KOREAN_LABEL_MIN_CHARS = 2
+
 _DOCX_HEADING_RE = re.compile(r"^Heading [1-9]$")
 
 
@@ -454,7 +463,7 @@ def _extract_csv(path: Path) -> ExtractionResult:
                 continue
             normalized = [" ".join(c.split()) for c in non_empty]
             if not all(
-                SECTION_HEADER_MIN_CHARS <= len(s.encode("utf-8")) <= SECTION_HEADER_MAX_CHARS
+                _label_min_chars(s) <= len(s) <= SECTION_HEADER_MAX_CHARS
                 for s in normalized
             ):
                 continue
@@ -484,7 +493,7 @@ def _extract_csv(path: Path) -> ExtractionResult:
             label = " ".join(str(cell).split())
             if not label:
                 continue
-            if not (SECTION_HEADER_MIN_CHARS <= len(label.encode("utf-8")) <= SECTION_HEADER_MAX_CHARS):
+            if not (_label_min_chars(label) <= len(label) <= SECTION_HEADER_MAX_CHARS):
                 continue
             if label in seen:
                 continue
@@ -520,6 +529,20 @@ def _is_pure_number(s: str) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _label_min_chars(s: str) -> int:
+    """Per-script length-guard floor for csv header labels.
+
+    Returns _CSV_KOREAN_LABEL_MIN_CHARS (= 2) when s contains any Hangul
+    syllable (U+AC00..U+D7A3), else SECTION_HEADER_MIN_CHARS (= 3). The
+    Hangul Syllables block matches the range used by the in-flight Korean
+    sections sub-project for `_sections.py`.
+    """
+    for c in s:
+        if "가" <= c <= "힣":
+            return _CSV_KOREAN_LABEL_MIN_CHARS
+    return SECTION_HEADER_MIN_CHARS
 
 
 EXTRACTORS: dict[str, TextExtractor] = {

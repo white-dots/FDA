@@ -87,6 +87,7 @@ class TestEachConstantHasOneHome:
         "_CSV_TEXT_ROWS_MAX": ("_extractors.py", "20"),
         "_CSV_TEXT_COLS_PER_ROW": ("_extractors.py", "32"),
         "_CSV_NO_HEADER_LABEL": ("_extractors.py", '"NoHeader"'),
+        "_CSV_KOREAN_LABEL_MIN_CHARS": ("_extractors.py", "2"),
     }
 
     def test_constant_defined_in_owning_module(self):
