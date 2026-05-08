@@ -439,3 +439,94 @@ class TestKoreanBulletBanners:
         from fda.organize._sections import extract_sections_from_text
 
         assert extract_sections_from_text("■　회사 정보\n") == ("회사 정보",)
+
+
+# ---------------------------------------------------------------------------
+# Mixed-language documents — Korean and English patterns coexist
+# ---------------------------------------------------------------------------
+
+
+class TestMixedLanguage:
+    def test_english_colon_korean_bracket_english_allcaps_in_source_order(self):
+        from fda.organize._sections import extract_sections_from_text
+
+        text = (
+            "Order Details:\n"
+            "...\n"
+            "[발주서]\n"
+            "...\n"
+            "INVOICE\n"
+            "...\n"
+        )
+        assert extract_sections_from_text(text) == (
+            "Order Details",
+            "발주서",
+            "Invoice",
+        )
+
+    def test_korean_and_english_colon_labels_intermixed(self):
+        from fda.organize._sections import extract_sections_from_text
+
+        text = (
+            "Bill To:\n"
+            "...\n"
+            "이름:\n"
+            "...\n"
+            "Ship To:\n"
+            "...\n"
+            "회사 정보:\n"
+        )
+        assert extract_sections_from_text(text) == (
+            "Bill To",
+            "이름",
+            "Ship To",
+            "회사 정보",
+        )
+
+    def test_duplicate_korean_labels_deduped(self):
+        from fda.organize._sections import extract_sections_from_text
+
+        text = (
+            "[발주서]\n"
+            "...\n"
+            "[계약서]\n"
+            "...\n"
+            "[발주서]\n"
+        )
+        assert extract_sections_from_text(text) == ("발주서", "계약서")
+
+    def test_korean_label_and_english_translation_are_distinct(self):
+        """We do not translate; same-meaning labels in different languages
+        appear as distinct entries."""
+        from fda.organize._sections import extract_sections_from_text
+
+        text = "이름:\nName:\n"
+        assert extract_sections_from_text(text) == ("이름", "Name")
+
+    def test_kpi_jipyo_in_bracket_not_title_cased(self):
+        """KPI 지표 must NOT become Kpi 지표. Pins the normalize_case=False gate
+        for _KOREAN_BRACKET_RE — Python's str.isupper() returns True on
+        "KPI 지표" because Hangul is uncased and KPI is uppercase."""
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("[KPI 지표]\n") == ("KPI 지표",)
+
+    def test_kpi_jipyo_in_colon_not_title_cased(self):
+        """Pins the normalize_case=False gate for _KOREAN_COLON_RE."""
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("KPI 지표:\n") == ("KPI 지표",)
+
+    def test_kpi_jipyo_after_bullet_not_title_cased(self):
+        """Pins the normalize_case=False gate for _KOREAN_BULLET_RE."""
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("■ KPI 지표\n") == ("KPI 지표",)
+
+    def test_bullet_plus_colon_ambiguous_line_yields_no_section(self):
+        """v1 limitation: a line combining bullet ornament and trailing colon
+        matches NEITHER Korean regex under the tightened char-class
+        exclusions. Pins the limitation against accidental relaxation."""
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("■ 회사 정보:\n") == ()
