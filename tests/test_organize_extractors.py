@@ -19,7 +19,7 @@ class TestPlainText:
         assert r.status == "ok"
         assert r.text == "hello"
 
-    @pytest.mark.parametrize("ext", [".md", ".csv", ".log", ".json", ".xml"])
+    @pytest.mark.parametrize("ext", [".md", ".log", ".json", ".xml"])
     def test_other_text_extensions_route_to_read_text(self, tmp_path, ext):
         from fda.organize import _extractors
 

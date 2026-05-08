@@ -613,12 +613,12 @@ class TestSectionsPropagation:
     def test_empty_when_extraction_returns_no_sections(
         self, workspace, fake_backend, logger
     ):
-        """A CSV (or any text without colon-headers / ALL-CAPS dividers)
-        yields sections=()."""
+        """A JSON file (or any plaintext without colon-headers /
+        ALL-CAPS dividers) yields sections=()."""
         from fda.organize import reader
 
-        (workspace / "data.csv").write_text(
-            "customer_id,order_date\n1,2024-01-01\n"
+        (workspace / "data.json").write_text(
+            '{"customer_id": 1, "order_date": "2024-01-01"}\n'
         )
         catalog = reader.read(workspace, backend=fake_backend, logger=logger)
         e = catalog.entries[0]
