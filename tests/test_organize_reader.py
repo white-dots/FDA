@@ -762,3 +762,36 @@ class TestSectionsPropagationDocxXlsx:
         e = next(c for c in catalog.entries if c.path.endswith("broken.xlsx"))
         assert e.extract_status == "failed"
         assert e.sections == ()
+
+    def test_pptx_sections_flow_through_reader(
+        self, workspace, fake_backend, logger
+    ):
+        from fda.organize import reader
+        from pptx import Presentation
+
+        f = workspace / "deck.pptx"
+        prs = Presentation()
+        for title in ("Quarter Plan", "Risks"):
+            slide = prs.slides.add_slide(prs.slide_layouts[0])
+            slide.shapes.title.text = title
+        prs.save(str(f))
+
+        catalog = reader.read(workspace, backend=fake_backend, logger=logger)
+        e = next(c for c in catalog.entries if c.path.endswith("deck.pptx"))
+        assert e.extract_status == "ok"
+        assert e.sections == ("Quarter Plan", "Risks")
+        assert e.verbatim_head.startswith("Slide 1: Quarter Plan")
+
+    def test_pptx_failed_extraction_yields_empty_sections_in_catalog(
+        self, workspace, fake_backend, logger
+    ):
+        """Parallel to docx/xlsx: when the extractor fails, the catalog
+        entry's sections is preserved as ()."""
+        from fda.organize import reader
+
+        f = workspace / "broken.pptx"
+        f.write_bytes(b"not a real pptx")
+        catalog = reader.read(workspace, backend=fake_backend, logger=logger)
+        e = next(c for c in catalog.entries if c.path.endswith("broken.pptx"))
+        assert e.extract_status == "failed"
+        assert e.sections == ()
