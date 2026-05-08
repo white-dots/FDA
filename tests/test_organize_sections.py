@@ -619,3 +619,56 @@ class TestKoreanLengthGuard:
         assert len(result) == MAX_SECTIONS_PER_FILE
         assert result[0] == labels[0]
         assert result[-1] == labels[MAX_SECTIONS_PER_FILE - 1]
+
+
+# ---------------------------------------------------------------------------
+# Backtracking-bound regression pin
+# ---------------------------------------------------------------------------
+
+
+class TestKoreanRegexBacktrackingBound:
+    """Pins the bounded char-class repetition in all three Korean regexes.
+
+    A 16K-character malformed line of all-Hangul triggers catastrophic
+    backtracking under unbounded `*?` capture (~6.7s in Codex's measurement)
+    but completes in microseconds under the bounded `{0,40}` lookahead +
+    `{2,40}` capture. The 500ms budget is loose enough to absorb noisy
+    CI runner pauses (the bounded version is ~10µs in measurement) but
+    still ~13× tighter than the unbounded regression, so it fails loudly
+    if a future edit reintroduces unbounded backtracking.
+    """
+
+    BUDGET_MS = 500
+
+    def _run_with_budget(self, fn):
+        import time
+        t0 = time.monotonic()
+        result = fn()
+        elapsed_ms = (time.monotonic() - t0) * 1000
+        assert elapsed_ms < self.BUDGET_MS, (
+            f"regex took {elapsed_ms:.1f}ms, budget {self.BUDGET_MS}ms — "
+            "bounded char-class repetition may have been reverted to "
+            "unbounded *? form (catastrophic backtracking risk)."
+        )
+        return result
+
+    def test_bracket_no_closer_terminates_fast(self):
+        from fda.organize._sections import extract_sections_from_text
+
+        line = "[" + ("한" * 16000)
+        result = self._run_with_budget(lambda: extract_sections_from_text(line))
+        assert result == ()
+
+    def test_colon_no_terminator_terminates_fast(self):
+        from fda.organize._sections import extract_sections_from_text
+
+        line = "한" * 16000
+        result = self._run_with_budget(lambda: extract_sections_from_text(line))
+        assert result == ()
+
+    def test_bullet_no_terminator_terminates_fast(self):
+        from fda.organize._sections import extract_sections_from_text
+
+        line = "■ " + ("한" * 16000)
+        result = self._run_with_budget(lambda: extract_sections_from_text(line))
+        assert result == ()
