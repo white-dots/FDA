@@ -39,37 +39,54 @@ _ALLCAPS_LINE_RE = re.compile(
     r"^[ \t]*([A-Z][A-Z0-9 \-/&]{2,38}[A-Z0-9])[ \t]*$"
 )
 
+# (regex, min_chars, normalize_case)
+# Tuple-driven iteration so each pattern carries its own length guard and
+# whether the existing ALL-CAPS-to-Title-case rule should fire. Korean
+# patterns will be appended in subsequent tasks with normalize_case=False
+# (Hangul has no case; "KPI 지표".isupper() is True because cased K, P, I
+# are uppercase, so an untagged .title() pass would mutate the label).
+#
+# IMPORTANT: every regex referenced here must be defined ABOVE this
+# tuple in the file. Tasks 4/5/6 each insert a new Korean regex between
+# _ALLCAPS_LINE_RE and _PATTERNS — never below _PATTERNS — so this tuple
+# remains the last definition before extract_sections_from_text. Putting
+# a regex below _PATTERNS would cause a module-import-time NameError.
+_PATTERNS: tuple[tuple[re.Pattern[str], int, bool], ...] = (
+    (_HEADER_LINE_RE, SECTION_HEADER_MIN_CHARS, True),
+    (_ALLCAPS_LINE_RE, SECTION_HEADER_MIN_CHARS, True),
+)
+
 
 def extract_sections_from_text(text: str) -> tuple[str, ...]:
     """Pure function: text → ordered tuple of unique section labels.
 
-    Walks lines ONCE in source order, trying each pattern per line. This
-    preserves intra-document order in mixed-pattern documents (e.g., a
-    file whose first matching line is ALL-CAPS and whose second is a
-    colon-header). Caps at MAX_SECTIONS_PER_FILE.
+    Walks lines ONCE in source order, trying each compiled regex per line
+    via _PATTERNS. Each entry pairs a regex with its min-chars guard and a
+    normalize_case flag (English ALL-CAPS labels get title-cased; Korean
+    labels do NOT — Hangul is uncased so str.isupper() over mixed labels
+    misbehaves). First match wins per line; ordered-set dedupe; cap at
+    MAX_SECTIONS_PER_FILE.
 
     Deterministic, side-effect-free, no LLM.
     """
     if not text:
         return ()
     head = text[:SECTION_SCAN_CHARS]
-    seen: dict[str, None] = {}   # ordered set
+    seen: dict[str, None] = {}
     for line in head.splitlines():
-        for rx in (_HEADER_LINE_RE, _ALLCAPS_LINE_RE):
+        for rx, min_chars, normalize_case in _PATTERNS:
             m = rx.match(line)
             if not m:
                 continue
             label = m.group(1).strip()
-            if not (SECTION_HEADER_MIN_CHARS <= len(label) <= SECTION_HEADER_MAX_CHARS):
+            if not (min_chars <= len(label) <= SECTION_HEADER_MAX_CHARS):
                 continue
-            # Normalize: collapse internal whitespace; title-case ALL-CAPS for
-            # stable keys (so "INVOICE" and "Invoice" don't both appear).
             label = " ".join(label.split())
-            if label.isupper():
+            if normalize_case and label.isupper():
                 label = label.title()
             if label not in seen:
                 seen[label] = None
                 if len(seen) >= MAX_SECTIONS_PER_FILE:
                     return tuple(seen)
-            break  # one match per line is enough; don't double-count
+            break
     return tuple(seen)
