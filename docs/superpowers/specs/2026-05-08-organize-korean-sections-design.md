@@ -396,3 +396,34 @@ Tracked in Obsidian: `Future Plan - Structural Sections Across Formats.md`. The 
 - Real-corpus validation pass complete; results recorded in the implementation plan's done-condition checklist.
 - Full pytest suite green.
 - One commit per task; merged independently of the in-flight CSV work; the minor append-style conflict in `tests/test_organize_constraints.py` resolves mechanically (different keys). Optional integration test goes in a new `TestKoreanSectionsThroughReader` class in `tests/test_organize_reader.py` so there's no class-body collision with CSV's `TestSectionsPropagationDocxXlsx`.
+
+## Real-corpus validation results
+
+**Corpus:** Lion Chemtech client documents (8 Korean PDFs sampled across three document types: production logs `성형일지` / `가공일지`, R&R organizational sheets `개인별 업무 리스트_*`, and a proposal deck). Cross-referenced against representative `.docx` (`01_생산팀_질문지_완.docx`, `02_품질관리팀_질문지_업데이트.docx`) and `.xlsx` (`수출260410.xlsx`) shapes via direct text inspection.
+
+**Method:** Loaded `_sections.py` standalone, extracted PDF text with `pdftotext -layout -nopgbrk`, ran `extract_sections_from_text` per file. Probed individual representative lines from the docx/xlsx corpus directly through the same function.
+
+**Quantitative result:** Across 8 PDFs — 3 extract failures (scanned image PDFs returning empty text; not a regex concern), 5 successfully extracted (~28K Hangul characters total). 0 sections detected, 0 false positives.
+
+**Line-level probes (from real corpus):**
+
+| Line | v1 Result | Reason |
+|---|---|---|
+| `[ 작업 확인사항 ]` (xlsx cell) | ✅ matches → `("작업 확인사항",)` | bracket + U+3000 padding handled |
+| `목 재 :`, `코드스트랩:`, `에어백 :` (xlsx cells) | ✅ matches | colon-label pattern |
+| `1. 데이터 관리 현황`, `2. MES화 기초작업 현황 (핵심)` (docx) | ❌ no match | numbered headers — deferred to v2 |
+| `📋 안내사항` (docx) | ❌ no match | emoji prefix — not in v1 marker set |
+| `대상 팀`, `작성자` (docx) | ❌ no match | bare label, no banner shape |
+| `AI 전환(AIX) 사전 진단을 위한 현황 파악` (docx) | ❌ no match | prose with parens, not a banner |
+
+**Why the PDF corpus produced zero hits:** the sampled PDFs are tabular role/responsibility sheets (`개인별 업무 리스트`) — they consist of column headers (`구분 | 업무명 | 업무 상세 내용`) plus rows of names and tasks. None of those lines have v1's bracket / colon / bullet shape. The bracket and colon regexes correctly fire on the xlsx/docx cells that *do* use those shapes, confirming the patterns work; the PDF samples just don't contain that style of banner.
+
+**Decision:** MERGE v1 as-is. False-positive rate is 0%; the v1-chosen patterns (bracket / colon / bullet) work correctly when their shapes appear. The dominant false-negative source is numbered-header style (`1. 제품 정보`) — exactly the v2 follow-up the plan anticipated. The plan's directive — "do not widen v1 patterns mid-implementation; open a new brainstorm" — applies cleanly.
+
+**v2 priority queue (corpus-driven, ranked by frequency in this corpus):**
+
+1. Numbered Korean headers (`1. 데이터 관리 현황`, `2. MES화 기초작업 현황`) — the highest-impact gap. Brainstorm a separate sub-project, mindful of false-positive risk against ordered-list bodies.
+2. Emoji/icon-prefixed headers (`📋 안내사항`) — corpus-frequent in modern Korean templates. Either widen the bullet marker set or add a lightweight emoji-banner pattern.
+3. Bare Korean labels with no marker (`대상 팀`, `작성자`) — likely too ambiguous for regex; defer indefinitely.
+
+Hanja / CJK-Unified-Ideographs in headers and English bracketed banners (`[INVOICE]`) saw zero corpus signal here; remain Non-goals.
