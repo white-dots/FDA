@@ -349,6 +349,17 @@ def _extract_pptx(path: Path) -> ExtractionResult:
             if body:
                 text_parts.append(body + "\n")
 
+        if slide.has_notes_slide:
+            notes_tf = slide.notes_slide.notes_text_frame
+            if notes_tf is not None:
+                notes_text = notes_tf.text or ""
+                if notes_text.strip():
+                    text_parts.append(
+                        "Notes: "
+                        + notes_text[:_PPTX_NOTES_CHARS_PER_SLIDE_MAX]
+                        + "\n"
+                    )
+
         text_parts.append("\n")  # blank line between slides
 
     return ExtractionResult(

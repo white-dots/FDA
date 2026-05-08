@@ -1092,3 +1092,92 @@ class TestPptxText:
         _build_pptx(p, slides=[{"title": "OnlyTitle"}])
         r = _extractors.extract(p)
         assert "OnlyTitle" in r.text
+
+
+class TestPptxNotes:
+    def test_notes_present_appended_to_text(self, tmp_path):
+        from fda.organize import _extractors
+
+        p = tmp_path / "notes.pptx"
+        _build_pptx(p, slides=[
+            {"title": "T", "notes": "Speaker context here."},
+        ])
+        r = _extractors.extract(p)
+        assert "Notes: Speaker context here." in r.text
+
+    def test_notes_truncated_at_cap(self, tmp_path):
+        from fda.organize import _extractors
+        from fda.organize._extractors import _PPTX_NOTES_CHARS_PER_SLIDE_MAX
+
+        long_notes = "x" * (_PPTX_NOTES_CHARS_PER_SLIDE_MAX + 200)
+        p = tmp_path / "long_notes.pptx"
+        _build_pptx(p, slides=[{"title": "T", "notes": long_notes}])
+        r = _extractors.extract(p)
+        # The full long_notes string should not appear; the truncated prefix should.
+        truncated = "Notes: " + ("x" * _PPTX_NOTES_CHARS_PER_SLIDE_MAX)
+        assert truncated in r.text
+        assert long_notes not in r.text
+
+    def test_no_notes_does_not_access_notes_slide(self, tmp_path, monkeypatch):
+        """Critical: extracting from a deck with no notes must NOT touch
+        slide.notes_slide at all — accessing it has a creation side effect.
+
+        The extractor does not save the in-memory presentation back to disk,
+        so a round-trip read-back wouldn't catch the violation. Instead,
+        monkeypatch Slide.notes_slide to raise on access. If the extractor
+        accidentally accesses it (i.e., violates the has_notes_slide gate),
+        the property will raise and bubble up as status='failed'."""
+        from fda.organize import _extractors
+        from pptx.slide import Slide
+
+        p = tmp_path / "no_notes.pptx"
+        _build_pptx(p, slides=[{"title": "T"}])  # no `notes` key
+
+        def _no_access(self):
+            raise AssertionError(
+                "extractor accessed slide.notes_slide on a no-notes slide "
+                "without gating on has_notes_slide"
+            )
+
+        monkeypatch.setattr(Slide, "notes_slide", property(_no_access))
+
+        r = _extractors.extract(p)
+        # Status must be ok — the extractor walked the slide without ever
+        # touching the patched property. If the extractor accessed it,
+        # AssertionError is caught by extract()'s outer try/except and the
+        # violation message ends up in r.note.
+        assert r.status == "ok", (
+            f"extractor accessed notes_slide without guard: r.note={r.note!r}"
+        )
+        assert "Notes:" not in r.text
+
+    def test_whitespace_only_notes_skipped(self, tmp_path):
+        """PowerPoint commonly creates notes slides containing only a stray
+        newline; those must NOT produce a spurious 'Notes:' line."""
+        from fda.organize import _extractors
+
+        p = tmp_path / "ws_notes.pptx"
+        _build_pptx(p, slides=[{"title": "T", "notes": "\n"}])
+        r = _extractors.extract(p)
+        assert "Notes:" not in r.text
+
+    def test_notes_text_frame_none_skipped(self, tmp_path, monkeypatch):
+        """Even when has_notes_slide is True, notes_text_frame can be None
+        (notes placeholder removed from the notes-slide layout). The extractor
+        must None-check before reading .text."""
+        from fda.organize import _extractors
+        from pptx import Presentation
+
+        p = tmp_path / "tf_none.pptx"
+        _build_pptx(p, slides=[{"title": "T", "notes": "real notes"}])
+
+        # Patch NotesSlide.notes_text_frame to None at the class level so the
+        # extractor sees the None case without us having to manipulate XML.
+        from pptx.slide import NotesSlide
+        monkeypatch.setattr(
+            NotesSlide, "notes_text_frame", property(lambda self: None)
+        )
+
+        r = _extractors.extract(p)
+        assert r.status == "ok"
+        assert "Notes:" not in r.text
