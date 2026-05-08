@@ -1640,3 +1640,98 @@ class TestCsvSectionsPostProcessing:
         # And the other valid headers are present.
         assert "customer_id" in r.sections
         assert "amount" in r.sections
+
+
+class TestCsvText:
+    def test_more_than_max_rows_capped(self, tmp_path):
+        from fda.organize import _extractors
+        from fda.organize._extractors import _CSV_TEXT_ROWS_MAX
+
+        p = tmp_path / "many_rows.csv"
+        # Header + (CAP + 5) data rows.
+        body = "name,age\n" + "".join(
+            f"row{i:03d},{i}\n" for i in range(_CSV_TEXT_ROWS_MAX + 5)
+        )
+        p.write_text(body)
+        r = _extractors.extract(p)
+        assert r.status == "ok"
+        # Rows 0 .. _CSV_TEXT_ROWS_MAX-1 in serialized text (header counts as row 0).
+        # We expect the header row + (_CSV_TEXT_ROWS_MAX - 1) data rows.
+        assert "name\tage\n" in r.text
+        assert f"row{_CSV_TEXT_ROWS_MAX - 2:03d}" in r.text  # last included data row
+        assert f"row{_CSV_TEXT_ROWS_MAX - 1:03d}" not in r.text  # first dropped
+        assert f"row{_CSV_TEXT_ROWS_MAX + 4:03d}" not in r.text  # well past cap
+
+    def test_more_than_max_cols_per_row_capped(self, tmp_path):
+        from fda.organize import _extractors
+        from fda.organize._extractors import _CSV_TEXT_COLS_PER_ROW
+
+        p = tmp_path / "wide.csv"
+        n_cols = _CSV_TEXT_COLS_PER_ROW + 5
+        headers = [f"c{i:02d}" for i in range(n_cols)]
+        values = [f"v{i:02d}" for i in range(n_cols)]
+        p.write_text(",".join(headers) + "\n" + ",".join(values) + "\n")
+        r = _extractors.extract(p)
+        assert r.status == "ok"
+        # Each text row contains _CSV_TEXT_COLS_PER_ROW tab-separated cells.
+        first_text_row = r.text.splitlines()[0]
+        assert first_text_row.count("\t") == _CSV_TEXT_COLS_PER_ROW - 1
+        assert f"c{_CSV_TEXT_COLS_PER_ROW - 1:02d}" in first_text_row
+        assert f"c{_CSV_TEXT_COLS_PER_ROW:02d}" not in first_text_row
+
+    def test_quoted_embedded_newline_yields_one_record(self, tmp_path):
+        from fda.organize import _extractors
+
+        p = tmp_path / "embedded_nl.csv"
+        # cell-A contains an embedded newline; csv.reader yields ONE row.
+        p.write_text(
+            'description,name\n'
+            '"line1\nline2",alice\n'
+        )
+        r = _extractors.extract(p)
+        assert r.status == "ok"
+        # The embedded newline is preserved inside the cell — first text row
+        # is "description\tname\n", second is the multi-line cell joined with name.
+        assert "description\tname\n" in r.text
+        # The "line1\nline2" cell is one record; its content is preserved verbatim.
+        assert "line1\nline2" in r.text
+
+    def test_quoted_delimiter_inside_cell_preserved(self, tmp_path):
+        from fda.organize import _extractors
+
+        p = tmp_path / "quoted_delim.csv"
+        p.write_text(
+            'pair,name\n'
+            '"a,b",alice\n'
+            '"c,d",bob\n'
+        )
+        r = _extractors.extract(p)
+        assert r.status == "ok"
+        # The "a,b" cell remains a single cell; the comma inside survives.
+        assert "a,b\talice" in r.text
+        assert "c,d\tbob" in r.text
+
+    def test_trailing_comma_preserves_empty_trailing_cell(self, tmp_path):
+        from fda.organize import _extractors
+
+        p = tmp_path / "trail.csv"
+        # Header with trailing comma → 3 cells, last empty.
+        p.write_text("a,b,\n1,2,3\n4,5,6\n")
+        r = _extractors.extract(p)
+        assert r.status == "ok"
+        # First text row has two tab separators (3 cells, last empty).
+        first_text_row = r.text.splitlines()[0]
+        assert first_text_row.count("\t") == 2
+        assert first_text_row.endswith("\t") or first_text_row.endswith("\t ") or first_text_row == "a\tb\t"
+
+    def test_crlf_line_endings_handled(self, tmp_path):
+        from fda.organize import _extractors
+
+        p = tmp_path / "crlf.csv"
+        # csv.reader handles both CRLF and LF transparently.
+        p.write_bytes(b"name,age\r\nalice,30\r\nbob,25\r\n")
+        r = _extractors.extract(p)
+        assert r.status == "ok"
+        assert r.sections == ("name", "age")
+        assert "name\tage\n" in r.text
+        assert "alice\t30\n" in r.text
