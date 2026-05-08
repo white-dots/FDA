@@ -454,7 +454,7 @@ def _extract_csv(path: Path) -> ExtractionResult:
                 continue
             normalized = [" ".join(c.split()) for c in non_empty]
             if not all(
-                SECTION_HEADER_MIN_CHARS <= len(s) <= SECTION_HEADER_MAX_CHARS
+                SECTION_HEADER_MIN_CHARS <= len(s.encode("utf-8")) <= SECTION_HEADER_MAX_CHARS
                 for s in normalized
             ):
                 continue
@@ -484,7 +484,7 @@ def _extract_csv(path: Path) -> ExtractionResult:
             label = " ".join(str(cell).split())
             if not label:
                 continue
-            if not (SECTION_HEADER_MIN_CHARS <= len(label) <= SECTION_HEADER_MAX_CHARS):
+            if not (SECTION_HEADER_MIN_CHARS <= len(label.encode("utf-8")) <= SECTION_HEADER_MAX_CHARS):
                 continue
             if label in seen:
                 continue

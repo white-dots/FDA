@@ -1277,3 +1277,51 @@ class TestCsvSections:
         # delimiter normalized to tab in serialized output
         assert "customer_id\torder_date\n" in r.text
         assert "1\t2024-01-01\n" in r.text
+
+
+class TestCsvEncoding:
+    def test_utf8_bom_stripped_from_first_header_and_text(self, tmp_path):
+        from fda.organize import _extractors
+
+        p = tmp_path / "bom.csv"
+        # ﻿ is the UTF-8 BOM; utf-8-sig must strip it from the first
+        # header label so the section is "name", not "﻿name".
+        p.write_bytes("﻿name,age\nalice,30\n".encode("utf-8"))
+        r = _extractors.extract(p)
+        assert r.status == "ok"
+        assert r.sections == ("name", "age")
+        assert "﻿" not in r.text
+
+    def test_utf8_korean_headers(self, tmp_path):
+        from fda.organize import _extractors
+
+        p = tmp_path / "ko_utf8.csv"
+        p.write_text("이름,나이,도시\n홍길동,30,서울\n", encoding="utf-8")
+        r = _extractors.extract(p)
+        assert r.status == "ok"
+        assert "이름" in r.sections
+        assert "나이" in r.sections
+        assert "도시" in r.sections
+
+    def test_cp949_korean_headers_fall_back(self, tmp_path):
+        from fda.organize import _extractors
+
+        p = tmp_path / "ko_cp949.csv"
+        # Excel-Korean exports default to cp949; bytes do NOT decode under utf-8.
+        p.write_bytes("이름,나이,도시\n홍길동,30,서울\n".encode("cp949"))
+        r = _extractors.extract(p)
+        assert r.status == "ok"
+        assert "이름" in r.sections
+        assert "나이" in r.sections
+        assert "도시" in r.sections
+
+    def test_undecodable_bytes_yield_failed_status(self, tmp_path):
+        from fda.organize import _extractors
+
+        p = tmp_path / "bad.csv"
+        # 0xff sequences that decode under neither utf-8-sig nor cp949.
+        p.write_bytes(b"\xff\xfe\xff\xfe\xff\xfe\xff\xfe")
+        r = _extractors.extract(p)
+        assert r.status == "failed"
+        assert r.text is None
+        assert r.sections == ()
