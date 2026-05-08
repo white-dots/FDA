@@ -313,7 +313,7 @@ Add seven new test classes alongside the existing `TestExtractSectionsFromText`.
 - Cap at `MAX_SECTIONS_PER_FILE`: produce 30 distinct Korean labels via repeated bracket lines → result length equals `MAX_SECTIONS_PER_FILE`.
 
 **`TestKoreanRegexBacktrackingBound`:**
-- Each Korean regex run against a 16K-character malformed line (e.g., 16K `한` characters with no closing bracket / no terminating colon / no proper bullet line). Test wraps the call in a wall-clock budget (e.g., `time.monotonic()` before and after, asserting elapsed < 100ms). Pins the bounded `{0,40}` lookahead + `{2,40}` capture structure against accidental regression to unbounded `*?` form, which Codex measured at ~6.7s on the same input. The 100ms budget is generous (bounded version is ~10µs in measurement) but tight enough to fail loudly if a future edit reintroduces unbounded backtracking.
+- Each Korean regex run against a 16K-character malformed line (e.g., 16K `한` characters with no closing bracket / no terminating colon / no proper bullet line). Test wraps the call in a wall-clock budget (`time.monotonic()` before and after, asserting elapsed < 500ms). Pins the bounded `{0,40}` lookahead + `{2,40}` capture structure against accidental regression to unbounded `*?` form, which Codex measured at ~6.7s on the same input. The 500ms budget is loose enough to absorb noisy CI runner pauses (the bounded version is ~10µs in measurement) but still ~13× tighter than the unbounded regression, so it fails loudly if a future edit reintroduces unbounded backtracking.
 
 **`TestContainsHangul`:**
 - `contains_hangul("이름")` → `True`.
@@ -351,7 +351,7 @@ The Future Plan flagged "no Korean corpus" as the reason this work was parked. N
 3. If false-negative rate is high for a specific shape that v1 chose to skip (e.g., numbered headers `1. 제품 정보`), document the gap for v2; do **not** widen v1 patterns mid-implementation without a brainstorm round.
 4. If real-corpus output is acceptable, merge. If not, revise patterns in the spec, re-run unit tests, re-validate.
 
-This step is a manual quality gate, not an automated test; it goes in the implementation plan's done-condition checklist rather than the pytest suite.
+This step is a manual quality gate, not an automated test; results are recorded in this spec's "Real-corpus validation results" section below (rather than in the pytest suite or in the implementation plan).
 
 ### Constants test
 
@@ -393,7 +393,7 @@ Tracked in Obsidian: `Future Plan - Structural Sections Across Formats.md`. The 
 - All existing tests in `TestExtractSectionsFromText` pass unchanged.
 - `tests/test_organize_constraints.py` registers `KOREAN_LABEL_MIN_CHARS` and `HANGUL_RANGE`.
 - Optional Korean plaintext reader integration test passes (or is intentionally omitted with a one-line spec note in the implementation plan).
-- Real-corpus validation pass complete; results recorded in the implementation plan's done-condition checklist.
+- Real-corpus validation pass complete; results recorded below in the "Real-corpus validation results" section.
 - Full pytest suite green.
 - One commit per task; merged independently of the in-flight CSV work; the minor append-style conflict in `tests/test_organize_constraints.py` resolves mechanically (different keys). Optional integration test goes in a new `TestKoreanSectionsThroughReader` class in `tests/test_organize_reader.py` so there's no class-body collision with CSV's `TestSectionsPropagationDocxXlsx`.
 
