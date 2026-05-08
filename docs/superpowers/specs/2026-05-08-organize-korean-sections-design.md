@@ -399,11 +399,16 @@ Tracked in Obsidian: `Future Plan - Structural Sections Across Formats.md`. The 
 
 ## Real-corpus validation results
 
-**Corpus:** Lion Chemtech client documents (8 Korean PDFs sampled across three document types: production logs `성형일지` / `가공일지`, R&R organizational sheets `개인별 업무 리스트_*`, and a proposal deck). Cross-referenced against representative `.docx` (`01_생산팀_질문지_완.docx`, `02_품질관리팀_질문지_업데이트.docx`) and `.xlsx` (`수출260410.xlsx`) shapes via direct text inspection.
+**Corpus:** Lion Chemtech client documents (8 Korean PDFs sampled across three document types: 2 production logs `성형일지` / `가공일지`, 5 R&R organizational sheets `개인별 업무 리스트_*`, 1 proposal deck `lion_chemtech_ax_proposal.pdf`). Cross-referenced against representative `.docx` (`01_생산팀_질문지_완.docx`, `02_품질관리팀_질문지_업데이트.docx`) and `.xlsx` (`수출260410.xlsx`) shapes via direct text inspection.
 
-**Method:** Loaded `_sections.py` standalone, extracted PDF text with `pdftotext -layout -nopgbrk`, ran `extract_sections_from_text` per file. Probed individual representative lines from the docx/xlsx corpus directly through the same function.
+**Method:** Loaded `_sections.py` standalone, extracted PDF text with `pdftotext -layout -nopgbrk`, ran `extract_sections_from_text` per file. Probed individual representative lines from the docx/xlsx corpus directly through the same function. Counted plausible Korean banner-style lines (numbered prefix `\d+\.\s+`, emoji prefix) in the same extractable text to estimate false-negative volume.
 
-**Quantitative result:** Across 8 PDFs — 3 extract failures (scanned image PDFs returning empty text; not a regex concern), 5 successfully extracted (~28K Hangul characters total). 0 sections detected, 0 false positives.
+**Quantitative result:**
+- 8 PDFs sampled. 3 produced empty text under pdftotext (the 2 production logs and the proposal deck — image-based; scanner / vector content; not a regex concern). 5 PDFs extracted as Korean text (the R&R sheets), totalling ~28K Hangul characters.
+- **Sections detected:** 0 across all 5 extractable PDFs.
+- **False positives:** 0.
+- **False negatives in PDFs:** 0 missed banner candidates — the 5 R&R sheets are tabular layouts (`구분 | 업무명 | 업무 상세 내용` columns), and inspection found no numbered/emoji-prefixed Hangul lines either. The PDFs simply contain no banner-style headers in any shape v1 or v2 would target.
+- **False negatives in docx:** ~5+ numbered headers per questionnaire (`1. 데이터 관리 현황`, `2. MES화 기초작업 현황`, …) and 1 emoji header per file (`📋 안내사항`); these straddle Word run boundaries so an exact count requires the docx text-joining pass, but inspection of two questionnaires showed numbered/emoji headers as the dominant header style in those files.
 
 **Line-level probes (from real corpus):**
 
@@ -416,7 +421,9 @@ Tracked in Obsidian: `Future Plan - Structural Sections Across Formats.md`. The 
 | `대상 팀`, `작성자` (docx) | ❌ no match | bare label, no banner shape |
 | `AI 전환(AIX) 사전 진단을 위한 현황 파악` (docx) | ❌ no match | prose with parens, not a banner |
 
-**Why the PDF corpus produced zero hits:** the sampled PDFs are tabular role/responsibility sheets (`개인별 업무 리스트`) — they consist of column headers (`구분 | 업무명 | 업무 상세 내용`) plus rows of names and tasks. None of those lines have v1's bracket / colon / bullet shape. The bracket and colon regexes correctly fire on the xlsx/docx cells that *do* use those shapes, confirming the patterns work; the PDF samples just don't contain that style of banner.
+**Why the PDF corpus produced zero hits:** the 5 extractable PDFs are tabular R&R sheets (`개인별 업무 리스트_*`) — column headers (`구분 | 업무명 | 업무 상세 내용`) plus rows of names and tasks; no banner-style headers in any shape (v1 patterns or v2 candidates). The other 3 sampled PDFs (production logs, proposal) failed extraction at pdftotext, so the regex layer never saw their content. The bracket and colon regexes correctly fire on the xlsx/docx cells that *do* use those shapes, confirming the patterns work; the extractable PDF samples just don't contain that style of banner.
+
+**Ranking source for v2 priority:** "frequency in this corpus" below means "qualitative frequency observed across the docx + xlsx + pdf samples inspected," not a count from an automated sweep. The numbered-header style appeared in every docx questionnaire opened; emoji-prefixed appeared once per docx; bare-label style appeared once per docx (대상 팀 / 작성자 / 목적 metadata triplet).
 
 **Decision:** MERGE v1 as-is. False-positive rate is 0%; the v1-chosen patterns (bracket / colon / bullet) work correctly when their shapes appear. The dominant false-negative source is numbered-header style (`1. 제품 정보`) — exactly the v2 follow-up the plan anticipated. The plan's directive — "do not widen v1 patterns mid-implementation; open a new brainstorm" — applies cleanly.
 
