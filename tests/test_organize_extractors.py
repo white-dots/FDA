@@ -1559,3 +1559,84 @@ class TestCsvHeaderDetection:
         assert r.status == "ok"
         # Fallback scan ran; row 2 qualified.
         assert r.sections == ("name", "age", "city")
+
+
+class TestCsvSectionsPostProcessing:
+    def test_short_cells_filtered_by_min_chars(self, tmp_path):
+        """Cells with stripped length < SECTION_HEADER_MIN_CHARS are dropped.
+        When all cells fail, sections fall back to NoHeader."""
+        from fda.organize import _extractors
+        from unittest.mock import patch
+
+        p = tmp_path / "short.csv"
+        # 1- and 2-char cells; trust row 1 via has_header=True so we exercise
+        # the length-guard branch on a header row, not the scan rule (2).
+        p.write_text("a,b,c,d\n1,2,3,4\n")
+        with patch("csv.Sniffer.has_header", return_value=True):
+            r = _extractors.extract(p)
+        assert r.status == "ok"
+        assert r.sections == ("NoHeader",)
+
+    def test_long_cells_filtered_by_max_chars(self, tmp_path):
+        from fda.organize import _extractors
+
+        p = tmp_path / "long.csv"
+        # 41 chars > SECTION_HEADER_MAX_CHARS (40)
+        long_label = "x" * 41
+        p.write_text(f"{long_label},name,age\n1,alice,30\n2,bob,25\n")
+        r = _extractors.extract(p)
+        assert r.status == "ok"
+        # The 41-char label is dropped; survivors land in order.
+        assert r.sections == ("name", "age")
+
+    def test_mixed_valid_and_short_cells(self, tmp_path):
+        from fda.organize import _extractors
+
+        p = tmp_path / "mixed.csv"
+        # `a` (1 char) and `bb` (2 chars) drop; `name` and `email` survive.
+        p.write_text(
+            "a,name,bb,email\n"
+            "1,alice,x,alice@example.com\n"
+            "2,bob,y,bob@example.com\n"
+        )
+        r = _extractors.extract(p)
+        assert r.status == "ok"
+        assert r.sections == ("name", "email")
+
+    def test_more_than_max_distinct_headers_capped(self, tmp_path):
+        from fda.organize import _extractors
+        from fda.organize._sections import MAX_SECTIONS_PER_FILE
+
+        p = tmp_path / "many.csv"
+        # MAX + 5 distinct headers, all length-guard valid (4-char names).
+        headers = [f"col{i:02d}" for i in range(MAX_SECTIONS_PER_FILE + 5)]
+        p.write_text(
+            ",".join(headers) + "\n"
+            + ",".join(["1"] * len(headers)) + "\n"
+            + ",".join(["2"] * len(headers)) + "\n"
+        )
+        r = _extractors.extract(p)
+        assert r.status == "ok"
+        assert len(r.sections) == MAX_SECTIONS_PER_FILE
+        assert r.sections[0] == "col00"
+        assert r.sections[-1] == f"col{MAX_SECTIONS_PER_FILE - 1:02d}"
+
+    def test_header_named_NoHeader_does_not_duplicate(self, tmp_path):
+        """If a real header column is literally named "NoHeader", the
+        synthesized fallback path is not reached (other columns make sections
+        non-empty), and ordered-set dedupe ensures no duplication regardless."""
+        from fda.organize import _extractors
+
+        p = tmp_path / "shadow.csv"
+        p.write_text(
+            "NoHeader,customer_id,amount\n"
+            "x,1,100\n"
+            "y,2,200\n"
+        )
+        r = _extractors.extract(p)
+        assert r.status == "ok"
+        # "NoHeader" appears at most once.
+        assert r.sections.count("NoHeader") <= 1
+        # And the other valid headers are present.
+        assert "customer_id" in r.sections
+        assert "amount" in r.sections
