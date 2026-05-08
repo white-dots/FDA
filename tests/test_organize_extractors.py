@@ -964,3 +964,79 @@ class TestPptxSections:
         ])
         r = _extractors.extract(p)
         assert r.sections == ("Agenda", "Wrap")
+
+    def test_slide_without_title_placeholder_contributes_no_section(self, tmp_path):
+        """layout 6 (Blank) has no title placeholder; sections should skip it."""
+        from fda.organize import _extractors
+
+        p = tmp_path / "blank.pptx"
+        _build_pptx(p, slides=[
+            {"layout": 0, "title": "Has Title"},
+            {"layout": 6, "title": None},
+            {"layout": 0, "title": "After Blank"},
+        ])
+        r = _extractors.extract(p)
+        assert r.sections == ("Has Title", "After Blank")
+
+    def test_two_char_title_filtered_by_min_chars(self, tmp_path):
+        from fda.organize import _extractors
+
+        p = tmp_path / "short.pptx"
+        _build_pptx(p, slides=[{"title": "OK"}, {"title": "Real Title"}])
+        r = _extractors.extract(p)
+        assert r.sections == ("Real Title",)
+        # Banner must NOT include the guard-failing title (spec: "If title
+        # fails the length guard, append `Slide N:\n` with no title").
+        assert "Slide 1: OK" not in r.text
+        assert "Slide 1:\n" in r.text
+
+    def test_long_title_filtered_by_max_chars(self, tmp_path):
+        from fda.organize import _extractors
+
+        p = tmp_path / "long.pptx"
+        # 41 chars > SECTION_HEADER_MAX_CHARS (40)
+        long_title = "x" * 41
+        _build_pptx(p, slides=[
+            {"title": long_title},
+            {"title": "Kept"},
+        ])
+        r = _extractors.extract(p)
+        assert r.sections == ("Kept",)
+        # Banner must NOT include the guard-failing title.
+        assert long_title not in r.text
+        assert "Slide 1:\n" in r.text
+
+    def test_whitespace_only_title_filtered(self, tmp_path):
+        from fda.organize import _extractors
+
+        p = tmp_path / "ws.pptx"
+        _build_pptx(p, slides=[
+            {"title": "   "},
+            {"title": "Real"},
+        ])
+        r = _extractors.extract(p)
+        assert r.sections == ("Real",)
+
+    def test_more_than_max_sections_capped(self, tmp_path):
+        from fda.organize import _extractors
+        from fda.organize._sections import MAX_SECTIONS_PER_FILE
+
+        p = tmp_path / "many.pptx"
+        _build_pptx(p, slides=[
+            {"title": f"Slide{i:02d}"} for i in range(MAX_SECTIONS_PER_FILE + 5)
+        ])
+        r = _extractors.extract(p)
+        assert len(r.sections) == MAX_SECTIONS_PER_FILE
+        assert r.sections[0] == "Slide00"
+        assert r.sections[-1] == f"Slide{MAX_SECTIONS_PER_FILE - 1:02d}"
+
+    def test_empty_deck_yields_empty_sections(self, tmp_path):
+        from fda.organize import _extractors
+        from pptx import Presentation
+
+        p = tmp_path / "empty.pptx"
+        Presentation().save(str(p))
+        r = _extractors.extract(p)
+        assert r.status == "ok"
+        assert r.sections == ()
+        assert r.text == ""
