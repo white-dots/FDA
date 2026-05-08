@@ -340,6 +340,17 @@ def _extract_pptx(path: Path) -> ExtractionResult:
         else:
             text_parts.append(f"Slide {slide_idx}:\n")
 
+        for shape_idx, shape in enumerate(slide.shapes, start=1):
+            if shape_idx > _PPTX_SHAPES_PER_SLIDE_MAX:
+                break
+            if not shape.has_text_frame:
+                continue
+            body = shape.text_frame.text
+            if body:
+                text_parts.append(body + "\n")
+
+        text_parts.append("\n")  # blank line between slides
+
     return ExtractionResult(
         text="".join(text_parts),
         status="ok",

@@ -1003,7 +1003,11 @@ class TestPptxSections:
         r = _extractors.extract(p)
         assert r.sections == ("Kept",)
         # Banner must NOT include the guard-failing title.
-        assert long_title not in r.text
+        # NOTE: the title TEXT may still appear via the shape walk that visits
+        # the title placeholder (Task 4 spec: "both are acceptable"), so we
+        # only assert the banner-form specifically — mirrors the sibling
+        # test_two_char_title_filtered_by_min_chars pattern.
+        assert f"Slide 1: {long_title}" not in r.text
         assert "Slide 1:\n" in r.text
 
     def test_whitespace_only_title_filtered(self, tmp_path):
@@ -1040,3 +1044,51 @@ class TestPptxSections:
         assert r.status == "ok"
         assert r.sections == ()
         assert r.text == ""
+
+
+class TestPptxText:
+    def test_banner_includes_slide_index_and_title(self, tmp_path):
+        from fda.organize import _extractors
+
+        p = tmp_path / "banner.pptx"
+        _build_pptx(p, slides=[
+            {"title": "Intro"},
+            {"title": "Results"},
+        ])
+        r = _extractors.extract(p)
+        assert r.status == "ok"
+        assert "Slide 1: Intro" in r.text
+        assert "Slide 2: Results" in r.text
+
+    def test_no_title_banner_has_no_title_suffix(self, tmp_path):
+        from fda.organize import _extractors
+
+        p = tmp_path / "blank.pptx"
+        _build_pptx(p, slides=[{"layout": 6, "title": None}])
+        r = _extractors.extract(p)
+        # Banner is exactly "Slide 1:\n" with no title suffix.
+        assert "Slide 1:\n" in r.text
+        assert "Slide 1: " not in r.text  # no trailing-space title form
+
+    def test_shape_text_included_in_text(self, tmp_path):
+        from fda.organize import _extractors
+
+        p = tmp_path / "shapes.pptx"
+        _build_pptx(p, slides=[
+            {"title": "Header", "body_shapes": ["Bullet point one", "Bullet point two"]},
+        ])
+        r = _extractors.extract(p)
+        assert "Bullet point one" in r.text
+        assert "Bullet point two" in r.text
+
+    def test_title_shape_appears_only_in_banner_or_shapes_not_omitted(self, tmp_path):
+        """The title appears in the banner, and may also appear when shape
+        iteration visits the title placeholder. Both are acceptable per spec
+        (the banner makes slide order legible; the shape pass keeps iteration
+        uniform). Assert presence, not exact count."""
+        from fda.organize import _extractors
+
+        p = tmp_path / "title_only.pptx"
+        _build_pptx(p, slides=[{"title": "OnlyTitle"}])
+        r = _extractors.extract(p)
+        assert "OnlyTitle" in r.text
