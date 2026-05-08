@@ -301,6 +301,52 @@ def _extract_xlsx(path: Path) -> ExtractionResult:
     )
 
 
+def _extract_pptx(path: Path) -> ExtractionResult:
+    """Extract text + slide-title sections from a .pptx file.
+
+    Sections: slide titles read from the title placeholder, in slide order,
+    deduped, length-guarded, capped at MAX_SECTIONS_PER_FILE. Slides whose
+    layout has no title placeholder contribute nothing to sections.
+
+    Text: per slide, "Slide N: <title>\n" banner + shape text from every
+    text-bearing shape + speaker notes (when present, with all guards).
+    Banner omits title when title fails the length guard or is empty after
+    trim. No extractor-side byte cap — Reader owns the 64 KiB contract cap.
+    """
+    from pptx import Presentation
+
+    prs = Presentation(str(path))
+    sections: list[str] = []
+    seen: dict[str, None] = {}
+    text_parts: list[str] = []
+
+    for slide_idx, slide in enumerate(prs.slides, start=1):
+        if slide_idx > _PPTX_SLIDES_MAX:
+            break
+
+        title_shape = slide.shapes.title
+        title_for_banner = ""  # set ONLY when title passes length guard
+        if title_shape is not None:
+            raw = title_shape.text or ""
+            candidate = " ".join(raw.split())
+            if SECTION_HEADER_MIN_CHARS <= len(candidate) <= SECTION_HEADER_MAX_CHARS:
+                title_for_banner = candidate
+                if candidate not in seen and len(sections) < MAX_SECTIONS_PER_FILE:
+                    seen[candidate] = None
+                    sections.append(candidate)
+
+        if title_for_banner:
+            text_parts.append(f"Slide {slide_idx}: {title_for_banner}\n")
+        else:
+            text_parts.append(f"Slide {slide_idx}:\n")
+
+    return ExtractionResult(
+        text="".join(text_parts),
+        status="ok",
+        sections=tuple(sections),
+    )
+
+
 EXTRACTORS: dict[str, TextExtractor] = {
     ".txt": _read_text,
     ".md": _read_text,
@@ -311,6 +357,7 @@ EXTRACTORS: dict[str, TextExtractor] = {
     ".pdf": _extract_pdf_text,
     ".docx": _extract_docx,
     ".xlsx": _extract_xlsx,
+    ".pptx": _extract_pptx,
 }
 
 

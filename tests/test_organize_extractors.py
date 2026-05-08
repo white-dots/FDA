@@ -893,3 +893,74 @@ class TestXlsxFormulaFallback:
         # The formula string must appear in `text` — i.e., the fallback
         # lookup at (sheet="Sparse", row=10, col=2) succeeds.
         assert "=1+1" in r.text
+
+
+# ---------------------------------------------------------------------------
+# .pptx — slide-title placeholders drive sections; banner+shapes+notes drive text
+# ---------------------------------------------------------------------------
+
+
+def _build_pptx(path, *, slides):
+    """Build a minimal .pptx at `path`.
+
+    `slides` is a list of dicts:
+      {"layout": int (slide_layouts index, default 0=Title Slide),
+       "title": str|None,
+       "body_shapes": list[str]|None,
+       "notes": str|None}
+
+    `notes` is set ONLY when a string is provided — touching `slide.notes_slide`
+    has a creation side effect, so leaving it None must NOT touch it.
+    """
+    from pptx import Presentation
+    from pptx.util import Inches
+
+    prs = Presentation()
+    for spec in slides:
+        layout_idx = spec.get("layout", 0)
+        slide = prs.slides.add_slide(prs.slide_layouts[layout_idx])
+        if spec.get("title") is not None and slide.shapes.title is not None:
+            slide.shapes.title.text = spec["title"]
+        for body_text in spec.get("body_shapes") or []:
+            tx = slide.shapes.add_textbox(Inches(1), Inches(2), Inches(4), Inches(1))
+            tx.text_frame.text = body_text
+        notes = spec.get("notes")
+        if notes is not None:  # only touch notes_slide if explicitly requested
+            slide.notes_slide.notes_text_frame.text = notes
+    prs.save(str(path))
+
+
+class TestPptxSections:
+    def test_single_slide_with_title_yields_one_section(self, tmp_path):
+        from fda.organize import _extractors
+
+        p = tmp_path / "a.pptx"
+        _build_pptx(p, slides=[{"title": "Quarterly Review"}])
+        r = _extractors.extract(p)
+        assert r.status == "ok"
+        assert r.sections == ("Quarterly Review",)
+
+    def test_multi_slide_titles_preserved_in_order(self, tmp_path):
+        from fda.organize import _extractors
+
+        p = tmp_path / "deck.pptx"
+        _build_pptx(p, slides=[
+            {"title": "Intro"},
+            {"title": "Results"},
+            {"title": "Next Steps"},
+        ])
+        r = _extractors.extract(p)
+        assert r.status == "ok"
+        assert r.sections == ("Intro", "Results", "Next Steps")
+
+    def test_duplicate_titles_deduped(self, tmp_path):
+        from fda.organize import _extractors
+
+        p = tmp_path / "dups.pptx"
+        _build_pptx(p, slides=[
+            {"title": "Agenda"},
+            {"title": "Agenda"},
+            {"title": "Wrap"},
+        ])
+        r = _extractors.extract(p)
+        assert r.sections == ("Agenda", "Wrap")
