@@ -27,6 +27,21 @@ KOREAN_LABEL_MIN_CHARS = 2
 # intentionally excluded — see spec Non-goals.
 HANGUL_RANGE = "가-힣"
 
+# Precompiled once for cheap reuse by contains_hangul().
+_HANGUL_SEARCH_RE = re.compile(rf"[{HANGUL_RANGE}]")
+
+
+def contains_hangul(text: str) -> bool:
+    """True iff `text` contains at least one Hangul Syllables character.
+
+    Public so other modules (e.g., the csv extractor's per-cell length
+    guard) can apply per-script logic without re-deriving the regex char
+    class from HANGUL_RANGE. Excludes Jamo and CJK Hanja by construction
+    of HANGUL_RANGE itself — see spec Non-goals.
+    """
+    return bool(_HANGUL_SEARCH_RE.search(text))
+
+
 # Pattern A: line that is *just* a section header followed by a colon.
 #   "Shipping Details:" / "Bill To:" / "Order Details:"
 _HEADER_LINE_RE = re.compile(

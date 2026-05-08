@@ -147,3 +147,53 @@ class TestExtractSectionsFromText:
         result = extract_sections_from_text(head + padding + decoy)
         assert "Real Header" in result
         assert "Decoy Header" not in result
+
+
+# ---------------------------------------------------------------------------
+# contains_hangul — public helper for cross-module per-script logic
+# ---------------------------------------------------------------------------
+
+
+class TestContainsHangul:
+    def test_pure_hangul_returns_true(self):
+        from fda.organize._sections import contains_hangul
+
+        assert contains_hangul("이름") is True
+
+    def test_mixed_ascii_and_hangul_returns_true(self):
+        from fda.organize._sections import contains_hangul
+
+        assert contains_hangul("KPI 지표") is True
+
+    def test_pure_ascii_returns_false(self):
+        from fda.organize._sections import contains_hangul
+
+        assert contains_hangul("name") is False
+
+    def test_empty_string_returns_false(self):
+        from fda.organize._sections import contains_hangul
+
+        assert contains_hangul("") is False
+
+    def test_punctuation_only_returns_false(self):
+        from fda.organize._sections import contains_hangul
+
+        assert contains_hangul("[Q&A]") is False
+
+    def test_full_width_roman_returns_false(self):
+        """Full-width Roman characters are not Hangul. Pins the precise
+        Hangul-only intent of HANGUL_RANGE = U+AC00..U+D7A3."""
+        from fda.organize._sections import contains_hangul
+
+        assert contains_hangul("ＫＰＩ") is False
+
+    def test_hanja_returns_false(self):
+        """CJK Hanja excluded per v1 Non-goals."""
+        from fda.organize._sections import contains_hangul
+
+        assert contains_hangul("漢字") is False
+
+    def test_full_width_roman_plus_hangul_returns_true(self):
+        from fda.organize._sections import contains_hangul
+
+        assert contains_hangul("ＫＰＩ 지표") is True
