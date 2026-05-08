@@ -45,6 +45,13 @@ _XLSX_TEXT_COLS_PER_ROW = 32
 _XLSX_FORMULA_DENSITY_THRESHOLD = 0.05
 _XLSX_MERGED_CELLS_MIN = 3
 
+# pptx serialization caps (memory-bound the in-process slide/shape/notes walk;
+# do NOT cap `text` — Reader owns the 64 KiB contract cap via
+# READER_TEXT_CAP_BYTES).
+_PPTX_SLIDES_MAX = 100
+_PPTX_SHAPES_PER_SLIDE_MAX = 50
+_PPTX_NOTES_CHARS_PER_SLIDE_MAX = 2000
+
 _DOCX_HEADING_RE = re.compile(r"^Heading [1-9]$")
 
 

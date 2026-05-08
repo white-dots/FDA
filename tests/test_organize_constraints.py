@@ -78,6 +78,9 @@ class TestEachConstantHasOneHome:
         "_XLSX_TEXT_COLS_PER_ROW": ("_extractors.py", "32"),
         "_XLSX_FORMULA_DENSITY_THRESHOLD": ("_extractors.py", "0.05"),
         "_XLSX_MERGED_CELLS_MIN": ("_extractors.py", "3"),
+        "_PPTX_SLIDES_MAX": ("_extractors.py", "100"),
+        "_PPTX_SHAPES_PER_SLIDE_MAX": ("_extractors.py", "50"),
+        "_PPTX_NOTES_CHARS_PER_SLIDE_MAX": ("_extractors.py", "2000"),
     }
 
     def test_constant_defined_in_owning_module(self):
