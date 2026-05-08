@@ -1415,3 +1415,147 @@ class TestCsvDelimiter:
         assert r.status == "ok"
         # Comma-fallback parsed the headers correctly.
         assert r.sections == ("name", "age", "city")
+
+
+class TestCsvHeaderDetection:
+    def test_preamble_row_rejected_by_cell_count_mismatch(self, tmp_path):
+        """Free-form preamble row has different cell count than data rows;
+        rule (5) rejects it; row 2 qualifies and becomes the header.
+
+        has_header is mocked False to deterministically exercise the fallback
+        scan path — the spec's rule (5) only runs in that branch."""
+        from fda.organize import _extractors
+        from unittest.mock import patch
+
+        p = tmp_path / "preamble.csv"
+        # Row 1 has 1 cell ("Customer Export 2024-Q3"). Rows 2-4 have 5 cells.
+        p.write_text(
+            "Customer Export 2024-Q3\n"
+            "name,age,city,plan,status\n"
+            "alice,30,Paris,gold,active\n"
+            "bob,25,Berlin,silver,active\n"
+            "carol,35,Madrid,gold,churned\n"
+        )
+        with patch("csv.Sniffer.has_header", return_value=False):
+            r = _extractors.extract(p)
+        assert r.status == "ok"
+        assert r.sections == ("name", "age", "city", "plan", "status")
+
+    def test_multi_row_preamble_skipped(self, tmp_path):
+        """Three-line preamble of varying widths followed by a real header
+        and data — the scan window finds row 4 as the qualifying header."""
+        from fda.organize import _extractors
+        from unittest.mock import patch
+
+        p = tmp_path / "multi_preamble.csv"
+        p.write_text(
+            "Generated 2024-12-01\n"
+            "Confidential\n"
+            "Source: warehouse\n"
+            "name,age,city\n"
+            "alice,30,Paris\n"
+            "bob,25,Berlin\n"
+        )
+        with patch("csv.Sniffer.has_header", return_value=False):
+            r = _extractors.extract(p)
+        assert r.status == "ok"
+        assert r.sections == ("name", "age", "city")
+
+    def test_all_numeric_rows_yield_no_header_label(self, tmp_path):
+        """Pure-numeric rows fail rule (3) "no pure numbers"; no qualifying
+        scan row → NoHeader."""
+        from fda.organize import _extractors
+
+        p = tmp_path / "numbers.csv"
+        # Force has_header=False heuristic by mocking it: pure-numeric
+        # samples can occasionally fool the sniffer, so pin it deterministic.
+        from unittest.mock import patch
+        p.write_text("1,2,3\n4,5,6\n7,8,9\n")
+        with patch("csv.Sniffer.has_header", return_value=False):
+            r = _extractors.extract(p)
+        assert r.status == "ok"
+        assert r.sections == ("NoHeader",)
+
+    def test_garbage_row1_then_numeric_rows_yields_no_header_label(self, tmp_path):
+        from fda.organize import _extractors
+
+        p = tmp_path / "garbage.csv"
+        from unittest.mock import patch
+        # Row 1 is garbage 1-cell; rows 2+ are numeric. No row qualifies.
+        p.write_text("---\n1,2,3\n4,5,6\n")
+        with patch("csv.Sniffer.has_header", return_value=False):
+            r = _extractors.extract(p)
+        assert r.status == "ok"
+        assert r.sections == ("NoHeader",)
+
+    def test_numeric_headers_under_has_header_true_land_normally(self, tmp_path):
+        """When has_header=True, row 1 is trusted unconditionally — rule (3)
+        "no pure numbers" only applies to the fallback scan. Year-as-header
+        layouts (`2024,2025,2026`) must not be filtered."""
+        from fda.organize import _extractors
+
+        p = tmp_path / "years.csv"
+        from unittest.mock import patch
+        p.write_text("2024,2025,2026\n100,200,300\n400,500,600\n")
+        with patch("csv.Sniffer.has_header", return_value=True):
+            r = _extractors.extract(p)
+        assert r.status == "ok"
+        assert r.sections == ("2024", "2025", "2026")
+
+    def test_single_row_file_qualifies_under_rule5_no_following_row(self, tmp_path):
+        """Rule (5) accepts a candidate row when there is no following row
+        (R is the final row in the file)."""
+        from fda.organize import _extractors
+
+        p = tmp_path / "single_row.csv"
+        from unittest.mock import patch
+        p.write_text("name,age,city\n")
+        with patch("csv.Sniffer.has_header", return_value=False):
+            r = _extractors.extract(p)
+        assert r.status == "ok"
+        assert r.sections == ("name", "age", "city")
+
+    def test_duplicate_cells_in_scan_row_rejected(self, tmp_path):
+        """Rule (4) rejects rows with duplicate non-empty cells under the
+        fallback scan — duplicates don't look like a real header."""
+        from fda.organize import _extractors
+
+        p = tmp_path / "dup_scan.csv"
+        from unittest.mock import patch
+        # Row 1: duplicate cells reject under rule 4. Row 2: distinct
+        # column-header-shaped cells qualify.
+        p.write_text(
+            "name,name,name\n"
+            "alpha,beta,gamma\n"
+            "1,2,3\n"
+            "4,5,6\n"
+        )
+        with patch("csv.Sniffer.has_header", return_value=False):
+            r = _extractors.extract(p)
+        assert r.status == "ok"
+        assert r.sections == ("alpha", "beta", "gamma")
+
+    def test_has_header_csv_error_falls_back_to_scan(self, tmp_path):
+        """When csv.Sniffer.has_header() raises csv.Error, the implementation
+        treats it as False and runs the fallback scan — covers the explicit
+        failure mode in spec 'Step 3 — find the header row'."""
+        from fda.organize import _extractors
+        from unittest.mock import patch
+
+        p = tmp_path / "has_header_fail.csv"
+        # Preamble row + valid header row + data so the fallback scan can
+        # find row 2 via rule (5) once it runs.
+        p.write_text(
+            "Customer Export 2024-Q3\n"
+            "name,age,city\n"
+            "alice,30,Paris\n"
+            "bob,25,Berlin\n"
+        )
+        with patch(
+            "csv.Sniffer.has_header",
+            side_effect=__import__("csv").Error("could not determine"),
+        ):
+            r = _extractors.extract(p)
+        assert r.status == "ok"
+        # Fallback scan ran; row 2 qualified.
+        assert r.sections == ("name", "age", "city")
