@@ -71,6 +71,19 @@ _KOREAN_BRACKET_RE = re.compile(
     r"[ \t　]*[\]】》〕」][ \t　]*$"
 )
 
+
+# Char class excludes ":" (line-end anchor handles the terminal colon)
+# AND bullet markers so a line that mixes bullet + colon (e.g.,
+# "■ 회사 정보:") does not match either Korean regex (the bullet regex
+# separately excludes ":"). v1 limitation; bullet+colon ambiguity is
+# rare in real Korean docs.
+_KOREAN_COLON_RE = re.compile(
+    rf"^[ \t　]*"
+    rf"(?=[^:\n■◆●□◇○]{{0,40}}[{HANGUL_RANGE}])"
+    rf"([^:\n■◆●□◇○]{{2,40}})"
+    rf"[ \t　]*:[ \t　]*$"
+)
+
 # (regex, min_chars, normalize_case)
 # Tuple-driven iteration so each pattern carries its own length guard and
 # whether the existing ALL-CAPS-to-Title-case rule should fire. Korean
@@ -87,6 +100,7 @@ _PATTERNS: tuple[tuple[re.Pattern[str], int, bool], ...] = (
     (_HEADER_LINE_RE, SECTION_HEADER_MIN_CHARS, True),
     (_ALLCAPS_LINE_RE, SECTION_HEADER_MIN_CHARS, True),
     (_KOREAN_BRACKET_RE, KOREAN_LABEL_MIN_CHARS, False),
+    (_KOREAN_COLON_RE, KOREAN_LABEL_MIN_CHARS, False),
 )
 
 

@@ -302,3 +302,69 @@ class TestKoreanBracketBanners:
         from fda.organize._sections import extract_sections_from_text
 
         assert extract_sections_from_text("[발주서] 2024\n") == ()
+
+
+# ---------------------------------------------------------------------------
+# Korean colon labels — 이름: / 회사 정보: / 2024년 매출:
+# ---------------------------------------------------------------------------
+
+
+class TestKoreanColonLabels:
+    def test_two_syllable_label_matches(self):
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("이름:\n") == ("이름",)
+
+    def test_four_syllable_label_with_space_matches(self):
+        """`회사 정보` is 4 Hangul syllables + 1 space = 5 chars after trim."""
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("회사 정보:\n") == ("회사 정보",)
+
+    def test_trailing_space_before_colon_matches(self):
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("담당자 :\n") == ("담당자",)
+
+    def test_year_prefixed_label_matches(self):
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("2024년 매출:\n") == ("2024년 매출",)
+
+    def test_mid_line_colon_does_not_match(self):
+        """Line must end with `:` — `회사: 한화` ends with `한화`, not `:`."""
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("회사: 한화\n") == ()
+
+    def test_english_label_routes_to_english_pattern_not_korean(self):
+        """`Order ID:` must match _HEADER_LINE_RE (existing English regex),
+        NOT _KOREAN_COLON_RE — the Korean lookahead requires Hangul."""
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("Order ID:\n") == ("Order ID",)
+
+    def test_one_syllable_korean_dropped_by_min_2(self):
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("가:\n") == ()
+
+    def test_label_over_max_chars_dropped(self):
+        from fda.organize._sections import extract_sections_from_text
+
+        long_label = "한" * 41
+        assert extract_sections_from_text(f"{long_label}:\n") == ()
+
+    def test_u3000_leading_whitespace_handled(self):
+        """U+3000 ideographic space at line start — common in Korean templates."""
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("　이름:\n") == ("이름",)
+
+    def test_full_width_roman_plus_hangul_matches_verbatim(self):
+        """Mixed full-width Roman + Hangul: lookahead succeeds (Hangul present),
+        capture preserves full-width chars verbatim, normalize_case=False
+        leaves casing alone."""
+        from fda.organize._sections import extract_sections_from_text
+
+        assert extract_sections_from_text("ＫＰＩ 지표:\n") == ("ＫＰＩ 지표",)
