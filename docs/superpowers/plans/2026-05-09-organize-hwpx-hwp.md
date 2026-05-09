@@ -23,9 +23,9 @@
 - `zf.read(name)` — full uncompressed bytes (DO NOT call before checking `file_size`).
 - `defusedxml.ElementTree.fromstring(bytes_or_str)` — drop-in for `xml.etree.ElementTree.fromstring`; raises `xml.etree.ElementTree.ParseError` on malformed XML and `defusedxml.common.DefusedXmlException` (subclasses: `DTDForbidden`, `EntitiesForbidden`, `ExternalReferenceForbidden`) on intentionally-malicious payloads.
 - `Element.iter()` — depth-first iteration over self and descendants. `tag` is `"{namespace}localname"` for namespaced elements.
-- `pyhwp` (verified surface):
-  - `from hwp5.xmlmodel import Hwp5File` — text-transform-capable file wrapper.
-  - `from hwp5.hwp5txt import transform_hwp5_to_text` — writes plaintext bytes to a destination buffer.
+- `pyhwp` (verified surface, against upstream `pyhwp/hwp5/hwp5txt.py`):
+  - `from hwp5.xmlmodel import Hwp5File` — text-transform-capable file wrapper. Wrap in `contextlib.closing` (pyhwp's own `main()` does this).
+  - `from hwp5.hwp5txt import TextTransform` — class. **Note:** `transform_hwp5_to_text` is a `@property` on `TextTransform` (not a module-level function); the property returns a callable. Usage: `t = TextTransform(); t.transform_hwp5_to_text(hwp, buf)`.
   - `Hwp5File(str(path))` — accepts a string path; rejects `pathlib.Path` (coerce explicitly).
   - `hwp.fileheader.flags.password` — boolean (no exception on password-protected docs).
   - `hwp.fileheader.flags.distributable` — boolean (no exception on distributed docs; pyhwp routes them through ViewText).
@@ -60,30 +60,33 @@ Expected: install succeeds. **If install fails on Python 3.12 / 3.13,** record t
 ```bash
 /Users/john/.pyenv/versions/3.12.8/bin/python -c "
 from hwp5.xmlmodel import Hwp5File
-from hwp5.hwp5txt import transform_hwp5_to_text
-print('imports ok:', Hwp5File, transform_hwp5_to_text)
+from hwp5.hwp5txt import TextTransform
+t = TextTransform()
+fn = t.transform_hwp5_to_text   # @property returns a callable
+print('imports ok:', Hwp5File, TextTransform, fn)
 "
 ```
-Expected: prints `imports ok: <class 'hwp5.xmlmodel.Hwp5File'> <function transform_hwp5_to_text at ...>`.
+Expected: prints `imports ok: <class 'hwp5.xmlmodel.Hwp5File'> <class 'hwp5.hwp5txt.TextTransform'> <function ...>`.
 
-If any import fails, the spec's pinned API is wrong for the installed pyhwp version. Record the actual symbol locations (search via `python -c "import hwp5; help(hwp5)"` and the package's `__init__.py`) and update the spec's Step 3/4 accordingly before continuing.
+If any import fails, the plan's pinned API is wrong for the installed pyhwp version. Record the actual symbol locations (search via `python -c "import hwp5; help(hwp5)"` and the package's source) and update the plan's Step 4 / Task 9 / Task 10 accordingly before continuing.
 
 - [ ] **Step 4: Verify pyhwp opens one of the user's hand-made samples and produces Korean text**
 
 ```bash
 /Users/john/.pyenv/versions/3.12.8/bin/python -c "
 import io
+from contextlib import closing
 from pathlib import Path
 from hwp5.xmlmodel import Hwp5File
-from hwp5.hwp5txt import transform_hwp5_to_text
+from hwp5.hwp5txt import TextTransform
 p = Path('/Users/hogyeongkim/Desktop/Projects/doc_agent_test_data/hwp_samples').glob('*.hwp')
 sample = next(iter(p))
-hwp = Hwp5File(str(sample))
-print('header.flags.password =', hwp.fileheader.flags.password)
-print('header.flags.distributable =', hwp.fileheader.flags.distributable)
-buf = io.BytesIO()
-transform_hwp5_to_text(hwp, buf)
-text = buf.getvalue().decode('utf-8', errors='replace')
+with closing(Hwp5File(str(sample))) as hwp:
+    print('header.flags.password =', hwp.fileheader.flags.password)
+    print('header.flags.distributable =', hwp.fileheader.flags.distributable)
+    buf = io.BytesIO()
+    TextTransform().transform_hwp5_to_text(hwp, buf)
+    text = buf.getvalue().decode('utf-8', errors='replace')
 print('text length:', len(text))
 print('first 200 chars:', repr(text[:200]))
 "
@@ -106,11 +109,13 @@ mkdir -p /Users/hogyeongkim/Desktop/Projects/FDA/FDA/tests/fixtures/hwp
 touch /Users/hogyeongkim/Desktop/Projects/FDA/FDA/tests/fixtures/hwp/.gitkeep
 ```
 
-- [ ] **Step 7: Harvest 2–3 public `.hwpx` documents (best-effort)**
+- [ ] **Step 7: Harvest 2–3 public `.hwpx` and `.hwp` documents (best-effort)**
 
-Search the Korea Data Portal (`data.go.kr`) and other public-domain Korean government sources for small (< 50 KiB each) `.hwpx` files. Confirm public-domain licensing, then commit them under `tests/fixtures/hwp/`.
+Search the Korea Data Portal (`data.go.kr`) and other public-domain Korean government sources for small (< 50 KiB each) `.hwpx` AND `.hwp` files. Confirm public-domain licensing, then commit them under `tests/fixtures/hwp/`.
 
-If you cannot find suitably-licensed small samples within a reasonable time-box (~30 minutes), **document the gap** in the spec under a new "Spike findings" section and move on — the spec is still shippable. The harvested-fixture spot-check in Task 8 becomes a `pytest.skip` when no harvested fixture is present.
+The spec called for committed `.hwp` fixtures so the HWP test surface does not silently disappear on hosts without the user's private corpus. If a tiny non-confidential `.hwp` cannot be harvested publicly, an alternative is to commit **one** of the user's hand-made samples (with the user's permission) — they are non-confidential by construction (per the spec, the user created them as test data).
+
+If you cannot find suitably-licensed small samples within a reasonable time-box (~30 minutes) AND cannot get permission to commit a user sample, **document the gap** in the "Spike findings" section (Step 8) and move on — the spec is still shippable. The harvested-fixture spot-check in Task 8 becomes a `pytest.skip` when no harvested `.hwpx` is present, and the HWP tests in Tasks 9–11 already `pytest.skip` when `_HWP_SAMPLES_DIR` is missing.
 
 - [ ] **Step 8: Record spike findings in the spec**
 
@@ -121,9 +126,10 @@ Edit `docs/superpowers/specs/2026-05-09-organize-hwpx-hwp-design.md`. Append a n
 
 - `pyhwp` installed cleanly on Python 3.12: <yes/no>. Pinned version: <X.Y.Z>.
 - `defusedxml` installed cleanly: <yes/no>. Pinned version: <X.Y.Z>.
-- API surface verified: `Hwp5File` from `hwp5.xmlmodel`, `transform_hwp5_to_text` from `hwp5.hwp5txt`.
+- API surface verified: `Hwp5File` from `hwp5.xmlmodel`; `TextTransform` from `hwp5.hwp5txt` (its `.transform_hwp5_to_text` is a `@property` returning a callable).
 - One user sample (`<filename>`) round-trips: text length <N>, contains <Hangul / PUA / both>.
-- Harvested public `.hwpx` fixtures: <list of files committed under tests/fixtures/hwp/, OR "none — gap recorded; harvested-fixture spot-check skipped">.
+- Harvested `.hwpx` fixtures committed under `tests/fixtures/hwp/`: <list, OR "none — gap recorded; harvested-fixture spot-check in Task 8 skipped">.
+- Harvested or user-permitted `.hwp` fixtures committed under `tests/fixtures/hwp/`: <list, OR "none — gap recorded; HWP tests skip without user's private corpus">.
 - HWP half decision: <GO / NO-GO; if NO-GO, Tasks 9–12 are skipped>.
 ```
 
@@ -276,7 +282,6 @@ def _build_hwpx(
     sections: list[list[list[str]]] | None = None,
     namespace: str = _HWPX_NS_2011,
     mimetype: bytes = b"application/hwp+zip",
-    encrypted: bool = False,
     extra_members: dict[str, bytes] | None = None,
 ) -> Path:
     """Build a minimal valid .hwpx archive on disk and return its path.
@@ -284,6 +289,11 @@ def _build_hwpx(
     `sections` is a list of section files; each section file is a list of
     paragraphs; each paragraph is a list of run texts (the <hp:t> contents).
     Default: one section, one paragraph, one run "[발주서]".
+
+    Note: there is no `encrypted=True` parameter — Python's zipfile.writestr
+    resets ZipInfo.flag_bits in _open_to_write, so setting flag_bits before
+    writestr does not produce an encrypted entry. The encrypted-flag test
+    monkeypatches ZipFile.infolist instead.
     """
     import zipfile
     from xml.etree import ElementTree as ET
@@ -296,8 +306,6 @@ def _build_hwpx(
         # mimetype is conventionally the first member, stored uncompressed.
         info = zipfile.ZipInfo("mimetype")
         info.compress_type = zipfile.ZIP_STORED
-        if encrypted:
-            info.flag_bits |= 0x1
         zf.writestr(info, mimetype)
 
         for idx, section in enumerate(sections):
@@ -690,10 +698,27 @@ class TestHwpxFailure:
         r = _extractors.extract(p)
         assert r.status == "failed"
 
-    def test_encrypted_entry_returns_failed(self, tmp_path):
+    def test_encrypted_entry_returns_failed(self, tmp_path, monkeypatch):
+        """Python's zipfile.ZipFile.writestr resets ZipInfo.flag_bits during
+        write, so a real encrypted-flag entry cannot be produced via the
+        helper. We instead monkeypatch ZipFile.infolist so it returns a
+        ZipInfo with flag_bits 0x1 set, simulating the runtime check."""
         from fda.organize import _extractors
+        import zipfile
 
-        p = _build_hwpx(tmp_path, encrypted=True)
+        p = _build_hwpx(tmp_path)
+
+        original_infolist = zipfile.ZipFile.infolist
+
+        def faked_infolist(self):
+            infos = original_infolist(self)
+            for info in infos:
+                if info.filename.startswith("Contents/section"):
+                    info.flag_bits |= 0x1
+                    break
+            return infos
+
+        monkeypatch.setattr(zipfile.ZipFile, "infolist", faked_infolist)
         r = _extractors.extract(p)
         assert r.status == "failed"
         assert "encrypted" in r.note
@@ -785,20 +810,23 @@ class TestHwpxCaps:
         monkeypatch.setattr(_extractors, "_HWPX_COMPRESSION_RATIO_MAX", 100_000)
 
         body = "x" * 5 * 1024  # ~5 KiB body per section
+        # Markers are arbitrary ASCII strings checked in r.text — the Korean
+        # section regexes are NOT exercised here, this test asserts walk
+        # truncation only.
         sections = [
-            [["[s0_marker]", body]],
-            [["[s1_marker]", body]],
-            [["[s2_marker]", body]],   # cumulative > 12 KiB before this read
-            [["[final_marker]"]],
+            [["s0_marker_text", body]],
+            [["s1_marker_text", body]],
+            [["s2_marker_text", body]],   # cumulative > 12 KiB before this read
+            [["final_marker_text"]],
         ]
         p = _build_hwpx(tmp_path, sections=sections)
         r = _extractors.extract(p)
         assert r.status == "ok"
-        # First two sections walked; third and final stopped.
-        assert "s0_marker" in r.sections
-        assert "s1_marker" in r.sections
-        assert "s2_marker" not in r.sections
-        assert "final_marker" not in r.sections
+        # First two sections walked (text present); third and final stopped.
+        assert "s0_marker_text" in r.text
+        assert "s1_marker_text" in r.text
+        assert "s2_marker_text" not in r.text
+        assert "final_marker_text" not in r.text
 
     def test_compression_ratio_bomb_aborts_archive(self, tmp_path):
         """A single entry whose uncompressed/compressed ratio exceeds
@@ -1088,11 +1116,22 @@ _HWP_SAMPLES_DIR = Path("/Users/hogyeongkim/Desktop/Projects/doc_agent_test_data
 
 
 def _first_hwp_sample() -> Path | None:
-    """Return the first .hwp sample on disk, or None if the dir is missing."""
+    """Return the first .hwp sample that round-trips through the extractor
+    successfully (status == "ok" with non-empty text). None if dir/samples
+    missing or all samples fail (e.g., all password-protected).
+
+    This guards against the first sorted sample being password-protected or
+    distributable — those cases would fail _extract_hwp's flag checks and
+    cause downstream tests to fail for the wrong reason.
+    """
     if not _HWP_SAMPLES_DIR.is_dir():
         return None
-    samples = sorted(_HWP_SAMPLES_DIR.glob("*.hwp"))
-    return samples[0] if samples else None
+    from fda.organize import _extractors  # local import to avoid cycle at module load
+    for sample in sorted(_HWP_SAMPLES_DIR.glob("*.hwp")):
+        r = _extractors.extract(sample)
+        if r.status == "ok" and r.text:
+            return sample
+    return None
 
 
 class TestHwpText:
@@ -1120,11 +1159,57 @@ class TestHwpText:
         assert has_hangul or has_pua, (
             f"sample {sample.name} produced neither Hangul nor PUA characters"
         )
+
+
+class TestHwpSections:
+    """Deterministic regression test for sections-wiring in _extract_hwp.
+
+    Patches TextTransform so its transform_hwp5_to_text writes known Korean
+    plaintext containing bracket / colon / bullet headers. Verifies that
+    _extract_hwp threads the buffer's bytes through extract_sections_from_text
+    and surfaces the labels in ExtractionResult.sections.
+
+    This is a committed regression guard — Task 12's per-sample real-corpus
+    pass records empirical behavior but does not assert on specific labels
+    (we don't know in advance which user samples have which headers).
+    """
+
+    def test_known_korean_text_flows_into_sections(self, tmp_path):
+        from fda.organize import _extractors
+        from unittest.mock import patch, MagicMock
+
+        sample = _first_hwp_sample()
+        if sample is None:
+            pytest.skip(f"no .hwp samples at {_HWP_SAMPLES_DIR}")
+        import shutil
+        dest = tmp_path / sample.name
+        shutil.copy2(sample, dest)
+
+        known_korean = (
+            "[발주서]\n"
+            "회사 정보:\n"
+            "■ 주의사항\n"
+            "본문 내용...\n"
+        )
+
+        def fake_transform(hwp, buf):
+            buf.write(known_korean.encode("utf-8"))
+
+        # _extract_hwp does `TextTransform().transform_hwp5_to_text(hwp, buf)`.
+        # Patch the class so any new instance's transform_hwp5_to_text is fake.
+        fake_class = MagicMock()
+        fake_class.return_value.transform_hwp5_to_text = fake_transform
+        with patch("hwp5.hwp5txt.TextTransform", fake_class):
+            r = _extractors.extract(dest)
+
+        assert r.status == "ok"
+        assert r.text == known_korean
+        assert r.sections == ("발주서", "회사 정보", "주의사항")
 ```
 
 - [ ] **Step 2: Run the new test to verify it fails**
 
-Run: `/Users/john/.pyenv/versions/3.12.8/bin/python -m pytest tests/test_organize_extractors.py::TestHwpText -v`
+Run: `/Users/john/.pyenv/versions/3.12.8/bin/python -m pytest tests/test_organize_extractors.py::TestHwpText tests/test_organize_extractors.py::TestHwpSections -v`
 Expected: FAIL — `extract()` returns `status="no_extractor"` because `.hwp` is not registered.
 
 - [ ] **Step 3: Implement `_extract_hwp`**
@@ -1150,9 +1235,11 @@ def _extract_hwp(path: Path) -> ExtractionResult:
     match _sections.py's contains_hangul() check, so PUA-heavy files
     produce sections=() even when visually they have headers.
     """
+    from contextlib import closing
+
     try:
         from hwp5.xmlmodel import Hwp5File
-        from hwp5.hwp5txt import transform_hwp5_to_text
+        from hwp5.hwp5txt import TextTransform
     except ImportError as e:
         return ExtractionResult(text=None, status="tool_missing", note=str(e))
 
@@ -1162,26 +1249,31 @@ def _extract_hwp(path: Path) -> ExtractionResult:
         )
 
     # pyhwp's Hwp5File rejects pathlib.Path; coerce explicitly to str.
+    # Wrap in contextlib.closing — pyhwp's own main() does the same to
+    # release the underlying OLE/file handle on exit.
     try:
-        hwp = Hwp5File(str(path))
+        hwp_file = Hwp5File(str(path))
     except Exception as e:  # noqa: BLE001 — malformed OLE, v3, etc.
         return ExtractionResult(text=None, status="failed", note=str(e))
 
-    header = hwp.fileheader
-    if header.flags.password:
-        return ExtractionResult(
-            text=None, status="failed", note="password-protected hwp"
-        )
-    if header.flags.distributable:
-        return ExtractionResult(
-            text=None, status="failed", note="distributed hwp"
-        )
+    with closing(hwp_file) as hwp:
+        header = hwp.fileheader
+        if header.flags.password:
+            return ExtractionResult(
+                text=None, status="failed", note="password-protected hwp"
+            )
+        if header.flags.distributable:
+            return ExtractionResult(
+                text=None, status="failed", note="distributed hwp"
+            )
 
-    buf = io.BytesIO()
-    try:
-        transform_hwp5_to_text(hwp, buf)
-    except Exception as e:  # noqa: BLE001 — pyhwp may raise on truncated streams
-        return ExtractionResult(text=None, status="failed", note=str(e))
+        buf = io.BytesIO()
+        try:
+            # transform_hwp5_to_text is a @property on TextTransform that
+            # returns a callable; invoke it with (hwp5file, dest_buffer).
+            TextTransform().transform_hwp5_to_text(hwp, buf)
+        except Exception as e:  # noqa: BLE001 — pyhwp may raise on truncated streams
+            return ExtractionResult(text=None, status="failed", note=str(e))
 
     text = buf.getvalue().decode("utf-8", errors="replace")
     return ExtractionResult(
@@ -1212,10 +1304,10 @@ EXTRACTORS: dict[str, TextExtractor] = {
 }
 ```
 
-- [ ] **Step 5: Run the new test to verify it passes**
+- [ ] **Step 5: Run the new tests to verify they pass**
 
-Run: `/Users/john/.pyenv/versions/3.12.8/bin/python -m pytest tests/test_organize_extractors.py::TestHwpText -v`
-Expected: PASS (1 test).
+Run: `/Users/john/.pyenv/versions/3.12.8/bin/python -m pytest tests/test_organize_extractors.py::TestHwpText tests/test_organize_extractors.py::TestHwpSections -v`
+Expected: PASS (2 tests; the sections test patches `hwp5.hwp5txt.TextTransform` so it does not depend on real Korean content in the user's samples).
 
 - [ ] **Step 6: Run the full suite**
 
@@ -1577,7 +1669,7 @@ git commit -m "organize(integration): hwpx flows through reader and pipeline"
 
 - `fda/organize/_extractors.py` defines five new constants (`_HWPX_SECTION_FILES_MAX`, `_HWPX_SECTION_BYTES_MAX`, `_HWPX_TOTAL_BYTES_MAX`, `_HWPX_COMPRESSION_RATIO_MAX`, `_HWP_BYTES_MAX`), the `_extract_hwpx` function, the `_extract_hwp` function, the `_hwpx_localname` helper, and the `_HWPX_SECTION_FILE_RE` regex. `EXTRACTORS` registers `.hwpx → _extract_hwpx` and `.hwp → _extract_hwp` (the latter only if Task 0's HWP decision was GO).
 - `pyproject.toml` lists `defusedxml` and (if HWP GO) `pyhwp` in `dependencies`.
-- All test classes added in Tasks 3–11 are green: `TestHwpxText`, `TestHwpxFailure`, `TestHwpxCaps`, `TestHwpxXmlSafety`, `TestHwpText`, `TestHwpFailure`. Reader passthrough + spot-check tests in `TestSectionsPropagationDocxXlsx` are green.
+- All test classes added in Tasks 3–11 are green: `TestHwpxText`, `TestHwpxFailure`, `TestHwpxCaps`, `TestHwpxXmlSafety`, `TestHwpText`, `TestHwpSections`, `TestHwpFailure`. Reader passthrough + spot-check tests in `TestSectionsPropagationDocxXlsx` are green.
 - Real-corpus validation results recorded in spec (Task 12).
 - Pipeline integration test green with `.hwpx` in the corpus (Task 13). `.hwp` is intentionally not in the pipeline corpus — its passthrough is covered by Tasks 9 + 11 because the `.hwp` source corpus is private to this host.
 - Full suite green via `/Users/john/.pyenv/versions/3.12.8/bin/python -m pytest tests/ -x -q --tb=short`.
