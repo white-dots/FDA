@@ -1887,3 +1887,52 @@ class TestHwpxText:
         assert r.status == "ok"
         assert r.text == ""
         assert r.sections == ()
+
+    @pytest.mark.parametrize("namespace", [_HWPX_NS_2011, _HWPX_NS_2016, _HWPX_NS_2021])
+    def test_namespace_variants_all_yield_text(self, tmp_path, namespace):
+        from fda.organize import _extractors
+
+        p = _build_hwpx(
+            tmp_path,
+            name=f"ns_{hash(namespace) % 1000}.hwpx",
+            sections=[[["[제목]"]]],
+            namespace=namespace,
+        )
+        r = _extractors.extract(p)
+        assert r.status == "ok"
+        assert "제목" in r.sections, f"namespace {namespace} did not match local-name"
+
+    def test_multi_paragraph_separated_by_newlines(self, tmp_path):
+        """Each <hp:p> ends with a "\\n" so line-oriented section regexes match."""
+        from fda.organize import _extractors
+
+        p = _build_hwpx(
+            tmp_path,
+            sections=[[
+                ["[발주서]"],
+                ["회사 정보:"],
+                ["■ 주의사항"],
+            ]],
+        )
+        r = _extractors.extract(p)
+        assert r.status == "ok"
+        # All three Korean banner styles parse — bracket, colon, bullet.
+        assert r.sections == ("발주서", "회사 정보", "주의사항")
+
+    def test_multi_section_files_separated_by_newlines(self, tmp_path):
+        """Each section file's text ends with a "\\n" before the next section
+        joins, so paragraph breaks across HWPX section boundaries do not get
+        glued together."""
+        from fda.organize import _extractors
+
+        p = _build_hwpx(
+            tmp_path,
+            sections=[
+                [["[발주서]"]],   # section0.xml
+                [["회사 정보:"]],  # section1.xml
+            ],
+        )
+        r = _extractors.extract(p)
+        assert r.status == "ok"
+        assert "발주서" in r.sections
+        assert "회사 정보" in r.sections
