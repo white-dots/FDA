@@ -2288,3 +2288,77 @@ class TestHwpSections:
         assert r.status == "ok"
         assert r.text == known_korean
         assert r.sections == ("발주서", "회사 정보", "주의사항")
+
+
+class TestHwpFailure:
+    def test_non_ole_input_returns_failed(self, tmp_path):
+        from fda.organize import _extractors
+
+        p = tmp_path / "fake.hwp"
+        p.write_bytes(b"this is not an OLE compound document")
+        r = _extractors.extract(p)
+        assert r.status == "failed"
+        assert r.text is None
+        assert r.sections == ()
+
+    def test_oversized_file_rejected_before_open(self, tmp_path):
+        """A file larger than _HWP_BYTES_MAX is rejected via path.stat()
+        before pyhwp is invoked — no parse work done."""
+        from fda.organize import _extractors
+        from fda.organize._extractors import _HWP_BYTES_MAX
+
+        p = tmp_path / "huge.hwp"
+        # Spec says check is path.stat().st_size > cap. Make file size > cap.
+        p.write_bytes(b"\x00" * (_HWP_BYTES_MAX + 1))
+        r = _extractors.extract(p)
+        assert r.status == "failed"
+        assert "oversized" in r.note
+
+    def test_password_protected_returns_failed(self, tmp_path):
+        """When header.flags.password is True, return failed — pyhwp does
+        NOT raise on password-protected docs (decryption unsupported)."""
+        from fda.organize import _extractors
+        from unittest.mock import patch, MagicMock
+
+        sample = _first_hwp_sample()
+        if sample is None:
+            pytest.skip(f"no .hwp samples at {_HWP_SAMPLES_DIR}")
+        import shutil
+        dest = tmp_path / sample.name
+        shutil.copy2(sample, dest)
+
+        # Patch Hwp5File so its instance reports password=True.
+        fake_header = MagicMock()
+        fake_header.flags.password = True
+        fake_header.flags.distributable = False
+        fake_hwp = MagicMock()
+        fake_hwp.fileheader = fake_header
+
+        with patch("hwp5.xmlmodel.Hwp5File", return_value=fake_hwp):
+            r = _extractors.extract(dest)
+        assert r.status == "failed"
+        assert "password" in r.note
+
+    def test_distributable_returns_failed(self, tmp_path):
+        """When header.flags.distributable is True, return failed — v1 does
+        not extract from ViewText-wrapped distributable docs."""
+        from fda.organize import _extractors
+        from unittest.mock import patch, MagicMock
+
+        sample = _first_hwp_sample()
+        if sample is None:
+            pytest.skip(f"no .hwp samples at {_HWP_SAMPLES_DIR}")
+        import shutil
+        dest = tmp_path / sample.name
+        shutil.copy2(sample, dest)
+
+        fake_header = MagicMock()
+        fake_header.flags.password = False
+        fake_header.flags.distributable = True
+        fake_hwp = MagicMock()
+        fake_hwp.fileheader = fake_header
+
+        with patch("hwp5.xmlmodel.Hwp5File", return_value=fake_hwp):
+            r = _extractors.extract(dest)
+        assert r.status == "failed"
+        assert "distributed" in r.note
