@@ -46,7 +46,18 @@ Faithful extension of the docx/xlsx/pptx/csv format-onboarding pattern: one extr
 
 **Files not touched:** `_sections.py`, `models.py`, `reader.py`, `classifier.py`, `plan_builder.py`, `executor.py`, `verifier.py`, all skill prompts. Reader already dispatches by extension and copies `sections` through.
 
-**One new runtime dependency:** `pyhwp`. `.hwpx` uses stdlib only.
+**One new runtime dependency:** `pyhwp` (subject to license review — see Open blockers below). `.hwpx` uses stdlib `zipfile` + `defusedxml.ElementTree`. `defusedxml` becomes a v1 dependency (was originally listed as a follow-up; promoted after security review — Python's stdlib `xml.etree` Expat backend can still be vulnerable to internal-entity expansion / large-token DoS depending on Expat version, and the cost of `defusedxml` is one import substitution).
+
+## Open blockers
+
+**pyhwp is licensed AGPLv3+.** This is a copyleft license with a network/SaaS clause: any modified or deployed-as-a-service distribution of code that links pyhwp must release its source under AGPL. If `fda-system` is currently MIT/Apache/BSD, adding pyhwp as a hard dep creates a license conflict for downstream packagers. The spec's "hard dep on pyhwp" choice was made before the license was known. The user needs to re-decide between:
+
+1. Accept AGPL exposure and proceed with pyhwp.
+2. Use pyhwp via a sandboxed `subprocess` call to the `hwp5txt` CLI, in a separate process — does NOT mitigate AGPL (AGPL applies to the binary, not just the import) but documents the boundary clearly.
+3. Switch to a different `.hwp` parser (none with pyhwp's coverage are known to be permissively licensed — would require its own brainstorm).
+4. Drop sub-project C from this spec; ship `.hwpx` (B) alone. C re-opens once a license-clean parser is identified.
+
+**Until this is resolved, the entire `_extract_hwp` section below is provisional.** All other parts of the spec (HWPX, architecture, validation strategy for B) stand independently.
 
 **Text contract:** Neither new extractor applies its own 64 KiB cap on `text`. Reader owns that contract via `READER_TEXT_CAP_BYTES` (`reader.py:29`) and applies byte-boundary-safe truncation plus the `[TRUNCATED at 64KB]` marker. The new constants exist only to bound in-process memory while reading, parsing, walking, and serializing — never as the contract cap.
 
@@ -76,14 +87,14 @@ Preview/                          # IGNORED
 BinData/                          # IGNORED (embedded images, OLE, etc.)
 ```
 
-Body text lives in `Contents/section*.xml` files. Each is XML with paragraphs (`<hp:p>` → `<hp:run>` → `<hp:t>` text runs). The exact namespace URI varies across HWPX revisions (2010 / 2014 / 2017); `.iter()` over local-name (`endswith("}t")`) avoids hard-coding the namespace.
+Body text lives in `Contents/section*.xml` files. Each is XML with paragraphs (`<hp:p>` → `<hp:run>` → `<hp:t>` text runs). The exact namespace URI varies across HWPX revisions; matching by local-name avoids hard-coding any specific namespace.
 
-> **Implementation note (to be pinned in the plan):** the namespace URIs the spec is most likely to encounter are `http://www.hancom.co.kr/hwpml/2011/paragraph` (older) and `http://www.hancom.co.kr/hwpml/2016/paragraph` (newer). Rather than match either explicitly, walk all elements and select those whose tag's local-name (after the `}`) is `t`. Implementation-plan task 0 must verify this against the harvested public samples.
+> **Namespace coverage (verified):** observed namespace families include `http://www.hancom.co.kr/hwpml/2011/paragraph`, `http://www.hancom.co.kr/hwpml/2016/paragraph`, and the newer `http://www.owpml.org/owpml/2021/...` family used by current Hancom Office output. Rather than match any of them explicitly, walk all elements and select those whose tag's local-name (after the `}`) is `t`. Synthetic test fixtures should include at least one document per namespace family (2011, 2016, 2021).
 
 ### Step 1 — open as zip, validate
 
 - Open via `zipfile.ZipFile(path, "r")`. Wrap in `try/except zipfile.BadZipFile` → `status="failed"`.
-- Read `mimetype` member. If absent OR contents do not start with `b"application/hwp+zip"` → `status="failed", note="not an OWPML hwpx"`. (Lenient on trailing whitespace; strict on the prefix because the format spec mandates uncompressed `mimetype` as the first member with that exact body.)
+- Read `mimetype` member. If absent → `status="failed", note="not an OWPML hwpx"`. Otherwise compare via `zf.read("mimetype").strip() == b"application/hwp+zip"` (exact match after stripping whitespace; reject prefix-only matches like `application/hwp+zip-bad`).
 - Reject encrypted entries: iterate `zf.infolist()`; if any `info.flag_bits & 0x1` is set → `status="failed", note="encrypted hwpx"`. (ZIP encryption flag.)
 
 ### Step 2 — locate section files
@@ -91,7 +102,7 @@ Body text lives in `Contents/section*.xml` files. Each is XML with paragraphs (`
 Two strategies; we use the simpler one:
 
 - **Chosen:** glob the namelist for `Contents/section\d+\.xml`. Sort numerically by the integer suffix. Walk in that order.
-- **Rejected:** parse `META-INF/container.xml` → `Contents/content.hpf` → resolve manifest items. More format-correct but adds two parses for negligible benefit; the section-file naming convention is stable across HWPX revisions and easier to verify against fixtures.
+- **Rejected:** parse `META-INF/container.xml` → `Contents/content.hpf` → resolve manifest items in spine order. More format-correct (Hancom's parsing guide treats `content.hpf` spine order as canonical) but adds two parses for negligible benefit; the section-file naming convention is stable in real-world Hangul Office output. **Accepted limitation:** if a future document uses non-standard section-file names listed only in the spine, we will miss them. The spec accepts this risk — flip to spine parsing in a follow-up if such a document appears in the corpus.
 
 If no section files match → `text="", sections=()`, `status="ok"`. (Empty doc: legitimate.)
 
@@ -101,8 +112,10 @@ Cap the count of section files walked at `_HWPX_SECTION_FILES_MAX` (default 100)
 
 For each section file (in order), up to the cap:
 
-- Read its bytes from the zip via `zf.read(name)`. Skip if size > `_HWPX_SECTION_BYTES_MAX` (default 4 MiB) — set the run's text to `""`, do not abort the whole extraction. Cumulative bytes parsed across all sections is also capped at `_HWPX_TOTAL_BYTES_MAX` (default 8 MiB). If exceeded, stop reading further sections.
-- Parse with `xml.etree.ElementTree.fromstring(data)`. On `ET.ParseError` → skip this section file (its text is `""`); do not abort. Note: `xml.etree` resolves no entities by default in modern Python, but for explicit defense-in-depth the implementation plan may switch to `defusedxml.ElementTree` if a benchmark shows acceptable cost — listed as an open follow-up below; not required for v1.
+- **Pre-decompression cap check (zip-bomb defense):** look up `ZipInfo.file_size` (uncompressed) for the entry. Skip if `file_size > _HWPX_SECTION_BYTES_MAX` (default 4 MiB) — set the run's text to `""`, do not call `zf.read`, do not abort the whole extraction. Track cumulative `file_size` across sections; if cumulative exceeds `_HWPX_TOTAL_BYTES_MAX` (default 8 MiB) BEFORE reading the next entry, stop walking.
+- **Compression-ratio guard:** also reject any entry where `file_size / max(compress_size, 1) > _HWPX_COMPRESSION_RATIO_MAX` (default 100) — defends against highly-compressed zip-bomb members that pass the absolute-size check.
+- Only after both checks pass: read via `zf.read(name)`.
+- Parse with `defusedxml.ElementTree.fromstring(data)` (the `defusedxml` import is mandatory in v1; see Architecture). On `ET.ParseError` → skip this section file (its text is `""`); do not abort.
 - Walk all elements. Collect `.text` (and `.tail` if non-trivial; details below) of every element whose local-name is `t`. Local-name match: `tag.rsplit("}", 1)[-1] == "t"`.
 - Join collected runs with `""` (empty string — runs in HWPX are already token-level; spaces inside runs are explicit). Append the section's joined text to a per-section list.
 - Between sections, append a single `"\n"` separator so paragraph breaks across HWPX section boundaries do not get glued together.
@@ -150,43 +163,61 @@ def _extract_hwp(path: Path) -> ExtractionResult: ...
 
 ### Dependency strategy
 
-`pyhwp` is added to `pyproject.toml` `dependencies` (hard dep, per the user's chosen option). The implementation plan's task 0 spike must verify three things before the rest of the plan executes:
+`pyhwp` is added to `pyproject.toml` `dependencies` *if and only if the AGPL license question (see Open blockers above) is resolved in favor of pyhwp*. The implementation plan's task 0 spike must verify three things before the rest of the plan executes:
 
-1. `pyhwp` installs cleanly on Python 3.12 / 3.13 (the `requires-python = ">=3.9"` line).
-2. The Python API is stable enough to import directly (vs shelling out to the `hwp5txt` CLI). If it's import-broken, fall back to a `subprocess.run([sys.executable, "-m", "hwp5txt", ...])` invocation in-process. Both are acceptable; the API path is preferred for speed and error visibility.
-3. The library's plaintext output preserves Korean characters (i.e., does not lossy-decode to question marks). Verify against one of the user's 10 hand-made samples.
+1. `pyhwp` installs cleanly on Python 3.12 / 3.13. **Risk:** pyhwp's PyPI classifiers stop at Python 3.8 with no active `python_requires`; install on 3.12+ is unverified and may fail.
+2. The Python API is stable enough to import directly. The confirmed top-level package is `hwp5`; the plaintext-extraction surface is `hwp5.hwp5txt.TextTransform` (importable). The console script is `hwp5txt`.
+3. The library's plaintext output preserves Korean characters. Verify against one of the user's 10 hand-made samples.
 
-If the spike reveals `pyhwp` is broken on 3.12, the design pivots to a subprocess-to-`hwp5txt`-CLI strategy (still hard dep — the install would carry the CLI). The user already accepted "hard dep" as a category; CLI vs library is an implementation detail. Spec stays valid; plan adapts.
+**Critical clarification (codex review finding):** the prior "fall back to subprocess-CLI if import-broken" strategy does NOT solve install failure — the `hwp5txt` console script is installed by the same package. If `pip install pyhwp` fails on 3.12, neither the library nor the CLI is available. Real fallback options if the spike fails: (a) vendor and patch pyhwp (AGPL-bound; out of scope here), (b) find an alternative `.hwp` parser (none known with comparable coverage), (c) drop sub-project C from this spec and brainstorm a replacement strategy. The spike's outcome is therefore a hard go/no-go gate for C — the plan must not proceed past task 0 for the HWP path if install fails.
 
 ### Step 1 — guard the dep
 
 ```python
 try:
-    import hwp5  # pyhwp's top-level package; exact name pinned in plan task 0
+    import hwp5  # pyhwp top-level package (verified)
+    from hwp5.hwp5txt import TextTransform  # plaintext-extraction surface (verified)
+    from hwp5.filestructure import Hwp5File  # for FileHeader flag inspection
 except ImportError as e:
     return ExtractionResult(text=None, status="tool_missing", note=str(e))
 ```
 
 This branch should be unreachable in practice because the dep is hard. It exists for defense-in-depth (corrupt venv, partial install) so a missing import never aborts a run.
 
-### Step 2 — open and extract
+### Step 2 — open file and inspect FileHeader flags
 
-The exact pyhwp call is **pinned in implementation-plan task 0** after the spike. The spec assumes a contract roughly:
+Open via `Hwp5File` (or pyhwp's equivalent file wrapper, verified in plan task 0). Before any text extraction, inspect FileHeader flags directly — pyhwp surfaces `password` and `distributable` as boolean flags on the file header, NOT as exceptions:
 
 ```python
-hwp5.dataio.UnpackErrors  # or whatever the lib raises on malformed
-text = hwp5.tools.hwp5txt.extract_text(path)  # placeholder; real name TBD in plan
+hwp = Hwp5File(path)
+header = hwp.fileheader  # or equivalent attribute
+if header.flags.password:
+    return ExtractionResult(text=None, status="failed", note="password-protected hwp")
+if header.flags.distributable:
+    # pyhwp wraps distributable docs and Hwp5File.text returns ViewText (a
+    # different code path). v1 treats this as failure; v2 may opt in to ViewText
+    # extraction once we understand the format better.
+    return ExtractionResult(text=None, status="failed", note="distributed hwp")
 ```
 
-Behavior the implementation plan must wrap regardless of API shape:
+**Codex finding:** the prior spec's exception-based detection ("if pyhwp surfaces it") was wrong — pyhwp passes password streams through with only a warning (decryption is unsupported in pyhwp), and distributable docs route through ViewText. Direct flag inspection is the correct surface.
 
-- Wrap in `try/except` to catch:
-  - File-format errors (malformed OLE, wrong version) → `status="failed", note=...`
-  - Distributed (locked) doc indicator if pyhwp surfaces it → `status="failed", note="distributed hwp"`
-  - HWP v3 detected → `status="failed", note="hwp v3 unsupported"`
-- Memory-bound the in-process work via `_HWP_BYTES_MAX` (default 16 MiB) read cap on the input file (not on output text — Reader owns the output cap). If the file is larger, the implementation plan decides between (a) reading the cap and passing a `BytesIO` to pyhwp (only works if pyhwp accepts a stream — verify in spike) or (b) returning `status="failed", note="oversized hwp"`. **Default decision for v1:** (b) — fail fast on oversized; revisit only if real Lion Chemtech docs trigger this.
+If header parsing itself raises (truly malformed OLE, wrong version including HWP v3) → `status="failed", note=str(e)`.
 
-### Step 3 — return
+### Step 3 — extract text
+
+```python
+text = TextTransform().transform(hwp)  # exact call signature pinned in plan task 0
+```
+
+Behavior the implementation plan must wrap:
+
+- Wrap in `try/except` for file-format errors during extraction → `status="failed", note=...`.
+- Memory-bound the in-process work via `_HWP_BYTES_MAX` (default 16 MiB) read cap on the input file. If `path.stat().st_size > _HWP_BYTES_MAX` → `status="failed", note="oversized hwp"` BEFORE opening. Reader owns the output cap.
+
+**Mojibake / Hanyang PUA known limitation:** pyhwp may emit Hanyang Private-Use Area characters (codepoints in U+E000..U+F8FF range) for some legacy Korean text rather than precomposed Hangul (U+AC00..U+D7A3). These pass through `text` cleanly but do NOT match `_sections.py`'s `contains_hangul()` Hangul-Syllables check, so PUA-heavy `.hwp` files will produce `sections=()` even when visually they have headers. **v1 accepts this limitation** rather than widening the regex (PUA is not unambiguously Korean). Document in real-corpus validation if observed; surface as a v2 brainstorm input. The original "all-`?` mojibake sentinel" is dropped from the spec — too narrow to catch the real failure mode (PUA), and risks false-positives on legitimately-empty docs.
+
+### Step 4 — return
 
 ```python
 return ExtractionResult(
@@ -200,16 +231,16 @@ Same pattern as `.hwpx`: the extractor itself calls `extract_sections_from_text(
 
 ### Edge cases (HWP)
 
-| Case | Behavior |
-|---|---|
-| Not an OLE compound doc | `status="failed", note="not an OLE compound doc"` |
-| HWP v3 (pre-5) | `status="failed", note="hwp v3 unsupported"` |
-| Distributed (DRM-locked) | `status="failed", note="distributed hwp"` |
-| Password-protected | `status="failed", note="password-protected hwp"` |
-| Truncated / malformed streams | `status="failed", note=<lib msg>` |
-| File > `_HWP_BYTES_MAX` | `status="failed", note="oversized hwp"` |
-| Empty body | `status="ok", text="", sections=()` |
-| Encoding mojibake (lib returns `?` for Hangul) | `status="failed", note="hwp decode error"` — detect via a sentinel check: if input file is non-trivial size but output text is all `?` and contains zero Hangul, treat as decode failure rather than a legitimately-empty doc. Implementation-plan task verifies the sentinel against samples. |
+| Case | Detection | Behavior |
+|---|---|---|
+| Not an OLE compound doc | `Hwp5File()` raises | `status="failed", note=str(e)` |
+| HWP v3 (pre-5) | `Hwp5File()` raises (pyhwp doesn't parse v3) | `status="failed", note="hwp v3 unsupported"` |
+| Distributed | `header.flags.distributable` is True | `status="failed", note="distributed hwp"` |
+| Password-protected | `header.flags.password` is True | `status="failed", note="password-protected hwp"` |
+| Truncated / malformed streams | `TextTransform().transform()` raises | `status="failed", note=str(e)` |
+| File > `_HWP_BYTES_MAX` | `path.stat().st_size` check before open | `status="failed", note="oversized hwp"` |
+| Empty body | `TextTransform()` returns `""` | `status="ok", text="", sections=()` |
+| Hanyang PUA characters | Pass through `text` cleanly | `status="ok"`, `sections` may be `()` (PUA evades `contains_hangul`) — known v1 limitation, see Step 3 |
 
 ## Constants
 
@@ -218,12 +249,13 @@ Added to `_extractors.py`:
 ```python
 # .hwpx (XML in zip; OWPML / TTAK.OT-10.0203). Memory-bound only — Reader
 # owns the 64 KiB contract cap via READER_TEXT_CAP_BYTES.
-_HWPX_SECTION_FILES_MAX = 100        # archive-entry count cap
-_HWPX_SECTION_BYTES_MAX = 4 * 1024 * 1024   # per-section-file decompressed size cap
-_HWPX_TOTAL_BYTES_MAX = 8 * 1024 * 1024     # cumulative cap across all sections
+_HWPX_SECTION_FILES_MAX = 100               # archive-entry count cap
+_HWPX_SECTION_BYTES_MAX = 4 * 1024 * 1024   # per-section-file uncompressed size cap (checked via ZipInfo.file_size BEFORE read)
+_HWPX_TOTAL_BYTES_MAX = 8 * 1024 * 1024     # cumulative uncompressed cap across all sections (checked BEFORE next read)
+_HWPX_COMPRESSION_RATIO_MAX = 100           # uncompressed/compressed ratio cap per entry (zip-bomb defense)
 
 # .hwp (binary OLE / HWP 5.x via pyhwp).
-_HWP_BYTES_MAX = 16 * 1024 * 1024    # input file size cap
+_HWP_BYTES_MAX = 16 * 1024 * 1024    # input file size cap (checked via path.stat().st_size BEFORE open)
 ```
 
 Numerical caps mirror the docx/xlsx/pptx/csv pattern: in-process memory-bound, never the contract cap. Caps are tunable; defaults chosen to comfortably exceed real-world Korean office docs (the user's 10 samples are all ~85 KiB) while still rejecting pathological inputs.
@@ -256,15 +288,15 @@ The implementation plan's first task is the harvest step (so subsequent tasks ca
 Mirroring the csv (~50 tests) and pptx (23 tests) patterns. Estimated counts (final numbers settled in plan tasks):
 
 **HWPX tests** (`tests/test_organize_extractors.py`):
-- `TestHwpxText` — happy path single-section, multi-section, empty body, namespace variants (2011 vs 2016), paragraph separators inserted between `<hp:p>`.
-- `TestHwpxSections` — synthetic fixtures embedding bracket / colon / bullet headers in their text runs; assert reader-side `_sections` extraction picks them up.
-- `TestHwpxFailure` — not-a-zip, missing-mimetype, wrong-mimetype, encrypted-flag-set, oversized-section, oversized-cumulative, malformed XML in one section but not all (partial recovery), HWPX with zero section files.
-- `TestHwpxCaps` — `_HWPX_SECTION_FILES_MAX`, `_HWPX_SECTION_BYTES_MAX`, `_HWPX_TOTAL_BYTES_MAX` boundary tests.
+- `TestHwpxText` — happy path single-section, multi-section, empty body, namespace variants (2011, 2016, 2021), paragraph separators inserted between `<hp:p>`.
+- `TestHwpxSections` — synthetic fixtures embedding bracket / colon / bullet headers in their text runs; assert the extractor populates `ExtractionResult.sections` and that Reader copies it through to `CatalogEntry.sections`.
+- `TestHwpxFailure` — not-a-zip, missing-mimetype, wrong-mimetype (including `application/hwp+zip-bad` exact-match regression), encrypted-flag-set, oversized-section (rejected via `ZipInfo.file_size` before `read`), oversized-cumulative, compression-ratio-bomb (small compressed/large uncompressed entry), malformed XML in one section but not all (partial recovery), HWPX with zero section files.
+- `TestHwpxCaps` — `_HWPX_SECTION_FILES_MAX`, `_HWPX_SECTION_BYTES_MAX`, `_HWPX_TOTAL_BYTES_MAX`, `_HWPX_COMPRESSION_RATIO_MAX` boundary tests.
 
 **HWP tests** (`tests/test_organize_extractors.py`):
 - `TestHwpText` — happy path against ≥1 real sample (committed), Korean text round-trips intact, multi-paragraph order preserved.
 - `TestHwpSections` — at least one sample with a known `[제목]` or `제목:` header in body text; assert `_sections.extract_sections_from_text` picks it up.
-- `TestHwpFailure` — non-OLE input (e.g., truncated bytes, plain text mislabeled as `.hwp`), oversized file, mojibake-sentinel detection.
+- `TestHwpFailure` — non-OLE input (e.g., truncated bytes, plain text mislabeled as `.hwp`), oversized file (rejected via `path.stat().st_size` before open), `header.flags.password` triggers password-protected failure, `header.flags.distributable` triggers distributed failure.
 - `TestHwpCaps` — `_HWP_BYTES_MAX` boundary.
 
 **Reader integration** (`tests/test_organize_reader.py`): one test per format that confirms `CatalogEntry.sections` is populated end-to-end for a sample with known headers, and preserved as `()` on extractor failure.
@@ -302,6 +334,8 @@ Each step is a separate commit. Pre-commit hook enforces the full 113+net-new te
 - **v2 numbered-header pattern in `_sections.py`** (deferred from Korean A; needs its own brainstorm).
 - **`.hml` extractor** if real `.hml` files appear in the corpus.
 - **Embedded-image OCR** for `.hwp(x)` — out for v1; would need an OCR runtime dep. Open Lion Chemtech corpus signal first.
-- **defusedxml swap** for `.hwpx` parsing if benchmarks show stdlib `xml.etree` is acceptable in throughput. Defense-in-depth, not correctness.
+- **content.hpf spine parsing** for `.hwpx` — flip from glob-based section discovery if a real document with non-standard section-file naming appears.
 - **Per-table section labeling** if Lion Chemtech `.hwp(x)` corpus shows tables-as-structure dominate (parallel to xlsx's `Sheet:<name>` pattern, but at the table level).
+- **Hanyang PUA → Hangul transliteration** for `.hwp` if PUA-heavy documents prove common — would feed Korean A's regex engine on previously-invisible structure.
+- **Distributed-doc ViewText extraction** for `.hwp` — pyhwp wraps distributable docs and exposes `Hwp5File.text` as `ViewText`; v1 fails them, v2 may opt in.
 - **Real-corpus validation results section** appended to this spec post-ship.
