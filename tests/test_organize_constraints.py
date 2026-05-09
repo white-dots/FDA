@@ -90,6 +90,11 @@ class TestEachConstantHasOneHome:
         "_CSV_TEXT_COLS_PER_ROW": ("_extractors.py", "32"),
         "_CSV_NO_HEADER_LABEL": ("_extractors.py", '"NoHeader"'),
         "_CSV_KOREAN_LABEL_MIN_CHARS": ("_extractors.py", "2"),
+        "_HWPX_SECTION_FILES_MAX": ("_extractors.py", "100"),
+        "_HWPX_SECTION_BYTES_MAX": ("_extractors.py", "4 * 1024 * 1024"),
+        "_HWPX_TOTAL_BYTES_MAX": ("_extractors.py", "8 * 1024 * 1024"),
+        "_HWPX_COMPRESSION_RATIO_MAX": ("_extractors.py", "100"),
+        "_HWP_BYTES_MAX": ("_extractors.py", "16 * 1024 * 1024"),
     }
 
     def test_constant_defined_in_owning_module(self):

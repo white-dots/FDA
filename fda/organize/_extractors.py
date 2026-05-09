@@ -76,6 +76,16 @@ _CSV_NO_HEADER_LABEL = "NoHeader"
 # with an import once that work merges.
 _CSV_KOREAN_LABEL_MIN_CHARS = 2
 
+# .hwpx (XML in zip; OWPML / TTAK.OT-10.0203). Memory-bound only — Reader
+# owns the 64 KiB contract cap via READER_TEXT_CAP_BYTES.
+_HWPX_SECTION_FILES_MAX = 100               # archive-entry count cap
+_HWPX_SECTION_BYTES_MAX = 4 * 1024 * 1024   # per-section-file uncompressed size cap (checked via ZipInfo.file_size BEFORE read)
+_HWPX_TOTAL_BYTES_MAX = 8 * 1024 * 1024     # cumulative uncompressed cap across all sections (checked BEFORE next read)
+_HWPX_COMPRESSION_RATIO_MAX = 100           # uncompressed/compressed ratio cap per entry (zip-bomb defense)
+
+# .hwp (binary OLE / HWP 5.x via pyhwp).
+_HWP_BYTES_MAX = 16 * 1024 * 1024    # input file size cap (checked via path.stat().st_size BEFORE open)
+
 _DOCX_HEADING_RE = re.compile(r"^Heading [1-9]$")
 
 
