@@ -856,6 +856,8 @@ class TestSectionsPropagationDocxXlsx:
         e = next(c for c in catalog.entries if c.path.endswith("doc.hwpx"))
         assert e.extract_status == "ok"
         assert e.sections == ("발주서", "회사 정보")
+        # Parallel to docx/pptx/csv reader tests — verbatim_head should hold.
+        assert e.verbatim_head
 
     def test_hwpx_failed_extraction_yields_empty_sections_in_catalog(
         self, workspace, fake_backend, logger
@@ -892,8 +894,11 @@ class TestSectionsPropagationDocxXlsx:
         catalog = reader.read(workspace, backend=fake_backend, logger=logger)
         e = next(c for c in catalog.entries if c.path.endswith(sample.name))
         # Real-world docs may or may not have headers _sections.py picks up;
-        # the assertion is just that extraction succeeded.
+        # the assertion is just that extraction succeeded with usable text.
         assert e.extract_status == "ok"
+        # verbatim_head must be present so a fixture with non-standard
+        # section paths doesn't silently pass with empty content.
+        assert e.verbatim_head
         # Sections is a tuple — empty tuple is fine, but the type should hold.
         assert isinstance(e.sections, tuple)
 
