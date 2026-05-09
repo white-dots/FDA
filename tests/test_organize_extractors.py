@@ -2145,8 +2145,10 @@ class TestHwpxXmlSafety:
         assert r.sections == ()
 
     def test_dtd_payload_aborts_whole_extraction(self, tmp_path):
-        """A section file containing a DOCTYPE (DTD) is rejected by defusedxml's
-        DTDForbidden — abort the whole extraction with status="failed"."""
+        """A section file containing a DOCTYPE with an inline entity
+        declaration is rejected by defusedxml's EntitiesForbidden (which
+        fires before DTDForbidden under the default forbid_dtd=False) —
+        abort the whole extraction with status="failed"."""
         from fda.organize import _extractors
         import zipfile
 
