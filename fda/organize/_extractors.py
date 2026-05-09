@@ -599,13 +599,25 @@ def _extract_hwpx(path: Path) -> ExtractionResult:
         return ExtractionResult(text=None, status="failed", note=str(e))
 
     try:
-        # mimetype member required, exact match.
+        # mimetype member required, exact match. Inspect ZipInfo BEFORE the
+        # read so a malicious archive cannot defeat the zip-bomb guards by
+        # smuggling a huge or highly-compressed mimetype entry.
         try:
-            mt = zf.read("mimetype").strip()
+            mt_info = zf.getinfo("mimetype")
         except KeyError:
             return ExtractionResult(
                 text=None, status="failed", note="not an OWPML hwpx"
             )
+        # "application/hwp+zip" is 19 bytes; 256 is a generous ceiling.
+        if mt_info.file_size > 256:
+            return ExtractionResult(
+                text=None, status="failed", note="oversized mimetype"
+            )
+        if (mt_info.file_size / max(mt_info.compress_size, 1)) > _HWPX_COMPRESSION_RATIO_MAX:
+            return ExtractionResult(
+                text=None, status="failed", note="compressed hwpx zip bomb"
+            )
+        mt = zf.read("mimetype").strip()
         if mt != b"application/hwp+zip":
             return ExtractionResult(
                 text=None, status="failed", note="not an OWPML hwpx"

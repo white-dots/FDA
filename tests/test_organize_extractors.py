@@ -2097,6 +2097,22 @@ class TestHwpxCaps:
         assert r.status == "failed"
         assert "bomb" in r.note or "compress" in r.note
 
+    def test_oversized_mimetype_rejected_before_read(self, tmp_path):
+        """A malicious archive with an oversized mimetype entry is rejected
+        before zf.read() runs — prevents memory exhaustion via the mimetype
+        check that occurs before the per-section zip-bomb guards."""
+        from fda.organize import _extractors
+        import zipfile
+
+        p = tmp_path / "oversized_mt.hwpx"
+        with zipfile.ZipFile(p, "w", compression=zipfile.ZIP_STORED) as zf:
+            # A 1 KiB mimetype is far above the 256 B ceiling.
+            zf.writestr("mimetype", b"application/hwp+zip" + b" " * 1024)
+            zf.writestr("Contents/section0.xml", b"<root/>")
+        r = _extractors.extract(p)
+        assert r.status == "failed"
+        assert "mimetype" in r.note or "oversized" in r.note
+
 
 class TestHwpxXmlSafety:
     def test_one_malformed_section_other_section_still_walked(self, tmp_path):
@@ -2258,15 +2274,13 @@ class TestHwpSections:
     """
 
     def test_known_korean_text_flows_into_sections(self, tmp_path):
+        """Self-contained — fully mocks Hwp5File AND TextTransform so this
+        test runs even on hosts without the user's private corpus."""
         from fda.organize import _extractors
         from unittest.mock import patch, MagicMock
 
-        sample = _first_hwp_sample()
-        if sample is None:
-            pytest.skip(f"no .hwp samples at {_HWP_SAMPLES_DIR}")
-        import shutil
-        dest = tmp_path / sample.name
-        shutil.copy2(sample, dest)
+        dest = tmp_path / "synth.hwp"
+        dest.write_bytes(b"\x00" * 16)  # tiny placeholder; pyhwp is mocked away
 
         known_korean = (
             "[발주서]\n"
@@ -2275,14 +2289,19 @@ class TestHwpSections:
             "본문 내용...\n"
         )
 
+        fake_header = MagicMock()
+        fake_header.flags.password = False
+        fake_header.flags.distributable = False
+        fake_hwp = MagicMock()
+        fake_hwp.fileheader = fake_header
+
         def fake_transform(hwp, buf):
             buf.write(known_korean.encode("utf-8"))
 
-        # _extract_hwp does `TextTransform().transform_hwp5_to_text(hwp, buf)`.
-        # Patch the class so any new instance's transform_hwp5_to_text is fake.
-        fake_class = MagicMock()
-        fake_class.return_value.transform_hwp5_to_text = fake_transform
-        with patch("hwp5.hwp5txt.TextTransform", fake_class):
+        fake_tt_class = MagicMock()
+        fake_tt_class.return_value.transform_hwp5_to_text = fake_transform
+        with patch("hwp5.xmlmodel.Hwp5File", return_value=fake_hwp), \
+             patch("hwp5.hwp5txt.TextTransform", fake_tt_class):
             r = _extractors.extract(dest)
 
         assert r.status == "ok"

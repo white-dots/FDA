@@ -42,7 +42,7 @@ Faithful extension of the docx/xlsx/pptx/csv format-onboarding pattern: one extr
 - `tests/test_organize_extractors.py` — new test classes per format (`TestHwpxText`, `TestHwpxSections`, `TestHwpxFailure`, `TestHwpxCaps`, `TestHwpText`, `TestHwpSections`, `TestHwpFailure`, `TestHwpCaps`). Synthetic .hwpx fixtures built in-test via stdlib zipfile + ElementTree; .hwp fixtures harvested from the user's `~/Desktop/Projects/doc_agent_test_data/hwp_samples/` corpus + a couple of pyhwp-compatible minimal fixtures committed under `tests/fixtures/hwp/` (very small, public-format, non-Korean-confidential content) for repository self-containedness.
 - `tests/test_organize_reader.py` — Reader passes `sections` through for `.hwpx` and `.hwp` (parallel to existing PDF/text/docx/xlsx/pptx/csv coverage).
 - `tests/test_organize_constraints.py` — register new constants + any new fallback labels in the `CONSTS` check.
-- `tests/test_organize_pipeline.py` — add `.hwpx` and `.hwp` files to the integration corpus.
+- `tests/test_organize_pipeline.py` — add `.hwpx` to the integration corpus. (`.hwp` is intentionally NOT in the pipeline corpus — its passthrough depends on the user's private corpus and is already exercised by extractor + reader integration tests.)
 
 **Files not touched:** `_sections.py`, `models.py`, `reader.py`, `classifier.py`, `plan_builder.py`, `executor.py`, `verifier.py`, all skill prompts. Reader already dispatches by extension and copies `sections` through.
 
@@ -323,7 +323,7 @@ Mirroring the csv (~50 tests) and pptx (23 tests) patterns. Estimated counts (fi
 
 **Constants registry** (`tests/test_organize_constraints.py`): register the five new memory-bound constants (`_HWPX_SECTION_FILES_MAX`, `_HWPX_SECTION_BYTES_MAX`, `_HWPX_TOTAL_BYTES_MAX`, `_HWPX_COMPRESSION_RATIO_MAX`, `_HWP_BYTES_MAX`) in the existing `CONSTS` check.
 
-**Pipeline integration** (`tests/test_organize_pipeline.py`): add `.hwpx` and `.hwp` fixtures to the integration corpus.
+**Pipeline integration** (`tests/test_organize_pipeline.py`): add `.hwpx` fixture to the integration corpus. `.hwp` is intentionally not in the pipeline corpus — its passthrough is covered by the extractor + reader integration tests, since the `.hwp` source corpus is private to one host.
 
 Test target: ~50 net new tests (≈30 hwpx + ≈20 hwp). Suite runs after every commit per CLAUDE.md.
 
