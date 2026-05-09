@@ -370,3 +370,43 @@ Each step is a separate commit. Pre-commit hook enforces the full 113+net-new te
 - Harvested or user-permitted `.hwp` fixtures committed under `tests/fixtures/hwp/`: none — gap recorded; HWP tests skip without user's private corpus.
 - Test Python path: `/Users/hogyeongkim/Desktop/Projects/FDA/FDA/.venv/bin/python` (project venv, Python 3.12.11). The plan's documented path (`/Users/john/.pyenv/versions/3.12.8/bin/python`) does not exist on this host; using the project venv per the plan's "fall back to whichever Python 3.12 the test fixture conftest works under" clause.
 - HWP half decision: **GO**.
+
+## Real-corpus validation results (2026-05-09)
+
+10 hand-made `.hwp` samples at `/Users/hogyeongkim/Desktop/Projects/doc_agent_test_data/hwp_samples`. Each was passed through `_extract_hwp` and inspected for:
+
+- `status == "ok"`
+- text length > 0
+- Hangul (U+AC00..U+D7A3) presence
+- Hanyang PUA (U+E000..U+F8FF) presence
+- non-empty `sections` (only required when Hangul is present, per spec)
+
+Per-sample results:
+
+| Sample | status | len | hangul | pua | sections |
+|---|---|---|---|---|---|
+| 새 문서 (1).hwp | ok | 636 | True | False | () |
+| 새 문서 (2).hwp | ok | 535 | True | False | () |
+| 새 문서 (3).hwp | ok | 536 | True | False | () |
+| 새 문서 (4).hwp | ok | 547 | True | False | () |
+| 새 문서 (5).hwp | ok | 556 | True | False | () |
+| 새 문서 (6).hwp | ok | 599 | True | False | () |
+| 새 문서 (7).hwp | ok | 587 | True | False | () |
+| 새 문서 (8).hwp | ok | 573 | True | False | () |
+| 새 문서 (9).hwp | ok | 621 | True | False | () |
+| 새 문서.hwp | ok | 645 | True | False | () |
+
+Aggregate findings:
+- Samples passing `status="ok"`: 10 / 10.
+- Samples with Hangul: 10.
+- Samples with PUA: 0.
+- Samples with non-empty sections: 0.
+- Samples with PUA-only output (sections=() expected, v1 limitation): 0.
+
+**False negatives (visible structure A's regexes miss):** All 10 samples use the numbered-header pattern (`1. 채용 요청 배경`, `2. 생산 실적`, `3. 주요 작업 내용`, etc.). Korean A's v1 regexes cover bracket `[제목]`, colon `제목:`, and bullet `■ 제목` patterns only — numbered Arabic-digit headers are the deferred v2 numbered-header pattern. The `sections=()` result for all 10 samples is therefore an expected v1 limitation, not an extractor defect. Text extraction and Hangul round-trip are confirmed correct on all 10 samples.
+
+**PUA observations:** No Hanyang PUA characters (U+E000..U+F8FF) observed in any sample. All samples produce clean precomposed Hangul (U+AC00..U+D7A3). The PUA-handling path remains untested on real corpus; its behavior is exercised only via the synthetic unit tests in `TestHwpFailure`.
+
+**v2 brainstorm inputs:**
+- **Numbered-header pattern** (`\d+\.\s+<Hangul label>`): present in all 10 real samples; unambiguously the dominant heading style in this Lion Chemtech corpus. High priority for Korean B / v2 `_sections.py` work.
+- **PUA transliteration**: no real-corpus signal yet. Remains a theoretical concern for older `.hwp` files; not observed here.
