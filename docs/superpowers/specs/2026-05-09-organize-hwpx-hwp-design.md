@@ -12,7 +12,7 @@
 
 Add two dedicated extractors for the Korean office formats:
 
-- `_extract_hwpx` for `.hwpx` (XML in zip; OWPML / TTAK.OT-10.0203). Stdlib only.
+- `_extract_hwpx` for `.hwpx` (XML in zip; OWPML / TTAK.OT-10.0203). Stdlib `zipfile` + `defusedxml`.
 - `_extract_hwp` for `.hwp` (binary OLE compound document; HWP 5.x). Hard dep on `pyhwp`.
 
 Both produce plaintext text that flows through `_sections.py`, where Korean A's regexes (bracket / colon / bullet) pick up Korean headings automatically. End state: Korean office documents in either format produce non-empty `text` and (when their content matches A's regexes) non-empty `sections`. Today both extensions return `status="no_extractor"` and contribute nothing to the classifier.
@@ -38,7 +38,7 @@ Faithful extension of the docx/xlsx/pptx/csv format-onboarding pattern: one extr
 
 **Files touched:**
 - `fda/organize/_extractors.py` — add `_extract_hwpx` and `_extract_hwp`; add `".hwpx": _extract_hwpx` and `".hwp": _extract_hwp` to `EXTRACTORS`. Add per-format memory-bound constants. The existing import of `extract_sections_from_text` at the top of the file (line 32) is reused — both new extractors call it on their produced plaintext and pass the result through `ExtractionResult.sections`, mirroring how `_read_text` and `_extract_pdf_text` already populate sections (lines 94, 152). No additional `_sections.py` symbols are needed for these extractors.
-- `pyproject.toml` — add `pyhwp` to `dependencies`. No optional-extras split (per the user's "hard dep" choice). Pin a minimum version once the implementation plan's spike confirms 3.12 compatibility.
+- `pyproject.toml` — add `pyhwp` and `defusedxml` to `dependencies`. No optional-extras split (per the user's "hard dep" choice). Pin minimum versions once the implementation plan's spike confirms 3.12 compatibility.
 - `tests/test_organize_extractors.py` — new test classes per format (`TestHwpxText`, `TestHwpxSections`, `TestHwpxFailure`, `TestHwpxCaps`, `TestHwpText`, `TestHwpSections`, `TestHwpFailure`, `TestHwpCaps`). Synthetic .hwpx fixtures built in-test via stdlib zipfile + ElementTree; .hwp fixtures harvested from the user's `~/Desktop/Projects/doc_agent_test_data/hwp_samples/` corpus + a couple of pyhwp-compatible minimal fixtures committed under `tests/fixtures/hwp/` (very small, public-format, non-Korean-confidential content) for repository self-containedness.
 - `tests/test_organize_reader.py` — Reader passes `sections` through for `.hwpx` and `.hwp` (parallel to existing PDF/text/docx/xlsx/pptx/csv coverage).
 - `tests/test_organize_constraints.py` — register new constants + any new fallback labels in the `CONSTS` check.
@@ -116,7 +116,9 @@ For each section file (in order), up to the cap:
 - **Pre-decompression cap check (zip-bomb defense):** look up `ZipInfo.file_size` (uncompressed) for the entry. Skip if `file_size > _HWPX_SECTION_BYTES_MAX` (default 4 MiB) — set the run's text to `""`, do not call `zf.read`, do not abort the whole extraction. Track cumulative `file_size` across sections; if cumulative exceeds `_HWPX_TOTAL_BYTES_MAX` (default 8 MiB) BEFORE reading the next entry, stop walking.
 - **Compression-ratio guard:** also reject any entry where `file_size / max(compress_size, 1) > _HWPX_COMPRESSION_RATIO_MAX` (default 100) — defends against highly-compressed zip-bomb members that pass the absolute-size check.
 - Only after both checks pass: read via `zf.read(name)`.
-- Parse with `defusedxml.ElementTree.fromstring(data)` (the `defusedxml` import is mandatory in v1; see Architecture). On `ET.ParseError` → skip this section file (its text is `""`); do not abort.
+- Parse with `defusedxml.ElementTree.fromstring(data)` (the `defusedxml` import is mandatory in v1; see Architecture). Two distinct error classes:
+  - `ET.ParseError` (mid-section corruption / not-well-formed XML) → **skip this section file** (its text is `""`); do not abort the whole extraction. Consistent with partial-recovery behavior.
+  - `defusedxml.common.DefusedXmlException` (and subclasses `DTDForbidden`, `EntitiesForbidden`, `ExternalReferenceForbidden`) → **abort the whole extraction** with `status="failed", note=str(e)`. These indicate intentionally-malicious payloads, not benign corruption; failing the whole file is the safer signal to the rest of the pipeline.
 - Walk all elements. Collect `.text` (and `.tail` if non-trivial; details below) of every element whose local-name is `t`. Local-name match: `tag.rsplit("}", 1)[-1] == "t"`.
 - Join collected runs with `""` (empty string — runs in HWPX are already token-level; spaces inside runs are explicit). Append the section's joined text to a per-section list.
 - Between sections, append a single `"\n"` separator so paragraph breaks across HWPX section boundaries do not get glued together.
@@ -147,9 +149,11 @@ For `text == ""` the call is harmless: `extract_sections_from_text("")` early-re
 | Any zip entry has encryption bit set | `status="failed", note="encrypted hwpx"` |
 | Zero section files | `status="ok", text="", sections=()` |
 | One or more section files unparseable XML | Skip the unparseable ones; continue. If ALL unparseable → `text=""` is acceptable; status stays `"ok"`. |
-| Section file > `_HWPX_SECTION_BYTES_MAX` | Skip that section; do not abort. |
-| Cumulative bytes > `_HWPX_TOTAL_BYTES_MAX` | Stop walking; return what we have. |
+| Section file `ZipInfo.file_size` > `_HWPX_SECTION_BYTES_MAX` | Skip that section (do NOT call `zf.read`); do not abort. |
+| Cumulative `file_size` > `_HWPX_TOTAL_BYTES_MAX` | Stop walking BEFORE next `zf.read`; return what we have. |
+| Compression ratio `file_size / max(compress_size, 1)` > `_HWPX_COMPRESSION_RATIO_MAX` | `status="failed", note="compressed hwpx zip bomb"` (any one entry exceeding the ratio fails the whole archive — these are not benign). |
 | Section count > `_HWPX_SECTION_FILES_MAX` | Truncate at the cap; do not abort. |
+| `defusedxml.common.DefusedXmlException` on any section | `status="failed", note=str(e)` (abort the whole extraction). |
 | Whole-archive read raises `OSError` | `status="failed", note=str(e)` |
 
 ## `_extract_hwp`
@@ -176,49 +180,64 @@ def _extract_hwp(path: Path) -> ExtractionResult: ...
 
 ```python
 try:
-    import hwp5  # pyhwp top-level package (verified)
-    from hwp5.hwp5txt import TextTransform  # plaintext-extraction surface (verified)
-    from hwp5.filestructure import Hwp5File  # for FileHeader flag inspection
+    import hwp5                                      # pyhwp top-level package (verified)
+    from hwp5.xmlmodel import Hwp5File               # text-transform-capable file wrapper
+    from hwp5.hwp5txt import transform_hwp5_to_text  # plaintext extraction (verified per pyhwp source)
 except ImportError as e:
     return ExtractionResult(text=None, status="tool_missing", note=str(e))
 ```
 
-This branch should be unreachable in practice because the dep is hard. It exists for defense-in-depth (corrupt venv, partial install) so a missing import never aborts a run.
+This branch should be unreachable in practice because the dep is hard. It exists for defense-in-depth (corrupt venv, partial install) so a missing import never aborts a run. Note: `Hwp5File` is imported from `hwp5.xmlmodel`, NOT `hwp5.filestructure` — the xmlmodel wrapper is what `transform_hwp5_to_text` operates on.
 
-### Step 2 — open file and inspect FileHeader flags
-
-Open via `Hwp5File` (or pyhwp's equivalent file wrapper, verified in plan task 0). Before any text extraction, inspect FileHeader flags directly — pyhwp surfaces `password` and `distributable` as boolean flags on the file header, NOT as exceptions:
+### Step 2 — pre-open size check
 
 ```python
-hwp = Hwp5File(path)
-header = hwp.fileheader  # or equivalent attribute
+if path.stat().st_size > _HWP_BYTES_MAX:
+    return ExtractionResult(text=None, status="failed", note="oversized hwp")
+```
+
+Reader owns the output cap. This cap memory-bounds pyhwp's in-process parse.
+
+### Step 3 — open and inspect FileHeader flags
+
+Open via `Hwp5File(str(path))` — pyhwp's `Hwp5File` constructor checks for `basestring`-shaped input and rejects `pathlib.Path`, so we coerce to `str` explicitly:
+
+```python
+try:
+    hwp = Hwp5File(str(path))
+except Exception as e:                       # malformed OLE, v3, etc.
+    return ExtractionResult(text=None, status="failed", note=str(e))
+
+header = hwp.fileheader                      # FileHeader; field name pinned in plan task 0
 if header.flags.password:
     return ExtractionResult(text=None, status="failed", note="password-protected hwp")
 if header.flags.distributable:
-    # pyhwp wraps distributable docs and Hwp5File.text returns ViewText (a
-    # different code path). v1 treats this as failure; v2 may opt in to ViewText
-    # extraction once we understand the format better.
+    # pyhwp passes distributable docs through a ViewText wrapper; v1 fails them,
+    # v2 may opt in to ViewText extraction once we understand the format better.
     return ExtractionResult(text=None, status="failed", note="distributed hwp")
 ```
 
-**Codex finding:** the prior spec's exception-based detection ("if pyhwp surfaces it") was wrong — pyhwp passes password streams through with only a warning (decryption is unsupported in pyhwp), and distributable docs route through ViewText. Direct flag inspection is the correct surface.
+**Codex finding (pass 1):** pyhwp does NOT raise on password or distributable — passwords pass through with a warning (decryption is unsupported in pyhwp), and distributable docs route through ViewText. Direct flag inspection is the correct surface.
 
-If header parsing itself raises (truly malformed OLE, wrong version including HWP v3) → `status="failed", note=str(e)`.
+### Step 4 — extract text
 
-### Step 3 — extract text
+pyhwp's plaintext API takes a destination buffer (BytesIO) — it streams text out, not a return value:
 
 ```python
-text = TextTransform().transform(hwp)  # exact call signature pinned in plan task 0
+import io
+buf = io.BytesIO()
+try:
+    transform_hwp5_to_text(hwp, buf)         # exact call signature pinned in plan task 0
+except Exception as e:
+    return ExtractionResult(text=None, status="failed", note=str(e))
+text = buf.getvalue().decode("utf-8", errors="replace")
 ```
 
-Behavior the implementation plan must wrap:
-
-- Wrap in `try/except` for file-format errors during extraction → `status="failed", note=...`.
-- Memory-bound the in-process work via `_HWP_BYTES_MAX` (default 16 MiB) read cap on the input file. If `path.stat().st_size > _HWP_BYTES_MAX` → `status="failed", note="oversized hwp"` BEFORE opening. Reader owns the output cap.
+The plan task 0 spike confirms the precise function name and signature against the installed package — Codex verified `transform_hwp5_to_text` from the pyhwp source, but pyhwp's internal API has shifted across versions, so the plan pins it once installed.
 
 **Mojibake / Hanyang PUA known limitation:** pyhwp may emit Hanyang Private-Use Area characters (codepoints in U+E000..U+F8FF range) for some legacy Korean text rather than precomposed Hangul (U+AC00..U+D7A3). These pass through `text` cleanly but do NOT match `_sections.py`'s `contains_hangul()` Hangul-Syllables check, so PUA-heavy `.hwp` files will produce `sections=()` even when visually they have headers. **v1 accepts this limitation** rather than widening the regex (PUA is not unambiguously Korean). Document in real-corpus validation if observed; surface as a v2 brainstorm input. The original "all-`?` mojibake sentinel" is dropped from the spec — too narrow to catch the real failure mode (PUA), and risks false-positives on legitimately-empty docs.
 
-### Step 4 — return
+### Step 5 — return
 
 ```python
 return ExtractionResult(
@@ -238,9 +257,9 @@ Same pattern as `.hwpx`: the extractor itself calls `extract_sections_from_text(
 | HWP v3 (pre-5) | `Hwp5File()` raises (pyhwp doesn't parse v3) | `status="failed", note="hwp v3 unsupported"` |
 | Distributed | `header.flags.distributable` is True | `status="failed", note="distributed hwp"` |
 | Password-protected | `header.flags.password` is True | `status="failed", note="password-protected hwp"` |
-| Truncated / malformed streams | `TextTransform().transform()` raises | `status="failed", note=str(e)` |
+| Truncated / malformed streams | `transform_hwp5_to_text(hwp, buf)` raises | `status="failed", note=str(e)` |
 | File > `_HWP_BYTES_MAX` | `path.stat().st_size` check before open | `status="failed", note="oversized hwp"` |
-| Empty body | `TextTransform()` returns `""` | `status="ok", text="", sections=()` |
+| Empty body | `transform_hwp5_to_text` writes 0 bytes to `buf` | `status="ok", text="", sections=()` |
 | Hanyang PUA characters | Pass through `text` cleanly | `status="ok"`, `sections` may be `()` (PUA evades `contains_hangul`) — known v1 limitation, see Step 3 |
 
 ## Constants
@@ -270,16 +289,16 @@ No new symbols are imported from `_sections.py` for these extractors. The existi
 After implementation passes unit tests, run the extractor against all 10 of the user's hand-made samples in `~/Desktop/Projects/doc_agent_test_data/hwp_samples/`. For each sample:
 
 1. Confirm `status == "ok"`.
-2. Confirm `text` contains Korean (at least one Hangul code point).
-3. Confirm running `_sections.extract_sections_from_text(text)` over the result produces a non-empty tuple WHEN the source document contains bracket / colon / bullet headers — i.e., visually inspect each sample to know which patterns it contains, then assert the regex catches them.
+2. Confirm `text` contains Korean characters in EITHER form: precomposed Hangul (U+AC00..U+D7A3) OR Hanyang Private-Use Area (U+E000..U+F8FF). Pass on either; PUA-only output is a known pyhwp emission for some legacy docs and is not a failure.
+3. Confirm running `_sections.extract_sections_from_text(text)` over the result produces a non-empty tuple WHEN the source document contains bracket / colon / bullet headers AND the output contains precomposed Hangul. **Skip the sections-regex assertion when the output is PUA-only** — Korean A's regexes match U+AC00..U+D7A3 only; this is a documented v1 limitation, not a failure of this work.
 
-Record findings in this spec under a "Real-corpus validation results" section appended at the end (mirrors the Korean A spec's pattern). Document any false negatives (visible structure that A's regexes miss) — those become inputs to the v2 numbered-header brainstorm or future refinements; they do NOT block this ship.
+Record findings in this spec under a "Real-corpus validation results" section appended at the end (mirrors the Korean A spec's pattern). Document any false negatives (visible structure that A's regexes miss) AND any PUA-heavy samples observed — those become inputs to the v2 numbered-header brainstorm and a future PUA-transliteration brainstorm. Neither blocks this ship.
 
 ### `.hwpx` (sub-project B) — synthetic + harvested public docs
 
 No user-provided `.hwpx` samples exist (user cannot create them). Two-pronged validation:
 
-1. **Synthetic fixtures (in-test):** Build minimal valid `.hwpx` archives in test code via stdlib `zipfile` + `xml.etree.ElementTree`. Cover: empty body, single-paragraph, multi-paragraph, multi-section, namespace variants (2011 vs 2016 paragraph namespace), one-section-file-malformed, encrypted-flag-set rejection, missing-mimetype rejection.
+1. **Synthetic fixtures (in-test):** Build minimal valid `.hwpx` archives in test code via stdlib `zipfile` + `xml.etree.ElementTree`. Cover: empty body, single-paragraph, multi-paragraph, multi-section, namespace variants (2011, 2016, AND 2021 OWPML namespace families — at least one fixture per family), one-section-file-malformed, encrypted-flag-set rejection, missing-mimetype rejection, compression-ratio-bomb rejection.
 2. **Harvested public corpus (under `tests/fixtures/hwp/`):** download 2–3 public-domain `.hwpx` documents from a Korean government open-data source (e.g., Korea Data Portal `data.go.kr` publishes `.hwpx`-formatted public records). Commit them to the repo under `tests/fixtures/hwp/` only if they are genuinely public-domain and small (< 50 KiB each). Their purpose is spot-check: real-world `.hwpx` produced by Hangul Office may have quirks the synthetic fixtures don't capture (unusual run nesting, comment annotations, etc.). If we can't find suitably-licensed small samples, skip this step and document the gap — the spec is still shippable, the gap goes in the post-ship follow-up checklist.
 
 The implementation plan's first task is the harvest step (so subsequent tasks can write fixtures-aware tests). If harvest fails, plan task 0 records that and moves on; we do not block on it.
@@ -302,7 +321,7 @@ Mirroring the csv (~50 tests) and pptx (23 tests) patterns. Estimated counts (fi
 
 **Reader integration** (`tests/test_organize_reader.py`): one test per format that confirms `CatalogEntry.sections` is populated end-to-end for a sample with known headers, and preserved as `()` on extractor failure.
 
-**Constants registry** (`tests/test_organize_constraints.py`): register the four new memory-bound constants in the existing `CONSTS` check.
+**Constants registry** (`tests/test_organize_constraints.py`): register the five new memory-bound constants (`_HWPX_SECTION_FILES_MAX`, `_HWPX_SECTION_BYTES_MAX`, `_HWPX_TOTAL_BYTES_MAX`, `_HWPX_COMPRESSION_RATIO_MAX`, `_HWP_BYTES_MAX`) in the existing `CONSTS` check.
 
 **Pipeline integration** (`tests/test_organize_pipeline.py`): add `.hwpx` and `.hwp` fixtures to the integration corpus.
 
@@ -323,7 +342,7 @@ The plan ships in this sequence on `dev_branch`:
 3. **HWP second** (depends on spike):
    - Add `pyhwp` to `pyproject.toml`.
    - Happy-path `_extract_hwp` + register.
-   - Failure modes (non-OLE, v3, distributed, password, oversized, mojibake sentinel).
+   - Failure modes (non-OLE, v3, distributed via FileHeader.flags, password via FileHeader.flags, oversized).
    - Reader integration test.
 4. **Pipeline integration** + constants-registry update + final corpus pass.
 
