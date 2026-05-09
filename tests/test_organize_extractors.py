@@ -2096,3 +2096,94 @@ class TestHwpxCaps:
         r = _extractors.extract(p)
         assert r.status == "failed"
         assert "bomb" in r.note or "compress" in r.note
+
+
+class TestHwpxXmlSafety:
+    def test_one_malformed_section_other_section_still_walked(self, tmp_path):
+        """Mid-section ParseError → skip that section's text=""; other
+        sections still produce text. Status stays "ok"."""
+        from fda.organize import _extractors
+        import zipfile
+
+        p = tmp_path / "partial.hwpx"
+        with zipfile.ZipFile(p, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            info = zipfile.ZipInfo("mimetype")
+            info.compress_type = zipfile.ZIP_STORED
+            zf.writestr(info, b"application/hwp+zip")
+            # section0: malformed XML.
+            zf.writestr("Contents/section0.xml", b"<root><unclosed>")
+            # section1: well-formed, contains a Korean header.
+            ns = _HWPX_NS_2011
+            xml = (
+                f'<?xml version="1.0"?>'
+                f'<hp:sec xmlns:hp="{ns}">'
+                f'<hp:p><hp:run><hp:t>[발주서]</hp:t></hp:run></hp:p>'
+                f'</hp:sec>'
+            ).encode("utf-8")
+            zf.writestr("Contents/section1.xml", xml)
+        r = _extractors.extract(p)
+        assert r.status == "ok"
+        # section0 skipped, section1 walked — its bracket header lands.
+        assert r.sections == ("발주서",)
+
+    def test_all_sections_malformed_returns_ok_empty(self, tmp_path):
+        """When all section files are unparseable, text="" is acceptable;
+        status stays "ok"."""
+        from fda.organize import _extractors
+        import zipfile
+
+        p = tmp_path / "all_bad.hwpx"
+        with zipfile.ZipFile(p, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            info = zipfile.ZipInfo("mimetype")
+            info.compress_type = zipfile.ZIP_STORED
+            zf.writestr(info, b"application/hwp+zip")
+            zf.writestr("Contents/section0.xml", b"<<not xml>>")
+            zf.writestr("Contents/section1.xml", b"</also bad/>")
+        r = _extractors.extract(p)
+        assert r.status == "ok"
+        assert r.text.strip() == ""
+        assert r.sections == ()
+
+    def test_dtd_payload_aborts_whole_extraction(self, tmp_path):
+        """A section file containing a DOCTYPE (DTD) is rejected by defusedxml's
+        DTDForbidden — abort the whole extraction with status="failed"."""
+        from fda.organize import _extractors
+        import zipfile
+
+        p = tmp_path / "dtd.hwpx"
+        with zipfile.ZipFile(p, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            info = zipfile.ZipInfo("mimetype")
+            info.compress_type = zipfile.ZIP_STORED
+            zf.writestr(info, b"application/hwp+zip")
+            zf.writestr(
+                "Contents/section0.xml",
+                b'<?xml version="1.0"?>'
+                b'<!DOCTYPE foo [<!ENTITY x "hello">]>'
+                b"<root>&x;</root>",
+            )
+        r = _extractors.extract(p)
+        assert r.status == "failed"
+        assert r.text is None
+
+    def test_billion_laughs_payload_aborts_whole_extraction(self, tmp_path):
+        """A section file with nested entity expansion (billion laughs) is
+        rejected by defusedxml's EntitiesForbidden — abort."""
+        from fda.organize import _extractors
+        import zipfile
+
+        p = tmp_path / "lol.hwpx"
+        with zipfile.ZipFile(p, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            info = zipfile.ZipInfo("mimetype")
+            info.compress_type = zipfile.ZIP_STORED
+            zf.writestr(info, b"application/hwp+zip")
+            zf.writestr(
+                "Contents/section0.xml",
+                b'<?xml version="1.0"?>'
+                b'<!DOCTYPE lolz ['
+                b'<!ENTITY lol "lol">'
+                b'<!ENTITY lol2 "&lol;&lol;&lol;&lol;&lol;">'
+                b']>'
+                b"<lolz>&lol2;</lolz>",
+            )
+        r = _extractors.extract(p)
+        assert r.status == "failed"
