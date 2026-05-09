@@ -379,7 +379,7 @@ Each step is a separate commit. Pre-commit hook enforces the full 113+net-new te
 - text length > 0
 - Hangul (U+AC00..U+D7A3) presence
 - Hanyang PUA (U+E000..U+F8FF) presence
-- non-empty `sections` (only required when Hangul is present, per spec)
+- non-empty `sections` (expected only when the content contains Korean A's bracket/colon/bullet patterns; numbered Arabic-digit headers and PUA-only output are documented v1 limitations)
 
 Per-sample results:
 
