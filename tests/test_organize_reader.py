@@ -905,8 +905,11 @@ class TestSectionsPropagationDocxXlsx:
     def test_hwp_sections_flow_through_reader(
         self, workspace, fake_backend, logger
     ):
-        """Real user sample round-trips through Reader; sections may be ()
-        when the sample is PUA-heavy (documented v1 limitation)."""
+        """Real user sample round-trips through Reader. sections is allowed
+        to be () because the user's corpus uses numbered headers (`1. ...`)
+        which Korean A's v1 regexes don't cover (deferred to v2). But
+        verbatim_head MUST be populated — that is what verifies extraction
+        actually surfaced content for the catalog."""
         from pathlib import Path
         import shutil
         from fda.organize import reader
@@ -926,6 +929,10 @@ class TestSectionsPropagationDocxXlsx:
         catalog = reader.read(workspace, backend=fake_backend, logger=logger)
         e = next(c for c in catalog.entries if c.path.endswith(sample.name))
         assert e.extract_status == "ok"
+        # verbatim_head non-empty is the real "extraction succeeded" signal —
+        # a regression that silently empties sections AND text would otherwise
+        # pass the loose `isinstance(e.sections, tuple)` check below.
+        assert e.verbatim_head
         assert isinstance(e.sections, tuple)
 
     def test_hwp_failed_extraction_yields_empty_sections_in_catalog(
