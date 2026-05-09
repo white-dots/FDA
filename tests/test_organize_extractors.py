@@ -1936,3 +1936,68 @@ class TestHwpxText:
         assert r.status == "ok"
         assert "발주서" in r.sections
         assert "회사 정보" in r.sections
+
+
+class TestHwpxFailure:
+    def test_not_a_zip_returns_failed(self, tmp_path):
+        from fda.organize import _extractors
+
+        p = tmp_path / "fake.hwpx"
+        p.write_bytes(b"this is not a zip file at all")
+        r = _extractors.extract(p)
+        assert r.status == "failed"
+        assert r.text is None
+        assert r.sections == ()
+
+    def test_zip_without_mimetype_member_returns_failed(self, tmp_path):
+        from fda.organize import _extractors
+        import zipfile
+
+        p = tmp_path / "no_mt.hwpx"
+        with zipfile.ZipFile(p, "w") as zf:
+            zf.writestr("Contents/section0.xml", b"<root/>")
+        r = _extractors.extract(p)
+        assert r.status == "failed"
+        assert "OWPML" in r.note or "hwpx" in r.note
+
+    def test_wrong_mimetype_returns_failed(self, tmp_path):
+        from fda.organize import _extractors
+
+        p = _build_hwpx(tmp_path, mimetype=b"application/zip")
+        r = _extractors.extract(p)
+        assert r.status == "failed"
+        assert "OWPML" in r.note or "hwpx" in r.note
+
+    def test_mimetype_with_extra_suffix_rejected_exact_match(self, tmp_path):
+        """Regression: prefix-only matches like `application/hwp+zip-bad` must
+        be rejected. The implementation compares exactly after .strip()."""
+        from fda.organize import _extractors
+
+        p = _build_hwpx(tmp_path, mimetype=b"application/hwp+zip-bad")
+        r = _extractors.extract(p)
+        assert r.status == "failed"
+
+    def test_encrypted_entry_returns_failed(self, tmp_path, monkeypatch):
+        """Python's zipfile.ZipFile.writestr resets ZipInfo.flag_bits during
+        write, so a real encrypted-flag entry cannot be produced via the
+        helper. We instead monkeypatch ZipFile.infolist so it returns a
+        ZipInfo with flag_bits 0x1 set, simulating the runtime check."""
+        from fda.organize import _extractors
+        import zipfile
+
+        p = _build_hwpx(tmp_path)
+
+        original_infolist = zipfile.ZipFile.infolist
+
+        def faked_infolist(self):
+            infos = original_infolist(self)
+            for info in infos:
+                if info.filename.startswith("Contents/section"):
+                    info.flag_bits |= 0x1
+                    break
+            return infos
+
+        monkeypatch.setattr(zipfile.ZipFile, "infolist", faked_infolist)
+        r = _extractors.extract(p)
+        assert r.status == "failed"
+        assert "encrypted" in r.note
