@@ -46,18 +46,19 @@ Faithful extension of the docx/xlsx/pptx/csv format-onboarding pattern: one extr
 
 **Files not touched:** `_sections.py`, `models.py`, `reader.py`, `classifier.py`, `plan_builder.py`, `executor.py`, `verifier.py`, all skill prompts. Reader already dispatches by extension and copies `sections` through.
 
-**One new runtime dependency:** `pyhwp` (subject to license review — see Open blockers below). `.hwpx` uses stdlib `zipfile` + `defusedxml.ElementTree`. `defusedxml` becomes a v1 dependency (was originally listed as a follow-up; promoted after security review — Python's stdlib `xml.etree` Expat backend can still be vulnerable to internal-entity expansion / large-token DoS depending on Expat version, and the cost of `defusedxml` is one import substitution).
+**Two new runtime dependencies:** `pyhwp` (AGPLv3+) and `defusedxml`. `.hwpx` uses stdlib `zipfile` + `defusedxml.ElementTree`. `defusedxml` is promoted from follow-up to v1 dep after security review — Python's stdlib `xml.etree` Expat backend can still be vulnerable to internal-entity expansion / large-token DoS depending on Expat version, and the cost of `defusedxml` is one import substitution.
 
-## Open blockers
+## License posture
 
-**pyhwp is licensed AGPLv3+.** This is a copyleft license with a network/SaaS clause: any modified or deployed-as-a-service distribution of code that links pyhwp must release its source under AGPL. If `fda-system` is currently MIT/Apache/BSD, adding pyhwp as a hard dep creates a license conflict for downstream packagers. The spec's "hard dep on pyhwp" choice was made before the license was known. The user needs to re-decide between:
+**pyhwp is AGPLv3+.** AGPL is viral copyleft with a network/SaaS clause. The decision (recorded 2026-05-09) is to **accept AGPL exposure given fda-system's current distribution scope**: internal / Lion Chemtech use only, no PyPI publication, no public SaaS deployment, no LICENSE file declared in the repo today (effectively all-rights-reserved). At this scope, AGPL's copyleft trigger conditions do not apply.
 
-1. Accept AGPL exposure and proceed with pyhwp.
-2. Use pyhwp via a sandboxed `subprocess` call to the `hwp5txt` CLI, in a separate process — does NOT mitigate AGPL (AGPL applies to the binary, not just the import) but documents the boundary clearly.
-3. Switch to a different `.hwp` parser (none with pyhwp's coverage are known to be permissively licensed — would require its own brainstorm).
-4. Drop sub-project C from this spec; ship `.hwpx` (B) alone. C re-opens once a license-clean parser is identified.
+**Re-evaluation triggers** (any of these change the calculus and require revisiting before the change ships):
 
-**Until this is resolved, the entire `_extract_hwp` section below is provisional.** All other parts of the spec (HWPX, architecture, validation strategy for B) stand independently.
+- Decision to publish `fda-system` to PyPI under any permissive license (MIT/Apache/BSD).
+- Decision to deploy `fda-system` as a public SaaS where third parties access the service over a network.
+- Decision to redistribute `fda-system` to commercial customers as an SDK.
+
+If any of these become real, the path forward is one of: switch to optional-extras (`pip install fda-system[hwp]`), evaluate a different `.hwp` parser, or vendor a stripped-down HWP 5 text-only reader. None of those work is in scope for this spec.
 
 **Text contract:** Neither new extractor applies its own 64 KiB cap on `text`. Reader owns that contract via `READER_TEXT_CAP_BYTES` (`reader.py:29`) and applies byte-boundary-safe truncation plus the `[TRUNCATED at 64KB]` marker. The new constants exist only to bound in-process memory while reading, parsing, walking, and serializing — never as the contract cap.
 
@@ -163,7 +164,7 @@ def _extract_hwp(path: Path) -> ExtractionResult: ...
 
 ### Dependency strategy
 
-`pyhwp` is added to `pyproject.toml` `dependencies` *if and only if the AGPL license question (see Open blockers above) is resolved in favor of pyhwp*. The implementation plan's task 0 spike must verify three things before the rest of the plan executes:
+`pyhwp` is added to `pyproject.toml` `dependencies` (license posture resolved — see above). The implementation plan's task 0 spike must verify three things before the rest of the plan executes:
 
 1. `pyhwp` installs cleanly on Python 3.12 / 3.13. **Risk:** pyhwp's PyPI classifiers stop at Python 3.8 with no active `python_requires`; install on 3.12+ is unverified and may fail.
 2. The Python API is stable enough to import directly. The confirmed top-level package is `hwp5`; the plaintext-extraction surface is `hwp5.hwp5txt.TextTransform` (importable). The console script is `hwp5txt`.
