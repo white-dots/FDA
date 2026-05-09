@@ -359,3 +359,14 @@ Each step is a separate commit. Pre-commit hook enforces the full 113+net-new te
 - **Hanyang PUA → Hangul transliteration** for `.hwp` if PUA-heavy documents prove common — would feed Korean A's regex engine on previously-invisible structure.
 - **Distributed-doc ViewText extraction** for `.hwp` — pyhwp wraps distributable docs and exposes `Hwp5File.text` as `ViewText`; v1 fails them, v2 may opt in.
 - **Real-corpus validation results section** appended to this spec post-ship.
+
+## Spike findings (2026-05-09)
+
+- `pyhwp` installed cleanly on Python 3.12 (.venv/bin/python is 3.12.11): yes. Pinned version: 0.1b15.
+- `defusedxml` installed cleanly: yes. Pinned version: 0.7.1.
+- API surface verified: `Hwp5File` from `hwp5.xmlmodel`; `TextTransform` from `hwp5.hwp5txt` (its `.transform_hwp5_to_text` is a `@property` returning a callable — confirmed it returns `BaseTransform.make_transform_hwp5.<locals>.transform_hwp5`).
+- Sample round-trip: 3 of the user's hand-made samples checked (`새 문서 (1).hwp`, `새 문서 (2).hwp`, `새 문서 (3).hwp`); all open with `password=0`, `distributable=0`; produce 500–650 chars of clean precomposed Hangul text (no PUA observed in the spot-check). Note: `header.flags.password` and `.distributable` are integers (0/1) not bools — the falsy check `if header.flags.password:` works correctly.
+- Harvested `.hwpx` fixtures committed under `tests/fixtures/hwp/`: none — gap recorded; harvested-fixture spot-check in Task 8 will skip. Auto-mode time-box did not allow Korea Data Portal harvest.
+- Harvested or user-permitted `.hwp` fixtures committed under `tests/fixtures/hwp/`: none — gap recorded; HWP tests skip without user's private corpus.
+- Test Python path: `/Users/hogyeongkim/Desktop/Projects/FDA/FDA/.venv/bin/python` (project venv, Python 3.12.11). The plan's documented path (`/Users/john/.pyenv/versions/3.12.8/bin/python`) does not exist on this host; using the project venv per the plan's "fall back to whichever Python 3.12 the test fixture conftest works under" clause.
+- HWP half decision: **GO**.
