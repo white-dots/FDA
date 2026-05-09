@@ -902,6 +902,45 @@ class TestSectionsPropagationDocxXlsx:
         # Sections is a tuple — empty tuple is fine, but the type should hold.
         assert isinstance(e.sections, tuple)
 
+    def test_hwp_sections_flow_through_reader(
+        self, workspace, fake_backend, logger
+    ):
+        """Real user sample round-trips through Reader; sections may be ()
+        when the sample is PUA-heavy (documented v1 limitation)."""
+        from pathlib import Path
+        import shutil
+        from fda.organize import reader
+
+        samples_dir = Path(
+            "/Users/hogyeongkim/Desktop/Projects/doc_agent_test_data/hwp_samples"
+        )
+        if not samples_dir.is_dir():
+            pytest.skip(f"no .hwp samples at {samples_dir}")
+        samples = sorted(samples_dir.glob("*.hwp"))
+        if not samples:
+            pytest.skip(f"no .hwp samples at {samples_dir}")
+
+        sample = samples[0]
+        dest = workspace / sample.name
+        shutil.copy2(sample, dest)
+        catalog = reader.read(workspace, backend=fake_backend, logger=logger)
+        e = next(c for c in catalog.entries if c.path.endswith(sample.name))
+        assert e.extract_status == "ok"
+        assert isinstance(e.sections, tuple)
+
+    def test_hwp_failed_extraction_yields_empty_sections_in_catalog(
+        self, workspace, fake_backend, logger
+    ):
+        """Non-OLE input → status="failed", sections=()."""
+        from fda.organize import reader
+
+        f = workspace / "broken.hwp"
+        f.write_bytes(b"not an OLE compound document")
+        catalog = reader.read(workspace, backend=fake_backend, logger=logger)
+        e = next(c for c in catalog.entries if c.path.endswith("broken.hwp"))
+        assert e.extract_status == "failed"
+        assert e.sections == ()
+
 
 class TestKoreanSectionsThroughReader:
     """Korean structural-fingerprint coverage: a plaintext file containing
