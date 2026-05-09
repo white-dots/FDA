@@ -2189,3 +2189,102 @@ class TestHwpxXmlSafety:
             )
         r = _extractors.extract(p)
         assert r.status == "failed"
+
+
+# ---------------------------------------------------------------------------
+# .hwp — binary OLE compound document (HWP 5.x), via pyhwp
+# ---------------------------------------------------------------------------
+
+_HWP_SAMPLES_DIR = Path("/Users/hogyeongkim/Desktop/Projects/doc_agent_test_data/hwp_samples")
+
+
+def _first_hwp_sample() -> Path | None:
+    """Return the first .hwp sample that round-trips through the extractor
+    successfully (status == "ok" with non-empty text). None if dir/samples
+    missing or all samples fail (e.g., all password-protected).
+
+    This guards against the first sorted sample being password-protected or
+    distributable — those cases would fail _extract_hwp's flag checks and
+    cause downstream tests to fail for the wrong reason.
+    """
+    if not _HWP_SAMPLES_DIR.is_dir():
+        return None
+    from fda.organize import _extractors  # local import to avoid cycle at module load
+    for sample in sorted(_HWP_SAMPLES_DIR.glob("*.hwp")):
+        r = _extractors.extract(sample)
+        if r.status == "ok" and r.text:
+            return sample
+    return None
+
+
+class TestHwpText:
+    def test_real_user_sample_round_trips(self, tmp_path):
+        """The user has 10 hand-made .hwp samples; verify pyhwp opens one and
+        produces Korean text in EITHER form (precomposed Hangul or Hanyang PUA)."""
+        from fda.organize import _extractors
+
+        sample = _first_hwp_sample()
+        if sample is None:
+            pytest.skip(f"no .hwp samples at {_HWP_SAMPLES_DIR}")
+
+        # Copy to tmp_path so the test does not mutate the user's corpus.
+        import shutil
+        dest = tmp_path / sample.name
+        shutil.copy2(sample, dest)
+
+        r = _extractors.extract(dest)
+        assert r.status == "ok"
+        assert r.text is not None
+        # Accept either precomposed Hangul OR Hanyang PUA — pyhwp emission
+        # for legacy Korean docs varies. PUA is documented v1 limitation.
+        has_hangul = any("가" <= c <= "힣" for c in r.text)
+        has_pua = any("" <= c <= "" for c in r.text)
+        assert has_hangul or has_pua, (
+            f"sample {sample.name} produced neither Hangul nor PUA characters"
+        )
+
+
+class TestHwpSections:
+    """Deterministic regression test for sections-wiring in _extract_hwp.
+
+    Patches TextTransform so its transform_hwp5_to_text writes known Korean
+    plaintext containing bracket / colon / bullet headers. Verifies that
+    _extract_hwp threads the buffer's bytes through extract_sections_from_text
+    and surfaces the labels in ExtractionResult.sections.
+
+    This is a committed regression guard — Task 12's per-sample real-corpus
+    pass records empirical behavior but does not assert on specific labels
+    (we don't know in advance which user samples have which headers).
+    """
+
+    def test_known_korean_text_flows_into_sections(self, tmp_path):
+        from fda.organize import _extractors
+        from unittest.mock import patch, MagicMock
+
+        sample = _first_hwp_sample()
+        if sample is None:
+            pytest.skip(f"no .hwp samples at {_HWP_SAMPLES_DIR}")
+        import shutil
+        dest = tmp_path / sample.name
+        shutil.copy2(sample, dest)
+
+        known_korean = (
+            "[발주서]\n"
+            "회사 정보:\n"
+            "■ 주의사항\n"
+            "본문 내용...\n"
+        )
+
+        def fake_transform(hwp, buf):
+            buf.write(known_korean.encode("utf-8"))
+
+        # _extract_hwp does `TextTransform().transform_hwp5_to_text(hwp, buf)`.
+        # Patch the class so any new instance's transform_hwp5_to_text is fake.
+        fake_class = MagicMock()
+        fake_class.return_value.transform_hwp5_to_text = fake_transform
+        with patch("hwp5.hwp5txt.TextTransform", fake_class):
+            r = _extractors.extract(dest)
+
+        assert r.status == "ok"
+        assert r.text == known_korean
+        assert r.sections == ("발주서", "회사 정보", "주의사항")

@@ -696,6 +696,72 @@ def _extract_hwpx(path: Path) -> ExtractionResult:
     )
 
 
+def _extract_hwp(path: Path) -> ExtractionResult:
+    """Extract text + sections from a .hwp file (HWP 5.x via pyhwp).
+
+    pyhwp is a hard runtime dep; the ImportError branch is defense-in-depth
+    against corrupt venv / partial install — it should be unreachable in
+    practice.
+
+    pyhwp does NOT raise on password-protected or distributable docs:
+    passwords pass through with a warning (decryption unsupported);
+    distributable docs route through ViewText. We inspect the FileHeader
+    flags directly and fail those cases as v1 does not support them.
+
+    Mojibake / Hanyang PUA is a known v1 limitation: pyhwp may emit PUA
+    characters (U+E000..U+F8FF) for some legacy Korean text rather than
+    precomposed Hangul. PUA passes through `text` cleanly but does not
+    match _sections.py's contains_hangul() check, so PUA-heavy files
+    produce sections=() even when visually they have headers.
+    """
+    from contextlib import closing
+
+    try:
+        from hwp5.xmlmodel import Hwp5File
+        from hwp5.hwp5txt import TextTransform
+    except ImportError as e:
+        return ExtractionResult(text=None, status="tool_missing", note=str(e))
+
+    if path.stat().st_size > _HWP_BYTES_MAX:
+        return ExtractionResult(
+            text=None, status="failed", note="oversized hwp"
+        )
+
+    # pyhwp's Hwp5File rejects pathlib.Path; coerce explicitly to str.
+    # Wrap in contextlib.closing — pyhwp's own main() does the same to
+    # release the underlying OLE/file handle on exit.
+    try:
+        hwp_file = Hwp5File(str(path))
+    except Exception as e:  # noqa: BLE001 — malformed OLE, v3, etc.
+        return ExtractionResult(text=None, status="failed", note=str(e))
+
+    with closing(hwp_file) as hwp:
+        header = hwp.fileheader
+        if header.flags.password:
+            return ExtractionResult(
+                text=None, status="failed", note="password-protected hwp"
+            )
+        if header.flags.distributable:
+            return ExtractionResult(
+                text=None, status="failed", note="distributed hwp"
+            )
+
+        buf = io.BytesIO()
+        try:
+            # transform_hwp5_to_text is a @property on TextTransform that
+            # returns a callable; invoke it with (hwp5file, dest_buffer).
+            TextTransform().transform_hwp5_to_text(hwp, buf)
+        except Exception as e:  # noqa: BLE001 — pyhwp may raise on truncated streams
+            return ExtractionResult(text=None, status="failed", note=str(e))
+
+    text = buf.getvalue().decode("utf-8", errors="replace")
+    return ExtractionResult(
+        text=text,
+        status="ok",
+        sections=extract_sections_from_text(text),
+    )
+
+
 EXTRACTORS: dict[str, TextExtractor] = {
     ".txt": _read_text,
     ".md": _read_text,
@@ -708,6 +774,7 @@ EXTRACTORS: dict[str, TextExtractor] = {
     ".xlsx": _extract_xlsx,
     ".pptx": _extract_pptx,
     ".hwpx": _extract_hwpx,
+    ".hwp": _extract_hwp,
 }
 
 
