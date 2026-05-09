@@ -43,6 +43,22 @@ claude mcp add fda -- ssh your-mac.local /Users/john/.pyenv/versions/3.12.8/bin/
 
 Auth = SSH keys. No new ports, no tokens, nothing exposed beyond port 22.
 
+## Install the client-side skill (recommended)
+
+There's a Claude Code skill in this repo that walks the user through SSH key
+setup, MCP registration, and common workflows. Install it on the remote
+machine (laptop, VM, etc.) once and the skill auto-triggers when the user
+mentions FDA, remote setup, or invokes `mcp__fda__*` tools:
+
+```bash
+mkdir -p ~/.claude/skills/fda-remote
+curl -fsSL https://raw.githubusercontent.com/white-dots/FDA/v1/.claude/skills/fda-remote/SKILL.md \
+  -o ~/.claude/skills/fda-remote/SKILL.md
+```
+
+The skill is self-contained — no other files needed. Open the file to review
+what triggers it and edit the description if you want different trigger phrases.
+
 ## Verify
 
 ```bash
