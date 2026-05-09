@@ -1790,3 +1790,100 @@ class TestCsvEdgeCases:
         assert r.status == "ok"
         assert r.sections == ("name", "age")
         assert "alice\t30\n" in r.text
+
+
+# ---------------------------------------------------------------------------
+# .hwpx — XML in zip (OWPML / TTAK.OT-10.0203)
+# ---------------------------------------------------------------------------
+
+# Namespace URIs observed across HWPX revisions. Synthetic fixtures cover
+# all three families to exercise local-name matching.
+_HWPX_NS_2011 = "http://www.hancom.co.kr/hwpml/2011/paragraph"
+_HWPX_NS_2016 = "http://www.hancom.co.kr/hwpml/2016/paragraph"
+_HWPX_NS_2021 = "http://www.owpml.org/owpml/2021/paragraph"
+
+
+def _build_hwpx(
+    tmp_path,
+    name: str = "doc.hwpx",
+    sections: list[list[list[str]]] | None = None,
+    namespace: str = _HWPX_NS_2011,
+    mimetype: bytes = b"application/hwp+zip",
+    extra_members: dict[str, bytes] | None = None,
+) -> Path:
+    """Build a minimal valid .hwpx archive on disk and return its path.
+
+    `sections` is a list of section files; each section file is a list of
+    paragraphs; each paragraph is a list of run texts (the <hp:t> contents).
+    Default: one section, one paragraph, one run "[발주서]".
+
+    Note: there is no `encrypted=True` parameter — Python's zipfile.writestr
+    resets ZipInfo.flag_bits in _open_to_write, so setting flag_bits before
+    writestr does not produce an encrypted entry. The encrypted-flag test
+    monkeypatches ZipFile.infolist instead.
+    """
+    import zipfile
+    from xml.etree import ElementTree as ET
+
+    if sections is None:
+        sections = [[["[발주서]"]]]
+
+    p = tmp_path / name
+    with zipfile.ZipFile(p, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        # mimetype is conventionally the first member, stored uncompressed.
+        info = zipfile.ZipInfo("mimetype")
+        info.compress_type = zipfile.ZIP_STORED
+        zf.writestr(info, mimetype)
+
+        for idx, section in enumerate(sections):
+            ET.register_namespace("hp", namespace)
+            root = ET.Element(f"{{{namespace}}}sec")
+            for para in section:
+                p_el = ET.SubElement(root, f"{{{namespace}}}p")
+                for run_text in para:
+                    run_el = ET.SubElement(p_el, f"{{{namespace}}}run")
+                    t_el = ET.SubElement(run_el, f"{{{namespace}}}t")
+                    t_el.text = run_text
+            xml_bytes = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+            zf.writestr(f"Contents/section{idx}.xml", xml_bytes)
+
+        for member_name, member_data in (extra_members or {}).items():
+            zf.writestr(member_name, member_data)
+    return p
+
+
+class TestHwpxText:
+    def test_single_section_single_paragraph_yields_run_text(self, tmp_path):
+        from fda.organize import _extractors
+
+        p = _build_hwpx(tmp_path, sections=[[["Hello world"]]])
+        r = _extractors.extract(p)
+        assert r.status == "ok"
+        assert "Hello world" in r.text
+
+    def test_korean_bracket_header_picked_up_as_section(self, tmp_path):
+        from fda.organize import _extractors
+
+        p = _build_hwpx(tmp_path, sections=[[["[발주서]"]]])
+        r = _extractors.extract(p)
+        assert r.status == "ok"
+        assert r.sections == ("발주서",)
+
+    def test_multiple_runs_in_one_paragraph_join_with_empty_string(self, tmp_path):
+        """Runs join with "" — HWPX runs are token-level; spaces are explicit."""
+        from fda.organize import _extractors
+
+        p = _build_hwpx(tmp_path, sections=[[["회사 ", "정보:"]]])
+        r = _extractors.extract(p)
+        assert r.status == "ok"
+        # Two adjacent runs concatenate into "회사 정보:" — colon-header regex picks it up.
+        assert "회사 정보" in r.sections
+
+    def test_empty_archive_zero_section_files_returns_ok(self, tmp_path):
+        from fda.organize import _extractors
+
+        p = _build_hwpx(tmp_path, sections=[])
+        r = _extractors.extract(p)
+        assert r.status == "ok"
+        assert r.text == ""
+        assert r.sections == ()

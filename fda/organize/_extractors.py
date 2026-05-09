@@ -21,6 +21,7 @@ import re
 import shutil
 import subprocess
 import time
+import zipfile
 from pathlib import Path
 from typing import Callable
 
@@ -555,6 +556,146 @@ def _label_min_chars(s: str) -> int:
     return SECTION_HEADER_MIN_CHARS
 
 
+def _hwpx_localname(tag: str) -> str:
+    """Return the local-name of an XML tag.
+
+    Tags from `xml.etree.ElementTree` are formatted as "{namespace}localname"
+    when namespaced, or "localname" plain when not. The rsplit handles both.
+    """
+    return tag.rsplit("}", 1)[-1]
+
+
+_HWPX_SECTION_FILE_RE = re.compile(r"^Contents/section(\d+)\.xml$")
+
+
+def _extract_hwpx(path: Path) -> ExtractionResult:
+    """Extract text + sections from a .hwpx file.
+
+    Format: ZIP archive (OWPML / TTAK.OT-10.0203). Body text lives in
+    Contents/section*.xml. Each is XML with paragraphs (<hp:p>) holding
+    runs (<hp:run>) holding text (<hp:t>). Namespace URIs vary across
+    revisions (2011/2016/2021); we match by local-name to handle all.
+
+    Sections: produced by extract_sections_from_text() over the joined
+    plaintext — Korean A's regexes (bracket / colon / bullet) pick up
+    Korean headings automatically.
+
+    Memory-bound caps:
+    - _HWPX_SECTION_FILES_MAX: archive entry count.
+    - _HWPX_SECTION_BYTES_MAX: per-entry uncompressed size (checked via
+      ZipInfo.file_size BEFORE zf.read).
+    - _HWPX_TOTAL_BYTES_MAX: cumulative uncompressed size across sections.
+    - _HWPX_COMPRESSION_RATIO_MAX: per-entry zip-bomb defense.
+    """
+    # defusedxml is mandatory in v1; hard import (no try/except — pyproject
+    # makes it a runtime dep).
+    import defusedxml.ElementTree as DET
+    from defusedxml.common import DefusedXmlException
+    from xml.etree.ElementTree import ParseError as _XmlParseError
+
+    try:
+        zf = zipfile.ZipFile(path, "r")
+    except zipfile.BadZipFile as e:
+        return ExtractionResult(text=None, status="failed", note=str(e))
+
+    try:
+        # mimetype member required, exact match.
+        try:
+            mt = zf.read("mimetype").strip()
+        except KeyError:
+            return ExtractionResult(
+                text=None, status="failed", note="not an OWPML hwpx"
+            )
+        if mt != b"application/hwp+zip":
+            return ExtractionResult(
+                text=None, status="failed", note="not an OWPML hwpx"
+            )
+
+        # Reject any encrypted entries.
+        for info in zf.infolist():
+            if info.flag_bits & 0x1:
+                return ExtractionResult(
+                    text=None, status="failed", note="encrypted hwpx"
+                )
+
+        # Locate section files; sort numerically by suffix.
+        sections_by_idx: list[tuple[int, zipfile.ZipInfo]] = []
+        for info in zf.infolist():
+            m = _HWPX_SECTION_FILE_RE.match(info.filename)
+            if m:
+                sections_by_idx.append((int(m.group(1)), info))
+        sections_by_idx.sort(key=lambda pair: pair[0])
+
+        if not sections_by_idx:
+            text = ""
+            return ExtractionResult(
+                text=text,
+                status="ok",
+                sections=extract_sections_from_text(text),
+            )
+
+        # Truncate at file-count cap (do not abort).
+        sections_by_idx = sections_by_idx[:_HWPX_SECTION_FILES_MAX]
+
+        per_section_texts: list[str] = []
+        cumulative = 0
+        for _idx, info in sections_by_idx:
+            # Compression-ratio guard FIRST: any one entry exceeding the
+            # ratio is treated as malicious — abort the whole archive.
+            ratio = info.file_size / max(info.compress_size, 1)
+            if ratio > _HWPX_COMPRESSION_RATIO_MAX:
+                return ExtractionResult(
+                    text=None,
+                    status="failed",
+                    note="compressed hwpx zip bomb",
+                )
+            # Per-section uncompressed-size cap (checked BEFORE read).
+            if info.file_size > _HWPX_SECTION_BYTES_MAX:
+                per_section_texts.append("")
+                continue
+            # Cumulative cap (checked BEFORE next read).
+            if cumulative + info.file_size > _HWPX_TOTAL_BYTES_MAX:
+                break
+            cumulative += info.file_size
+
+            data = zf.read(info.filename)
+            try:
+                root = DET.fromstring(data)
+            except DefusedXmlException as e:
+                # Intentionally-malicious payload (DTD / billion laughs /
+                # external reference) — abort the whole extraction.
+                return ExtractionResult(
+                    text=None, status="failed", note=str(e)
+                )
+            except _XmlParseError:
+                # Benign mid-section corruption — skip this section, keep going.
+                per_section_texts.append("")
+                continue
+
+            # Walk paragraphs, then runs within each paragraph. Insert "\n"
+            # between paragraphs so line-oriented regexes in _sections.py
+            # can pattern-match.
+            paragraph_lines: list[str] = []
+            for el in root.iter():
+                if _hwpx_localname(el.tag) != "p":
+                    continue
+                run_parts: list[str] = []
+                for sub in el.iter():
+                    if _hwpx_localname(sub.tag) == "t" and sub.text:
+                        run_parts.append(sub.text)
+                paragraph_lines.append("".join(run_parts))
+            per_section_texts.append("\n".join(paragraph_lines))
+    finally:
+        zf.close()
+
+    text = "\n".join(per_section_texts)
+    return ExtractionResult(
+        text=text,
+        status="ok",
+        sections=extract_sections_from_text(text),
+    )
+
+
 EXTRACTORS: dict[str, TextExtractor] = {
     ".txt": _read_text,
     ".md": _read_text,
@@ -566,6 +707,7 @@ EXTRACTORS: dict[str, TextExtractor] = {
     ".docx": _extract_docx,
     ".xlsx": _extract_xlsx,
     ".pptx": _extract_pptx,
+    ".hwpx": _extract_hwpx,
 }
 
 
