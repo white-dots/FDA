@@ -52,6 +52,22 @@ def workspace(tmp_path):
     csv_path = root / "data.csv"
     csv_path.write_text("customer_id,order_date\n1,2024-01-01\n")
 
+    # Minimal .hwpx (one section, one paragraph with a Korean bracket header).
+    import zipfile as _zipfile
+    hwpx_path = root / "korean.hwpx"
+    ns = "http://www.hancom.co.kr/hwpml/2011/paragraph"
+    with _zipfile.ZipFile(hwpx_path, "w", compression=_zipfile.ZIP_DEFLATED) as zf:
+        info = _zipfile.ZipInfo("mimetype")
+        info.compress_type = _zipfile.ZIP_STORED
+        zf.writestr(info, b"application/hwp+zip")
+        xml = (
+            f'<?xml version="1.0"?>'
+            f'<hp:sec xmlns:hp="{ns}">'
+            f'<hp:p><hp:run><hp:t>[발주서]</hp:t></hp:run></hp:p>'
+            f'</hp:sec>'
+        ).encode("utf-8")
+        zf.writestr("Contents/section0.xml", xml)
+
     return root
 
 
@@ -119,6 +135,7 @@ class TestOrganize:
         assert (workspace / "Texts" / "data.xlsx").exists()
         assert (workspace / "Texts" / "deck.pptx").exists()
         assert (workspace / "Texts" / "data.csv").exists()
+        assert (workspace / "Texts" / "korean.hwpx").exists()
         assert result.log_path is not None
         assert "Texts" in result.summary or "text-shaped" in result.summary
 
@@ -138,6 +155,7 @@ class TestOrganize:
         assert (workspace / "data.xlsx").exists()
         assert (workspace / "deck.pptx").exists()
         assert (workspace / "data.csv").exists()
+        assert (workspace / "korean.hwpx").exists()
         assert plan.log_path is not None
 
     def test_invalid_target_raises(self, workspace):
