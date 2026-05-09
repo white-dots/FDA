@@ -2001,3 +2001,98 @@ class TestHwpxFailure:
         r = _extractors.extract(p)
         assert r.status == "failed"
         assert "encrypted" in r.note
+
+
+class TestHwpxCaps:
+    def test_section_file_count_truncated_at_max(self, tmp_path, monkeypatch):
+        """When more than _HWPX_SECTION_FILES_MAX section files exist, the
+        extractor truncates at the cap rather than aborting."""
+        from fda.organize import _extractors
+
+        # Lower the file-count cap so we can build a small fixture.
+        monkeypatch.setattr(_extractors, "_HWPX_SECTION_FILES_MAX", 5)
+        # Build cap + 3 section files; only the first 5 should be walked.
+        sections = [[[f"section_{i}_marker"]] for i in range(8)]
+        p = _build_hwpx(tmp_path, sections=sections)
+        r = _extractors.extract(p)
+        assert r.status == "ok"
+        # First 5 sections present; sections past the cap absent.
+        assert "section_0_marker" in r.text
+        assert "section_4_marker" in r.text
+        assert "section_5_marker" not in r.text
+        assert "section_7_marker" not in r.text
+
+    def test_oversized_section_skipped_not_aborted(self, tmp_path, monkeypatch):
+        """A section whose ZipInfo.file_size exceeds _HWPX_SECTION_BYTES_MAX
+        is skipped (text=""); other sections still produce text."""
+        from fda.organize import _extractors
+
+        # Lower the per-section cap so a 4 KiB body trips it; raise the
+        # ratio cap so the highly-compressible body doesn't trip the bomb
+        # guard first.
+        monkeypatch.setattr(_extractors, "_HWPX_SECTION_BYTES_MAX", 1024)
+        monkeypatch.setattr(_extractors, "_HWPX_COMPRESSION_RATIO_MAX", 100_000)
+
+        big_body = "x" * 8 * 1024     # ~8 KiB run text > 1 KiB section cap
+        p = _build_hwpx(
+            tmp_path,
+            sections=[
+                [[big_body]],         # section0: oversized → skipped
+                [["[발주서]"]],       # section1: normal → walked
+            ],
+        )
+        r = _extractors.extract(p)
+        assert r.status == "ok"
+        # section0 skipped — its big_body not present.
+        assert "x" * 100 not in r.text
+        # section1 walked.
+        assert r.sections == ("발주서",)
+
+    def test_cumulative_cap_stops_walk(self, tmp_path, monkeypatch):
+        """When cumulative file_size exceeds _HWPX_TOTAL_BYTES_MAX before the
+        next read, the walk stops with what we have."""
+        from fda.organize import _extractors
+
+        # Lower the cumulative cap so a fixture of a few KiB sections trips it.
+        # Raise the ratio cap so highly-compressible bodies don't trip the bomb.
+        monkeypatch.setattr(_extractors, "_HWPX_TOTAL_BYTES_MAX", 12 * 1024)
+        monkeypatch.setattr(_extractors, "_HWPX_SECTION_BYTES_MAX", 8 * 1024)
+        monkeypatch.setattr(_extractors, "_HWPX_COMPRESSION_RATIO_MAX", 100_000)
+
+        body = "x" * 5 * 1024  # ~5 KiB body per section
+        # Markers are arbitrary ASCII strings checked in r.text — the Korean
+        # section regexes are NOT exercised here, this test asserts walk
+        # truncation only.
+        sections = [
+            [["s0_marker_text", body]],
+            [["s1_marker_text", body]],
+            [["s2_marker_text", body]],   # cumulative > 12 KiB before this read
+            [["final_marker_text"]],
+        ]
+        p = _build_hwpx(tmp_path, sections=sections)
+        r = _extractors.extract(p)
+        assert r.status == "ok"
+        # First two sections walked (text present); third and final stopped.
+        assert "s0_marker_text" in r.text
+        assert "s1_marker_text" in r.text
+        assert "s2_marker_text" not in r.text
+        assert "final_marker_text" not in r.text
+
+    def test_compression_ratio_bomb_aborts_archive(self, tmp_path):
+        """A single entry whose uncompressed/compressed ratio exceeds
+        _HWPX_COMPRESSION_RATIO_MAX is treated as malicious — abort whole."""
+        from fda.organize import _extractors
+        import zipfile
+
+        p = tmp_path / "bomb.hwpx"
+        # Write a "section0.xml" that's highly compressible (1 MiB of "A")
+        # so DEFLATE produces a tiny compressed size — ratio in the thousands.
+        big_xml = b"<?xml version='1.0'?><root>" + b"A" * (1024 * 1024) + b"</root>"
+        with zipfile.ZipFile(p, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            info = zipfile.ZipInfo("mimetype")
+            info.compress_type = zipfile.ZIP_STORED
+            zf.writestr(info, b"application/hwp+zip")
+            zf.writestr("Contents/section0.xml", big_xml)
+        r = _extractors.extract(p)
+        assert r.status == "failed"
+        assert "bomb" in r.note or "compress" in r.note
