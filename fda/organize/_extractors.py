@@ -425,6 +425,15 @@ def _extract_csv(path: Path) -> ExtractionResult:
     with path.open("rb") as f:
         raw = f.read(_CSV_READ_BYTES_MAX)
 
+    # Reject NUL bytes explicitly. Older Pythons relied on csv.reader raising
+    # csv.Error("line contains NUL"), but Python 3.12+ no longer does — a NUL
+    # byte would otherwise pass through into `text`. A NUL anywhere in a CSV
+    # is a strong signal the file is binary or corrupt; fail closed.
+    if b"\x00" in raw:
+        return ExtractionResult(
+            text=None, status="failed", note="line contains NUL"
+        )
+
     try:
         decoded = raw.decode("utf-8-sig")
     except UnicodeDecodeError:
