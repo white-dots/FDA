@@ -831,6 +831,72 @@ class TestSectionsPropagationDocxXlsx:
         assert e.extract_status == "failed"
         assert e.sections == ()
 
+    def test_hwpx_sections_flow_through_reader(
+        self, workspace, fake_backend, logger
+    ):
+        from fda.organize import reader
+        import zipfile
+
+        ns = "http://www.hancom.co.kr/hwpml/2011/paragraph"
+        f = workspace / "doc.hwpx"
+        with zipfile.ZipFile(f, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            info = zipfile.ZipInfo("mimetype")
+            info.compress_type = zipfile.ZIP_STORED
+            zf.writestr(info, b"application/hwp+zip")
+            xml = (
+                f'<?xml version="1.0"?>'
+                f'<hp:sec xmlns:hp="{ns}">'
+                f'<hp:p><hp:run><hp:t>[발주서]</hp:t></hp:run></hp:p>'
+                f'<hp:p><hp:run><hp:t>회사 정보:</hp:t></hp:run></hp:p>'
+                f'</hp:sec>'
+            ).encode("utf-8")
+            zf.writestr("Contents/section0.xml", xml)
+
+        catalog = reader.read(workspace, backend=fake_backend, logger=logger)
+        e = next(c for c in catalog.entries if c.path.endswith("doc.hwpx"))
+        assert e.extract_status == "ok"
+        assert e.sections == ("발주서", "회사 정보")
+
+    def test_hwpx_failed_extraction_yields_empty_sections_in_catalog(
+        self, workspace, fake_backend, logger
+    ):
+        """Parallel to docx/xlsx/pptx/csv: when the hwpx extractor fails (not
+        a zip), the catalog entry's sections is preserved as ()."""
+        from fda.organize import reader
+
+        f = workspace / "broken.hwpx"
+        f.write_bytes(b"not a zip file")
+        catalog = reader.read(workspace, backend=fake_backend, logger=logger)
+        e = next(c for c in catalog.entries if c.path.endswith("broken.hwpx"))
+        assert e.extract_status == "failed"
+        assert e.sections == ()
+
+    def test_hwpx_harvested_public_fixture_spot_check(
+        self, workspace, fake_backend, logger, tmp_path
+    ):
+        """Spot-check against a real-world public-domain `.hwpx` (harvested in
+        Task 0). Skips if the harvest gap was recorded — see spec spike findings."""
+        from pathlib import Path
+        import shutil
+        from fda.organize import reader
+
+        fixture_dir = Path(__file__).resolve().parent / "fixtures" / "hwp"
+        harvested = sorted(fixture_dir.glob("*.hwpx"))
+        if not harvested:
+            pytest.skip("no harvested .hwpx fixtures (Task 0 gap)")
+
+        # Copy the first harvested fixture into the workspace so reader sees it.
+        sample = harvested[0]
+        dest = workspace / sample.name
+        shutil.copy2(sample, dest)
+        catalog = reader.read(workspace, backend=fake_backend, logger=logger)
+        e = next(c for c in catalog.entries if c.path.endswith(sample.name))
+        # Real-world docs may or may not have headers _sections.py picks up;
+        # the assertion is just that extraction succeeded.
+        assert e.extract_status == "ok"
+        # Sections is a tuple — empty tuple is fine, but the type should hold.
+        assert isinstance(e.sections, tuple)
+
 
 class TestKoreanSectionsThroughReader:
     """Korean structural-fingerprint coverage: a plaintext file containing
