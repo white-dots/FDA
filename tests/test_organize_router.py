@@ -87,3 +87,25 @@ class TestAggregateSignals:
         entries = [_entry(0, failed=True), _entry(1, failed=False)]
         sig = _aggregate_signals(entries)
         assert sig.all_extraction_failed is False
+
+
+class TestShortCircuit:
+    def test_misc_category_short_circuits_to_s3(self):
+        from fda.organize.router import _aggregate_signals, _short_circuit
+        sig = _aggregate_signals([_entry(0)])
+        assert _short_circuit("Misc", sig) == "s3"
+
+    def test_all_extraction_failed_short_circuits_to_s3(self):
+        from fda.organize.router import _aggregate_signals, _short_circuit
+        sig = _aggregate_signals([_entry(0, failed=True), _entry(1, failed=True)])
+        assert _short_circuit("Finance/Invoices", sig) == "s3"
+
+    def test_normal_category_no_short_circuit(self):
+        from fda.organize.router import _aggregate_signals, _short_circuit
+        sig = _aggregate_signals([_entry(0), _entry(1)])
+        assert _short_circuit("Finance/Invoices", sig) is None
+
+    def test_single_file_category_does_not_short_circuit(self):
+        from fda.organize.router import _aggregate_signals, _short_circuit
+        sig = _aggregate_signals([_entry(0)])
+        assert _short_circuit("Reports/Sales", sig) is None

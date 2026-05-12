@@ -45,3 +45,29 @@ def _aggregate_signals(entries: list[CatalogEntry]) -> RoutingSignals:
         tabular_schema_consistent=tabular_schema_consistent,
         all_extraction_failed=all_extraction_failed,
     )
+
+
+_MISC_CATEGORY_NAMES = frozenset({"Misc"})
+
+
+def _short_circuit(category_name: str, signals: RoutingSignals) -> str | None:
+    """Return 's3' when the category trips a hard-coded edge case, else None.
+
+    The router applies these defaults *before* calling Claude. A short-circuit
+    return value is the destination; categories tagged this way also get
+    `low_confidence: true` in the report.
+    """
+    if category_name in _MISC_CATEGORY_NAMES:
+        return "s3"
+    if signals.all_extraction_failed:
+        return "s3"
+    return None
+
+
+def _short_circuit_reason(category_name: str, signals: RoutingSignals) -> str:
+    if category_name in _MISC_CATEGORY_NAMES:
+        return "Catch-all category — defaulted to S3 without consulting Claude."
+    if signals.all_extraction_failed:
+        return ("Text extraction failed on every file — no usable signal "
+                "for routing; defaulted to S3.")
+    return ""
