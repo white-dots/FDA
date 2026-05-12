@@ -127,3 +127,45 @@ class Grouping:
 class Groupings:
     items: tuple[Grouping, ...]
     overall_reason: str
+
+
+# ---- routing models ----------------------------------------------------------
+
+
+Destination = Literal["sharepoint", "s3", "rdbms"]
+
+
+@dataclass(frozen=True)
+class RoutingSignals:
+    file_count: int
+    total_size_bytes: int
+    extension_distribution: tuple[tuple[str, int], ...]
+    tabular_schema_consistent: bool
+    all_extraction_failed: bool
+
+
+@dataclass(frozen=True)
+class Misfit:
+    path_id: str
+    relative_path: str
+    suggested_destination: Destination
+    reason: str
+
+
+@dataclass(frozen=True)
+class RoutedCategory:
+    name: str
+    subpath: str
+    destination: Destination
+    reason: str
+    low_confidence: bool
+    signals: RoutingSignals
+    misfits: tuple[Misfit, ...]
+
+
+@dataclass(frozen=True)
+class RoutingReport:
+    version: str
+    generated_at: str
+    target_root: str
+    categories: tuple[RoutedCategory, ...]
