@@ -909,14 +909,28 @@ Expected: FAIL with `ImportError: cannot import name 'route'`.
 
 - [ ] **Step 3: Implement `route()` in `fda/organize/router.py`**
 
-Append to `fda/organize/router.py`:
+First, extend the top-of-file import block that Task 4 set up. Add to the existing `from fda.organize.models import (...)` group:
 
 ```python
 from datetime import datetime, timezone
 
-from fda.organize.models import Catalog, Groupings
+from fda.organize.models import (
+    Catalog,
+    CatalogEntry,
+    Destination,
+    Groupings,
+    Misfit,
+    RoutedCategory,
+    RoutingReport,
+    RoutingSignals,
+)
+```
 
+(Replace the smaller models-import block from Task 4 with this expanded one. The two new names compared to Task 4 are `Catalog` and `Groupings`. Also add the `datetime` import to the top of the file alongside the others.)
 
+Then append the `route()` body and `_now_iso` helper at the bottom of the file:
+
+```python
 def _now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace(
         "+00:00", "Z",
@@ -968,9 +982,17 @@ def route(
             continue
 
         try:
+            # Note: Grouping carries `category`, `subpath`, `file_ids`,
+            # `reason` (== TaxonomyCategory.criteria). It does NOT carry
+            # the TaxonomyCategory.description. Routing v1 sends an empty
+            # description; the skill prompt still has category_name +
+            # subpath + criteria, which carry most of the routing signal.
+            # If Task 9 (corpus eyeballing) reveals decisions suffer from
+            # the missing description, the v2 follow-up is to thread
+            # Taxonomy through classify() → organize() → route().
             destination, reason, raw_misfits = _route_one_category(
                 category_name=g.category,
-                description="",  # Grouping doesn't carry description today
+                description="",
                 criteria=g.reason,
                 subpath=g.subpath,
                 signals=signals,
@@ -1283,6 +1305,11 @@ class TestOrganizeRouting:
             return original(*args, **kwargs)
         backend.complete.side_effect = _route_or_default
 
+        # Routing-detection check is disjoint from Stage A/B: the
+        # classifier's taxonomy payload contains the key `categories`
+        # (plural), the assigner's payload contains `BATCH`, and the
+        # router's payload contains both `category` (singular) AND
+        # `signals` together. No Stage A/B call can satisfy that pair.
         organize(
             str(workspace), instructions="",
             backend=backend,
@@ -1323,7 +1350,23 @@ Expected: FAIL — `TypeError: organize() got an unexpected keyword argument 'ro
 
 - [ ] **Step 3: Modify `fda/organize/__init__.py`**
 
-Edit the `organize()` signature and body. The current signature is:
+First, add `router` to the top-of-file import list. The existing import line is:
+
+```python
+from fda.organize import _fs, classifier, executor, plan_builder, reader, verifier
+```
+
+Change it to:
+
+```python
+from fda.organize import (
+    _fs, classifier, executor, plan_builder, reader, router, verifier,
+)
+```
+
+(Eager top-level import — `router.py` does not import from `fda/organize/__init__.py`, so there is no circular-import risk. Matches the convention used by `classifier`, `executor`, etc.)
+
+Then edit the `organize()` signature. The current signature is:
 
 ```python
 def organize(
@@ -1360,9 +1403,8 @@ Then, immediately before the existing `olog.log("RUN_END", status="success", ...
         # Cloud-destination routing (final stage). Operates on the
         # post-executor tree; skipped in preview mode or when --no-route.
         if route:
-            from fda.organize import router as _router
             try:
-                _router.route(
+                router.route(
                     catalog=catalog,
                     groupings=groupings,
                     target_path=target_path,
@@ -1507,31 +1549,7 @@ to:
             )
 ```
 
-Also update `organize_files_preview` to accept `route: bool = True` for symmetry (preview never runs the router, but the parameter shouldn't cause `TypeError` if a caller passes it):
-
-```python
-    def organize_files_preview(
-        self,
-        target_path: str,
-        instructions: str = "",
-        progress_callback: Optional[Callable[[str], None]] = None,
-        *,
-        route: bool = True,
-    ):
-        """Build a Plan without executing it. Returns a fda.organize.Plan."""
-        from fda.organize import organize as _organize
-
-        target_path = self.resolve_project_path(target_path)
-        return _organize(
-            target_path,
-            instructions,
-            preview=True,
-            backend=self._backend,
-            allowed_roots=self.projects,
-            progress_callback=progress_callback,
-            route=route,
-        )
-```
+Leave `organize_files_preview` unchanged. Preview never reaches the router stage (the `if route:` block in `organize()` runs only after `apply_plan`, which is skipped when `preview=True`), so threading the flag through preview would be dead plumbing.
 
 - [ ] **Step 4: Modify `fda/cli.py` — add `--no-route` flag and wire it**
 
