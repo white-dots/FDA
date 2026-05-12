@@ -300,17 +300,29 @@ def route(
             logger.log("ROUTER_FAIL", category=g.category, error=str(e))
             raise
 
-        misfits = tuple(
-            Misfit(
+        misfit_records: list[Misfit] = []
+        for m in raw_misfits:
+            entry_path = entries_by_id[m["path_id"]].path
+            try:
+                rel = str(Path(entry_path).relative_to(target_path))
+            except ValueError:
+                # Entry path isn't under target_path (symlink resolved
+                # elsewhere, executor produced an absolute path with a
+                # different prefix, etc.). Skip this misfit but keep the
+                # category — losing one annotation is better than losing
+                # the entire routing stage.
+                logger.log(
+                    "ROUTER_MISFIT_SKIP",
+                    category=g.category, path_id=m["path_id"], path=entry_path,
+                )
+                continue
+            misfit_records.append(Misfit(
                 path_id=m["path_id"],
-                relative_path=str(
-                    Path(entries_by_id[m["path_id"]].path).relative_to(target_path)
-                ),
+                relative_path=rel,
                 suggested_destination=m["suggested_destination"],
                 reason=m["reason"],
-            )
-            for m in raw_misfits
-        )
+            ))
+        misfits = tuple(misfit_records)
         routed.append(RoutedCategory(
             name=g.category,
             subpath=g.subpath,

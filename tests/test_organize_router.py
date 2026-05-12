@@ -368,6 +368,35 @@ class TestRoutePublic:
         assert misfit.relative_path == "Finance/Invoices/sales.csv"
         assert misfit.suggested_destination == "rdbms"
 
+    def test_misfit_outside_target_is_skipped_not_fatal(self, tmp_path):
+        from fda.organize.router import route
+        # One in-tree file, one rogue file whose .path lives outside tmp_path.
+        entries = [
+            _entry(0, path=str(tmp_path / "Finance/Invoices/inv.pdf")),
+            _entry(1, ext=".csv", path="/elsewhere/outside/tree/sales.csv"),
+        ]
+        catalog = _catalog(entries, target=str(tmp_path))
+        groupings = _groupings([_grouping("Finance/Invoices", ["f000", "f001"])])
+        backend = MagicMock()
+        backend.complete.return_value = _skill_response(
+            destination="sharepoint", reason="r",
+            misfits=[
+                {"path_id": "f001", "suggested_destination": "rdbms",
+                 "reason": "Tabular."},
+            ],
+        )
+        logger_ = _Logger()
+        report = route(
+            catalog=catalog, groupings=groupings, target_path=tmp_path,
+            backend=backend, logger=logger_,
+        )
+        # The category is still routed; the rogue misfit is dropped.
+        assert report.categories[0].destination == "sharepoint"
+        assert report.categories[0].misfits == ()
+        events = [e for e, _ in logger_.events]
+        assert "ROUTER_MISFIT_SKIP" in events
+        assert "ROUTER_DECIDED" in events
+
 
 class TestReportWriters:
     def _sample_report(self, target_path):
