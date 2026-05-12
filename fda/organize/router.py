@@ -24,6 +24,8 @@ from fda.organize.models import (
     Destination,
     Groupings,
     Misfit,
+    OperationKind,
+    OperationOutcome,
     RoutedCategory,
     RoutingReport,
     RoutingSignals,
@@ -153,10 +155,15 @@ def _build_router_prompt(
 
 
 def _validate_router_response(
-    raw: str, *, batch_path_ids: set[str], chosen_destination: str | None = None,
+    raw: str, *, sample_path_ids: set[str], chosen_destination: str | None = None,
 ) -> tuple[str, str, list[dict[str, Any]]]:
     """Parse + validate the skill's JSON response. Raises RouterError on any
-    structural problem. Returns (destination, reason, misfits)."""
+    structural problem. Returns (destination, reason, misfits).
+
+    `sample_path_ids` must be the IDs of files actually shown to the model
+    (i.e. the output of `_sample_entries`), not the full category. The model
+    cannot validly reference path_ids it never saw.
+    """
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as e:
@@ -181,8 +188,8 @@ def _validate_router_response(
         pid = m.get("path_id")
         sug = m.get("suggested_destination")
         msg = m.get("reason", "")
-        if pid not in batch_path_ids:
-            raise RouterError(f"misfit path_id {pid!r} not in category")
+        if pid not in sample_path_ids:
+            raise RouterError(f"misfit path_id {pid!r} not in sample")
         if sug not in _ALLOWED_DESTINATIONS:
             raise RouterError(f"misfit suggested_destination invalid: {sug!r}")
         if sug == destination:
@@ -224,14 +231,43 @@ def _route_one_category(
         max_tokens=MAX_CLAUDE_TOKENS,
         temperature=0.0,
     )
-    batch_ids = {e.path_id for e in entries}
-    return _validate_router_response(raw, batch_path_ids=batch_ids)
+    sample_ids = {e.path_id for e in _sample_entries(entries)}
+    return _validate_router_response(raw, sample_path_ids=sample_ids)
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace(
         "+00:00", "Z",
     )
+
+
+def _final_paths_from_outcomes(
+    catalog: Catalog,
+    outcomes: tuple[OperationOutcome, ...],
+) -> dict[str, str]:
+    """Map path_id → on-disk path after the executor ran.
+
+    The catalog's `CatalogEntry.path` records the pre-move location. For files
+    the executor successfully moved, the post-move location lives on the
+    matching MOVE outcome's `destination`. Files that were skipped or failed
+    keep their original path (the executor left them alone).
+    """
+    final: dict[str, str] = {e.path_id: e.path for e in catalog.entries}
+    if not outcomes:
+        return final
+    id_by_source: dict[str, str] = {e.path: e.path_id for e in catalog.entries}
+    for o in outcomes:
+        op = o.operation
+        if op.kind != OperationKind.MOVE:
+            continue
+        if o.status not in ("applied", "rescued"):
+            continue
+        if not op.source or not op.destination:
+            continue
+        pid = id_by_source.get(op.source)
+        if pid is not None:
+            final[pid] = op.destination
+    return final
 
 
 def route(
@@ -241,13 +277,20 @@ def route(
     target_path: Path,
     backend,
     logger: OrganizeLogger,
+    outcomes: tuple[OperationOutcome, ...] = (),
 ) -> RoutingReport:
     """Top-level router. Iterate per-category groupings, short-circuit or
     invoke the destination-router skill, resolve misfit paths, build the
     in-memory RoutingReport. Report files are written by the caller (see
-    Task 6)."""
+    Task 6).
+
+    `outcomes` carries executor results so misfit `relative_path` reflects
+    the post-move on-disk layout. When empty (e.g. unit tests that bypass
+    the executor), the router falls back to the catalog's pre-move paths.
+    """
     skill = _skills.load_skill(_SKILL_DIR)
     entries_by_id = {e.path_id: e for e in catalog.entries}
+    final_path_by_id = _final_paths_from_outcomes(catalog, outcomes)
 
     routed: list[RoutedCategory] = []
     logger.log("ROUTER_START", categories=len(groupings.items))
@@ -302,15 +345,17 @@ def route(
 
         misfit_records: list[Misfit] = []
         for m in raw_misfits:
-            entry_path = entries_by_id[m["path_id"]].path
+            entry_path = final_path_by_id.get(
+                m["path_id"], entries_by_id[m["path_id"]].path,
+            )
             try:
                 rel = str(Path(entry_path).relative_to(target_path))
             except ValueError:
-                # Entry path isn't under target_path (symlink resolved
-                # elsewhere, executor produced an absolute path with a
-                # different prefix, etc.). Skip this misfit but keep the
-                # category — losing one annotation is better than losing
-                # the entire routing stage.
+                # Entry path isn't under target_path (file's MOVE was
+                # skipped/failed and its source lives elsewhere, symlink
+                # resolved outside the tree, etc.). Skip this misfit but
+                # keep the category — losing one annotation is better than
+                # losing the entire routing stage.
                 logger.log(
                     "ROUTER_MISFIT_SKIP",
                     category=g.category, path_id=m["path_id"], path=entry_path,

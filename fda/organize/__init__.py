@@ -163,6 +163,7 @@ def organize(
                     target_path=target_path,
                     backend=backend,
                     logger=olog,
+                    outcomes=result.outcomes,
                 )
             except Exception as e:  # noqa: BLE001
                 # Don't fail the whole organize run if routing fails — log

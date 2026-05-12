@@ -226,6 +226,30 @@ class TestRouteOneCategory:
                 backend=backend, skill=skill, logger=_Logger(),
             )
 
+    def test_misfit_path_id_outside_sample_raises_router_error(self):
+        # SAMPLE_SIZE is 20: the skill only sees the first 20 entries (by
+        # path_id). A misfit naming an entry that exists in the category but
+        # was never shown to the model is a hallucination — reject it.
+        from fda.organize.router import (
+            _route_one_category, _aggregate_signals, RouterError, SAMPLE_SIZE,
+        )
+        entries = [_entry(i) for i in range(SAMPLE_SIZE + 5)]
+        unsampled_pid = entries[SAMPLE_SIZE].path_id  # "f020"
+        backend = MagicMock()
+        backend.complete.return_value = _skill_response(misfits=[{
+            "path_id": unsampled_pid,
+            "suggested_destination": "rdbms",
+            "reason": "r",
+        }])
+        sig = _aggregate_signals(entries)
+        skill = MagicMock(); skill.body = "x"; skill.model = "claude-sonnet-4-6"
+        with pytest.raises(RouterError, match="sample"):
+            _route_one_category(
+                category_name="x", description="d", criteria="c", subpath="x",
+                signals=sig, entries=entries,
+                backend=backend, skill=skill, logger=_Logger(),
+            )
+
     def test_prompt_payload_contains_signals_and_sample(self):
         from fda.organize.router import _route_one_category, _aggregate_signals
         backend = MagicMock()
@@ -367,6 +391,48 @@ class TestRoutePublic:
         assert misfit.path_id == "f001"
         assert misfit.relative_path == "Finance/Invoices/sales.csv"
         assert misfit.suggested_destination == "rdbms"
+
+    def test_misfit_relative_path_uses_post_move_destination(self, tmp_path):
+        # Router runs after the executor; misfit relative_path must reflect
+        # the post-move on-disk location, not the catalog's pre-move path.
+        from fda.organize.models import (
+            Operation, OperationKind, OperationOutcome,
+        )
+        from fda.organize.router import route
+        pre = str(tmp_path / "inbox/sales.csv")
+        post = str(tmp_path / "Finance/Invoices/sales.csv")
+        entries = [
+            _entry(0, path=str(tmp_path / "Finance/Invoices/inv.pdf")),
+            _entry(1, ext=".csv", path=pre),
+        ]
+        catalog = _catalog(entries, target=str(tmp_path))
+        groupings = _groupings([_grouping("Finance/Invoices", ["f000", "f001"])])
+        outcomes = (
+            OperationOutcome(
+                operation_index=0,
+                operation=Operation(
+                    kind=OperationKind.MOVE, source=pre, destination=post,
+                    reason="categorize",
+                ),
+                status="applied",
+            ),
+        )
+        backend = MagicMock()
+        backend.complete.return_value = _skill_response(
+            destination="sharepoint", reason="r",
+            misfits=[{
+                "path_id": "f001",
+                "suggested_destination": "rdbms",
+                "reason": "Tabular.",
+            }],
+        )
+        report = route(
+            catalog=catalog, groupings=groupings, target_path=tmp_path,
+            backend=backend, logger=_Logger(), outcomes=outcomes,
+        )
+        misfit = report.categories[0].misfits[0]
+        assert misfit.path_id == "f001"
+        assert misfit.relative_path == "Finance/Invoices/sales.csv"
 
     def test_misfit_outside_target_is_skipped_not_fatal(self, tmp_path):
         from fda.organize.router import route
