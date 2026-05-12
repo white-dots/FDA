@@ -12,14 +12,17 @@ from __future__ import annotations
 import json
 import logging
 from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from fda.organize import _skills
 from fda.organize._logger import OrganizeLogger
 from fda.organize.models import (
+    Catalog,
     CatalogEntry,
     Destination,
+    Groupings,
     Misfit,
     RoutedCategory,
     RoutingReport,
@@ -223,3 +226,111 @@ def _route_one_category(
     )
     batch_ids = {e.path_id for e in entries}
     return _validate_router_response(raw, batch_path_ids=batch_ids)
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace(
+        "+00:00", "Z",
+    )
+
+
+def route(
+    *,
+    catalog: Catalog,
+    groupings: Groupings,
+    target_path: Path,
+    backend,
+    logger: OrganizeLogger,
+) -> RoutingReport:
+    """Top-level router. Iterate per-category groupings, short-circuit or
+    invoke the destination-router skill, resolve misfit paths, build the
+    in-memory RoutingReport. Report files are written by the caller (see
+    Task 6)."""
+    skill = _skills.load_skill(_SKILL_DIR)
+    entries_by_id = {e.path_id: e for e in catalog.entries}
+
+    routed: list[RoutedCategory] = []
+    logger.log("ROUTER_START", categories=len(groupings.items))
+
+    for g in groupings.items:
+        category_entries = [entries_by_id[pid] for pid in g.file_ids
+                            if pid in entries_by_id]
+        if not category_entries:
+            logger.log("ROUTER_SKIP_EMPTY", category=g.category)
+            continue
+
+        signals = _aggregate_signals(category_entries)
+        short = _short_circuit(g.category, signals)
+
+        if short is not None:
+            routed.append(RoutedCategory(
+                name=g.category,
+                subpath=g.subpath,
+                destination=short,
+                reason=_short_circuit_reason(g.category, signals),
+                low_confidence=True,
+                signals=signals,
+                misfits=(),
+            ))
+            logger.log(
+                "ROUTER_SHORT_CIRCUIT",
+                category=g.category, destination=short,
+            )
+            continue
+
+        try:
+            # Note: Grouping carries `category`, `subpath`, `file_ids`,
+            # `reason` (== TaxonomyCategory.criteria). It does NOT carry
+            # the TaxonomyCategory.description. Routing v1 sends an empty
+            # description; the skill prompt still has category_name +
+            # subpath + criteria, which carry most of the routing signal.
+            # If Task 9 (corpus eyeballing) reveals decisions suffer from
+            # the missing description, the v2 follow-up is to thread
+            # Taxonomy through classify() → organize() → route().
+            destination, reason, raw_misfits = _route_one_category(
+                category_name=g.category,
+                description="",
+                criteria=g.reason,
+                subpath=g.subpath,
+                signals=signals,
+                entries=category_entries,
+                backend=backend, skill=skill, logger=logger,
+            )
+        except RouterError as e:
+            logger.log("ROUTER_FAIL", category=g.category, error=str(e))
+            raise
+
+        misfits = tuple(
+            Misfit(
+                path_id=m["path_id"],
+                relative_path=str(
+                    Path(entries_by_id[m["path_id"]].path).relative_to(target_path)
+                ),
+                suggested_destination=m["suggested_destination"],
+                reason=m["reason"],
+            )
+            for m in raw_misfits
+        )
+        routed.append(RoutedCategory(
+            name=g.category,
+            subpath=g.subpath,
+            destination=destination,
+            reason=reason,
+            low_confidence=False,
+            signals=signals,
+            misfits=misfits,
+        ))
+        logger.log(
+            "ROUTER_DECIDED",
+            category=g.category, destination=destination,
+            misfits=len(misfits),
+        )
+
+    report = RoutingReport(
+        version="1.0",
+        generated_at=_now_iso(),
+        target_root=str(target_path),
+        categories=tuple(routed),
+    )
+    logger.log("ROUTER_DONE", categories=len(routed))
+    return report
