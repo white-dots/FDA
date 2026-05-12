@@ -1273,6 +1273,7 @@ def handle_organize(args: argparse.Namespace) -> int:
         target_path=target_path,
         instructions=instructions,
         progress_callback=progress,
+        route=not args.no_route,
     )
 
     if not result.get("success"):
@@ -1952,6 +1953,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     organize_parser.add_argument(
         "--force", action="store_true",
         help="Skip confirmation prompt",
+    )
+    organize_parser.add_argument(
+        "--no-route", action="store_true", dest="no_route",
+        help="Skip the cloud-destination routing stage (no sidecar reports).",
     )
     organize_parser.set_defaults(func=handle_organize)
 

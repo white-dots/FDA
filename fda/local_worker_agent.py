@@ -901,6 +901,8 @@ IMPORTANT RULES:
         target_path: str,
         instructions: str = "",
         progress_callback: Optional[Callable[[str], None]] = None,
+        *,
+        route: bool = True,
     ) -> dict[str, Any]:
         """Organize files in `target_path` via the
         reader+classifier+plan_builder+executor+verifier pipeline. Returns
@@ -917,6 +919,7 @@ IMPORTANT RULES:
                 backend=self._backend,
                 allowed_roots=self.projects,
                 progress_callback=progress_callback,
+                route=route,
             )
         except ValueError as e:
             return {"success": False, "error": str(e)}

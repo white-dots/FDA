@@ -412,3 +412,47 @@ class TestRepoDiscovery:
         local_worker.state = MagicMock()
         result = local_worker.resolve_project_path("/tmp/something")
         assert result == "/private/tmp/something" or result == "/tmp/something"
+
+
+class TestOrganizeFilesRoutingFlag:
+    def test_organize_files_accepts_route_kwarg_and_forwards_it(self, tmp_path, monkeypatch):
+        from fda.local_worker_agent import LocalWorkerAgent
+
+        recorded = {}
+        def fake_organize(target, instructions="", **kwargs):
+            recorded["route"] = kwargs.get("route")
+            from fda.organize.models import (
+                Plan, PlanResult,
+            )
+            plan = Plan(target=target, instructions=instructions,
+                        operations=(), grouping_summary="", log_path=None)
+            return PlanResult(
+                plan=plan, outcomes=(), leftover_empty_dirs=(),
+                discrepancies=(), repos_skipped=(), summary="",
+                log_path=None,
+            )
+
+        monkeypatch.setattr("fda.organize.organize", fake_organize)
+        worker = LocalWorkerAgent(projects=[str(tmp_path)])
+        worker.organize_files(target_path=str(tmp_path), route=False)
+        assert recorded["route"] is False
+
+    def test_organize_files_route_defaults_to_true(self, tmp_path, monkeypatch):
+        from fda.local_worker_agent import LocalWorkerAgent
+
+        recorded = {}
+        def fake_organize(target, instructions="", **kwargs):
+            recorded["route"] = kwargs.get("route")
+            from fda.organize.models import Plan, PlanResult
+            plan = Plan(target=target, instructions=instructions,
+                        operations=(), grouping_summary="", log_path=None)
+            return PlanResult(
+                plan=plan, outcomes=(), leftover_empty_dirs=(),
+                discrepancies=(), repos_skipped=(), summary="",
+                log_path=None,
+            )
+
+        monkeypatch.setattr("fda.organize.organize", fake_organize)
+        worker = LocalWorkerAgent(projects=[str(tmp_path)])
+        worker.organize_files(target_path=str(tmp_path))
+        assert recorded["route"] is True
