@@ -167,3 +167,63 @@ class TestOrganize:
                 backend=backend,
                 allowed_roots=[workspace],
             )
+
+
+class TestOrganizeRouting:
+    def test_routing_report_written_on_default_run(self, workspace):
+        backend = _scripted_backend(workspace)
+        # _scripted_backend handles summarizer / Stage A / Stage B; add a
+        # router response by chaining the side_effect callable: any call
+        # whose payload starts with '{"category"' is a router call.
+        original = backend.complete.side_effect
+        def _route_or_default(*args, **kwargs):
+            body = kwargs["messages"][0]["content"]
+            try:
+                parsed = json.loads(body)
+            except Exception:
+                return original(*args, **kwargs)
+            if "category" in parsed and "signals" in parsed:
+                return json.dumps({
+                    "destination": "sharepoint",
+                    "reason": "test routing reason",
+                    "misfits": [],
+                })
+            return original(*args, **kwargs)
+        backend.complete.side_effect = _route_or_default
+
+        # Routing-detection check is disjoint from Stage A/B: the
+        # classifier's taxonomy payload contains the key `categories`
+        # (plural), the assigner's payload contains `BATCH`, and the
+        # router's payload contains both `category` (singular) AND
+        # `signals` together. No Stage A/B call can satisfy that pair.
+        organize(
+            str(workspace), instructions="",
+            backend=backend,
+            allowed_roots=[workspace.parent],
+        )
+        assert (workspace / "routing-report.json").exists()
+        assert (workspace / "routing-report.md").exists()
+        parsed = json.loads((workspace / "routing-report.json").read_text())
+        assert parsed["version"] == "1.0"
+
+    def test_route_false_skips_router(self, workspace):
+        backend = _scripted_backend(workspace)
+        organize(
+            str(workspace), instructions="",
+            backend=backend,
+            allowed_roots=[workspace.parent],
+            route=False,
+        )
+        assert not (workspace / "routing-report.json").exists()
+        assert not (workspace / "routing-report.md").exists()
+
+    def test_preview_mode_skips_router(self, workspace):
+        backend = _scripted_backend(workspace)
+        result = organize(
+            str(workspace), instructions="",
+            backend=backend,
+            allowed_roots=[workspace.parent],
+            preview=True,
+        )
+        assert isinstance(result, Plan)
+        assert not (workspace / "routing-report.json").exists()

@@ -13,7 +13,9 @@ import logging
 from pathlib import Path
 from typing import Callable
 
-from fda.organize import _fs, classifier, executor, plan_builder, reader, verifier
+from fda.organize import (
+    _fs, classifier, executor, plan_builder, reader, router, verifier,
+)
 from fda.organize._logger import OrganizeLogger
 from fda.organize.models import (
     Operation,
@@ -35,6 +37,7 @@ def organize(
     allowed_roots: list[Path] | None = None,
     progress_callback: Callable[[str], None] | None = None,
     log_path: Path | bool | None = None,
+    route: bool = True,
 ) -> Plan | PlanResult:
     """Plan and (unless preview) execute organization for `target`."""
     if backend is None:
@@ -150,6 +153,22 @@ def organize(
             summary=result.summary,
             log_path=log_path_str,
         )
+        # Cloud-destination routing (final stage). Operates on the
+        # post-executor tree; skipped in preview mode or when --no-route.
+        if route:
+            try:
+                router.route(
+                    catalog=catalog,
+                    groupings=groupings,
+                    target_path=target_path,
+                    backend=backend,
+                    logger=olog,
+                )
+            except Exception as e:  # noqa: BLE001
+                # Don't fail the whole organize run if routing fails — log
+                # and continue. The organized tree is already on disk.
+                logger.error("router stage failed: %s", e, exc_info=True)
+                olog.log("ROUTER_FAIL_FATAL", error=str(e))
         olog.log("RUN_END", status="success",
                  ops=len(plan.operations),
                  discrepancies=len(result.discrepancies))
