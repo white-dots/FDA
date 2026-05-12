@@ -132,7 +132,7 @@ writing to `.fda/runs/<timestamp>/` instead.)
       },
       "misfits": [
         {
-          "path_id": "abc123",
+          "path_id": "f042",
           "relative_path": "Finance/Invoices/sales_2025.csv",
           "suggested_destination": "rdbms",
           "reason": "Clean tabular data with consistent schema."
@@ -168,16 +168,21 @@ following the existing `taxonomy-proposer` and `taxonomy-assigner` pattern.
 - Category metadata: `category_name`, `description`, `criteria`, `subpath`
 - File count and total size
 - Dominant file-extension distribution (e.g., `{".pdf": 38, ".docx": 9}`)
-- Aggregated structural signals (`tabular_schema_consistent`,
-  `dominant_section_fingerprint`, etc.)
-- A sample of file summaries from inside the category
+- Aggregated structural signals: `tabular_schema_consistent` (bool — true
+  iff every entry in the category has a consistent column schema, e.g. CSVs
+  with matching headers) and `all_extraction_failed` (bool — true iff
+  `summary_failed is True` for every `CatalogEntry` in the category).
+- A sample of file summaries from inside the category.
 
-**Output per category:**
+**Output per category (returned by the skill):**
 
 - `destination`: one of `sharepoint`, `s3`, `rdbms`
 - `reason`: prose explanation
-- `misfits`: list of `path_id`s that don't cleanly fit the chosen destination
-  (may be empty)
+- `misfits`: list of objects `{path_id, suggested_destination, reason}` for
+  files that don't fit the chosen destination (may be empty). The router
+  resolves each misfit's `relative_path` from the catalog when writing the
+  JSON report; the skill itself only returns the three fields above per
+  misfit.
 
 Structural signals — including total size — are **inputs to Claude's
 judgment**, not hard-coded overrides. Claude decides; the signals inform. No
@@ -193,9 +198,15 @@ fires, the category is also tagged `low_confidence: true` in the report.
 | Situation | Default destination | Calls Claude? |
 |---|---|---|
 | Category named `Misc` (taxonomy proposer's catch-all) | `s3` | No — short-circuit |
-| All files in the category failed extraction (no content signal) | `s3` | No — short-circuit |
+| All files in the category have `summary_failed: true` | `s3` | No — short-circuit |
 | Single-file category | (no special handling) | Yes — route normally |
 | Empty category (zero files) | (skipped entirely; not included in report) | No |
+
+"Extraction failed" for routing's purposes means **the summarizer produced no
+usable summary for Claude**, i.e. `summary_failed is True` on the
+`CatalogEntry`. We do not separately check `extract_status`; a file whose
+text was extracted but failed to summarize is just as unhelpful to routing
+as one whose text was never extracted.
 
 `low_confidence` only marks routing decisions made on weak signal. Confident
 calls — including single-file categories where the one file has clear
@@ -221,8 +232,11 @@ each category. Not part of v1.
   `fda/organize/skills/taxonomy-assigner/`.
 - `tests/test_organize_router.py` — unit tests (see *Validation* below).
 
-The CLI flag `--no-route` is wired into `fda/cli.py` and passed through
-`LocalWorkerAgent.organize_files` into the pipeline.
+The CLI flag `--no-route` is wired through three layers — `fda/cli.py`
+parses it, `LocalWorkerAgent.organize_files` forwards it, and the
+`organize()` entry point in `fda/organize/__init__.py` skips the router
+stage when set. All three signatures gain a `route: bool = True` parameter
+(or equivalent). The flag defaults to "routing on"; users opt out, not in.
 
 ## Validation
 
