@@ -367,3 +367,84 @@ class TestRoutePublic:
         assert misfit.path_id == "f001"
         assert misfit.relative_path == "Finance/Invoices/sales.csv"
         assert misfit.suggested_destination == "rdbms"
+
+
+class TestReportWriters:
+    def _sample_report(self, target_path):
+        from fda.organize.router import _aggregate_signals
+        from fda.organize.models import (
+            Misfit, RoutedCategory, RoutingReport,
+        )
+        entries = [_entry(0, path=str(target_path / "Finance/Invoices/inv.pdf"))]
+        sig = _aggregate_signals(entries)
+        return RoutingReport(
+            version="1.0",
+            generated_at="2026-05-12T14:30:00Z",
+            target_root=str(target_path),
+            categories=(
+                RoutedCategory(
+                    name="Finance/Invoices", subpath="Finance/Invoices",
+                    destination="sharepoint", reason="People retrieve these.",
+                    low_confidence=False, signals=sig,
+                    misfits=(
+                        Misfit(
+                            path_id="f000",
+                            relative_path="Finance/Invoices/sales.csv",
+                            suggested_destination="rdbms",
+                            reason="Tabular.",
+                        ),
+                    ),
+                ),
+                RoutedCategory(
+                    name="Misc", subpath="Misc",
+                    destination="s3",
+                    reason="Catch-all category — defaulted to S3.",
+                    low_confidence=True, signals=sig, misfits=(),
+                ),
+            ),
+        )
+
+    def test_json_writer_emits_expected_shape(self, tmp_path):
+        from fda.organize.router import _write_json_report
+        report = self._sample_report(tmp_path)
+        out = tmp_path / "routing-report.json"
+        _write_json_report(report, out)
+        parsed = json.loads(out.read_text())
+        assert parsed["version"] == "1.0"
+        assert parsed["target_root"] == str(tmp_path)
+        assert len(parsed["categories"]) == 2
+        c0 = parsed["categories"][0]
+        assert c0["name"] == "Finance/Invoices"
+        assert c0["destination"] == "sharepoint"
+        assert c0["low_confidence"] is False
+        assert c0["signals"]["file_count"] == 1
+        assert c0["misfits"][0]["relative_path"] == "Finance/Invoices/sales.csv"
+        assert c0["misfits"][0]["suggested_destination"] == "rdbms"
+
+    def test_markdown_writer_emits_per_destination_summary(self, tmp_path):
+        from fda.organize.router import _write_md_report
+        report = self._sample_report(tmp_path)
+        out = tmp_path / "routing-report.md"
+        _write_md_report(report, out)
+        md = out.read_text()
+        assert "# Routing Report" in md
+        assert "SharePoint: 1" in md
+        assert "S3: 1" in md
+        assert "RDBMS: 0" in md
+        assert "Finance/Invoices" in md
+        assert "sales.csv" in md
+        assert "low confidence" in md.lower()
+
+    def test_route_writes_both_sidecars(self, tmp_path):
+        from fda.organize.router import route
+        entries = [_entry(0, path=str(tmp_path / "Finance/Invoices/inv.pdf"))]
+        catalog = _catalog(entries, target=str(tmp_path))
+        groupings = _groupings([_grouping("Finance/Invoices", ["f000"])])
+        backend = MagicMock()
+        backend.complete.return_value = _skill_response(
+            destination="sharepoint", reason="r",
+        )
+        route(catalog=catalog, groupings=groupings, target_path=tmp_path,
+              backend=backend, logger=_Logger())
+        assert (tmp_path / "routing-report.json").exists()
+        assert (tmp_path / "routing-report.md").exists()

@@ -332,5 +332,103 @@ def route(
         target_root=str(target_path),
         categories=tuple(routed),
     )
+    _write_json_report(report, target_path / "routing-report.json")
+    _write_md_report(report, target_path / "routing-report.md")
     logger.log("ROUTER_DONE", categories=len(routed))
     return report
+
+
+_PRETTY_DESTINATION = {
+    "sharepoint": "SharePoint",
+    "s3": "S3",
+    "rdbms": "RDBMS",
+}
+
+
+def _report_to_dict(report: RoutingReport) -> dict[str, Any]:
+    return {
+        "version": report.version,
+        "generated_at": report.generated_at,
+        "target_root": report.target_root,
+        "categories": [
+            {
+                "name": c.name,
+                "subpath": c.subpath,
+                "destination": c.destination,
+                "reason": c.reason,
+                "low_confidence": c.low_confidence,
+                "signals": {
+                    "file_count": c.signals.file_count,
+                    "total_size_bytes": c.signals.total_size_bytes,
+                    "extension_distribution": dict(c.signals.extension_distribution),
+                    "tabular_schema_consistent": c.signals.tabular_schema_consistent,
+                    "all_extraction_failed": c.signals.all_extraction_failed,
+                },
+                "misfits": [
+                    {
+                        "path_id": m.path_id,
+                        "relative_path": m.relative_path,
+                        "suggested_destination": m.suggested_destination,
+                        "reason": m.reason,
+                    }
+                    for m in c.misfits
+                ],
+            }
+            for c in report.categories
+        ],
+    }
+
+
+def _write_json_report(report: RoutingReport, path: Path) -> None:
+    path.write_text(
+        json.dumps(_report_to_dict(report), indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def _write_md_report(report: RoutingReport, path: Path) -> None:
+    counts: Counter[str] = Counter(c.destination for c in report.categories)
+    lines: list[str] = []
+    lines.append("# Routing Report")
+    lines.append("")
+    lines.append(f"Generated: {report.generated_at}")
+    lines.append(f"Target: {report.target_root}")
+    lines.append("")
+    lines.append("## Summary")
+    lines.append("")
+    for key in ("sharepoint", "s3", "rdbms"):
+        lines.append(f"- {_PRETTY_DESTINATION[key]}: {counts.get(key, 0)}")
+    lines.append("")
+    for c in report.categories:
+        lines.append(f"## Category: {c.name}")
+        lines.append("")
+        suffix = " (low confidence)" if c.low_confidence else ""
+        lines.append(f"**Destination:** {_PRETTY_DESTINATION[c.destination]}{suffix}")
+        lines.append("")
+        if c.reason:
+            lines.append(c.reason)
+            lines.append("")
+        lines.append("**Signals:**")
+        lines.append(f"- file_count: {c.signals.file_count}")
+        lines.append(f"- total_size_bytes: {c.signals.total_size_bytes:,}")
+        ext_str = ", ".join(
+            f"{ext} ({n})" for ext, n in c.signals.extension_distribution
+        ) or "(none)"
+        lines.append(f"- extension_distribution: {ext_str}")
+        lines.append(
+            f"- tabular_schema_consistent: {c.signals.tabular_schema_consistent}"
+        )
+        lines.append(
+            f"- all_extraction_failed: {c.signals.all_extraction_failed}"
+        )
+        lines.append("")
+        if c.misfits:
+            lines.append("### Misfits")
+            lines.append("")
+            for m in c.misfits:
+                lines.append(
+                    f"- `{m.relative_path}` → "
+                    f"{_PRETTY_DESTINATION[m.suggested_destination]} — {m.reason}"
+                )
+            lines.append("")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
