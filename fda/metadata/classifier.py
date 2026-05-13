@@ -159,6 +159,9 @@ def classify_with_retry_and_bisect(
 
 def _bisect(*, files, backend, skill, business_context, out: BisectResult) -> None:
     """Recursive worker for classify_with_retry_and_bisect."""
+    if not files:
+        # Defensive: empty list would infinite-recurse on double failure.
+        return
     out.batches_total += 1
     # Attempt 1
     try:

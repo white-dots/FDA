@@ -77,6 +77,7 @@ class TestRetryThenBisect:
         # 1 retry counted at the top-level; sub-batches succeeded first try
         assert result.batches_retried == 1
         assert backend.complete.call_count == 4
+        assert result.batches_total == 3   # top-level + left half + right half
 
     def test_single_file_double_failure_marks_failed(self):
         from fda.metadata.classifier import classify_with_retry_and_bisect
@@ -90,3 +91,20 @@ class TestRetryThenBisect:
         assert result.records_by_path_id == {}
         assert result.failed_path_ids == ["f000"]
         assert backend.complete.call_count == 2
+
+    def test_empty_files_returns_empty_result(self):
+        """Regression: an empty files list must not infinite-recurse on
+        double failure. The guard at the top of _bisect short-circuits.
+        """
+        from fda.metadata.classifier import classify_with_retry_and_bisect
+        backend = MagicMock()
+        skill = MagicMock(body="p", model="claude-sonnet-4-6")
+        result = classify_with_retry_and_bisect(
+            files=[], backend=backend, skill=skill, business_context="",
+        )
+        assert result.records_by_path_id == {}
+        assert result.failed_path_ids == []
+        assert result.batches_total == 0
+        assert result.batches_retried == 0
+        # No LLM call wasted on an empty batch.
+        assert backend.complete.call_count == 0
