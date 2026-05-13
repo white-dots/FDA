@@ -365,6 +365,25 @@ class TestUpsert:
             conn.close()
 
 
+class TestLock:
+    def test_second_lock_attempt_raises(self, tmp_path):
+        from fda.metadata.store import acquire_lock, LockBusy
+        lock_path = tmp_path / "m.db.lock"
+        with acquire_lock(lock_path):
+            with pytest.raises(LockBusy):
+                with acquire_lock(lock_path):
+                    pass  # never reached
+
+    def test_lock_released_after_context_exit(self, tmp_path):
+        from fda.metadata.store import acquire_lock
+        lock_path = tmp_path / "m.db.lock"
+        with acquire_lock(lock_path):
+            pass
+        # Should re-acquire cleanly.
+        with acquire_lock(lock_path):
+            pass
+
+
 class TestPrune:
     def test_prune_removes_paths_under_target_not_seen_this_run(self, tmp_path):
         from fda.metadata.store import (

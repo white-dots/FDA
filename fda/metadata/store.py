@@ -14,8 +14,11 @@ Connection:
 """
 from __future__ import annotations
 
+import fcntl
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 
 from fda.metadata.schema import (
     DDL_DOCUMENT_INDEXES,
@@ -192,3 +195,37 @@ def prune_missing_paths(
         (current_run_id, target_root, target_root),
     )
     return cur.rowcount or 0
+
+
+class LockBusy(RuntimeError):
+    """Raised when another fda metadata process holds the lock."""
+
+
+@contextmanager
+def acquire_lock(lock_path: Path | str) -> Iterator[None]:
+    """Non-blocking advisory lock on `lock_path` via fcntl.flock.
+
+    Raises LockBusy immediately if another process holds the lock. The
+    file is created if missing; it is NOT deleted on exit (releasing the
+    flock is enough — the file is a long-lived lock target).
+    """
+    lock_path = Path(lock_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = open(lock_path, "a+")
+    try:
+        try:
+            fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as e:
+            fd.close()
+            raise LockBusy(
+                f"another fda metadata run is in progress (lock at {lock_path})"
+            ) from e
+        try:
+            yield
+        finally:
+            try:
+                fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
+            finally:
+                fd.close()
+    except LockBusy:
+        raise
