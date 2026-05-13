@@ -395,13 +395,6 @@ def route(
     return report
 
 
-_PRETTY_DESTINATION = {
-    "sharepoint": "SharePoint",
-    "s3": "S3",
-    "rdbms": "RDBMS",
-}
-
-
 def _report_to_dict(report: RoutingReport) -> dict[str, Any]:
     return {
         "version": report.version,
@@ -444,48 +437,45 @@ def _write_json_report(report: RoutingReport, path: Path) -> None:
 
 
 def _write_md_report(report: RoutingReport, path: Path) -> None:
-    counts: Counter[str] = Counter(c.destination for c in report.categories)
+    total_files = sum(c.signals.file_count for c in report.categories)
     lines: list[str] = []
-    lines.append("# Routing Report")
+    lines.append("# 라우팅 보고서")
     lines.append("")
-    lines.append(f"Generated: {report.generated_at}")
-    lines.append(f"Target: {report.target_root}")
+    lines.append(f"생성 시각: {report.generated_at}")
+    lines.append(f"대상 루트: {report.target_root}")
+    lines.append(
+        f"총 카테고리: {len(report.categories)} · 총 파일: {total_files}"
+    )
     lines.append("")
-    lines.append("## Summary")
-    lines.append("")
-    for key in ("sharepoint", "s3", "rdbms"):
-        lines.append(f"- {_PRETTY_DESTINATION[key]}: {counts.get(key, 0)}")
+    lines.append("## 카테고리별 라우팅")
     lines.append("")
     for c in report.categories:
-        lines.append(f"## Category: {c.name}")
+        lines.append(f"### {c.subpath}")
         lines.append("")
-        suffix = " (low confidence)" if c.low_confidence else ""
-        lines.append(f"**Destination:** {_PRETTY_DESTINATION[c.destination]}{suffix}")
-        lines.append("")
+        suffix = " (낮은 신뢰도)" if c.low_confidence else ""
+        lines.append(f"- 대상: {c.destination}{suffix}")
+        lines.append(f"- 파일 수: {c.signals.file_count}")
         if c.reason:
-            lines.append(c.reason)
-            lines.append("")
-        lines.append("**Signals:**")
-        lines.append(f"- file_count: {c.signals.file_count}")
-        lines.append(f"- total_size_bytes: {c.signals.total_size_bytes:,}")
+            lines.append(f"- 이유: {c.reason}")
         ext_str = ", ".join(
             f"{ext} ({n})" for ext, n in c.signals.extension_distribution
-        ) or "(none)"
-        lines.append(f"- extension_distribution: {ext_str}")
+        ) or "(없음)"
+        lines.append(f"- 확장자 분포: {ext_str}")
+        lines.append(f"- 총 용량(바이트): {c.signals.total_size_bytes:,}")
         lines.append(
-            f"- tabular_schema_consistent: {c.signals.tabular_schema_consistent}"
+            f"- 표 형식 일관성: {c.signals.tabular_schema_consistent}"
         )
         lines.append(
-            f"- all_extraction_failed: {c.signals.all_extraction_failed}"
+            f"- 전체 추출 실패: {c.signals.all_extraction_failed}"
         )
         lines.append("")
         if c.misfits:
-            lines.append("### Misfits")
+            lines.append("### 불일치 파일")
             lines.append("")
             for m in c.misfits:
                 lines.append(
                     f"- `{m.relative_path}` → "
-                    f"{_PRETTY_DESTINATION[m.suggested_destination]} — {m.reason}"
+                    f"{m.suggested_destination} — {m.reason}"
                 )
             lines.append("")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")

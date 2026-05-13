@@ -516,19 +516,20 @@ class TestReportWriters:
         assert c0["misfits"][0]["relative_path"] == "Finance/Invoices/sales.csv"
         assert c0["misfits"][0]["suggested_destination"] == "rdbms"
 
-    def test_markdown_writer_emits_per_destination_summary(self, tmp_path):
+    def test_markdown_writer_emits_korean_labels_with_misfit_and_low_confidence(self, tmp_path):
         from fda.organize.router import _write_md_report
         report = self._sample_report(tmp_path)
         out = tmp_path / "routing-report.md"
         _write_md_report(report, out)
-        md = out.read_text()
-        assert "# Routing Report" in md
-        assert "SharePoint: 1" in md
-        assert "S3: 1" in md
-        assert "RDBMS: 0" in md
+        md = out.read_text(encoding="utf-8")
+        assert "# 라우팅 보고서" in md
+        assert "## 카테고리별 라우팅" in md
+        assert "대상:" in md
+        assert "파일 수:" in md
+        assert "총 카테고리: 2" in md
         assert "Finance/Invoices" in md
         assert "sales.csv" in md
-        assert "low confidence" in md.lower()
+        assert "낮은 신뢰도" in md
 
     def test_route_writes_both_sidecars(self, tmp_path):
         from fda.organize.router import route
