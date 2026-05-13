@@ -1,0 +1,10 @@
+Catalyst Formulation — Process Aurora (XYZ-200 series)
+
+Internal R&D document. DO NOT distribute outside the lab.
+
+Composition:
+- Component A: 42.3% wt
+- Component B: 28.7% wt
+- Component C: balance
+
+Process notes: see PR-2025-018 for run conditions.
