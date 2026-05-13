@@ -65,3 +65,29 @@ class TestClassification:
         kw["confidence"] = 1.5
         with pytest.raises(ValidationError):
             Classification(**kw)
+
+
+class TestLiteralVocabSync:
+    """Tripwire: Literal types in schema.py must match the canonical tuples
+    in vocab.py. If you add a code to vocab.py without updating the Literal
+    in schema.py, this test catches it before the classifier silently
+    rejects valid model output.
+    """
+
+    def test_department_literal_matches_vocab(self):
+        from typing import get_args
+        from fda.metadata.schema import Department
+        from fda.metadata.vocab import DEPARTMENTS
+        assert set(get_args(Department)) == set(DEPARTMENTS)
+
+    def test_document_type_literal_matches_vocab(self):
+        from typing import get_args
+        from fda.metadata.schema import DocumentType
+        from fda.metadata.vocab import DOCUMENT_TYPES
+        assert set(get_args(DocumentType)) == set(DOCUMENT_TYPES)
+
+    def test_confidentiality_literal_matches_vocab(self):
+        from typing import get_args
+        from fda.metadata.schema import Confidentiality
+        from fda.metadata.vocab import CONFIDENTIALITY
+        assert set(get_args(Confidentiality)) == set(CONFIDENTIALITY)

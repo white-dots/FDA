@@ -13,7 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 from fda.metadata.vocab import CONFIDENTIALITY, DEPARTMENTS, DOCUMENT_TYPES
 
@@ -47,14 +47,6 @@ class Classification(BaseModel):
     keywords: Keywords
     confidence: float = Field(ge=0.0, le=1.0)
     fail_closed_override: bool = False
-
-    @field_validator("keywords", mode="before")
-    @classmethod
-    def _coerce_keywords(cls, v):
-        # Allow dict input from JSON (Pydantic v2 will validate it).
-        if isinstance(v, dict):
-            return Keywords(**v)
-        return v
 
 
 @dataclass(frozen=True)
