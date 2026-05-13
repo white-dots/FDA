@@ -188,11 +188,16 @@ def prune_missing_paths(
 
     Paths *outside* `target_root` are never pruned by this call — different
     `fda metadata` runs may target different trees on the same DB.
+
+    Uses pure substring comparison instead of GLOB/LIKE so that
+    metacharacters in `target_root` (e.g. `*`, `?`, `[`, `%`, `_`) are
+    treated literally and never cause over- or under-matching.
     """
+    prefix = target_root + "/"
     cur = conn.execute(
         "DELETE FROM document_paths WHERE last_seen_run != ? "
-        "AND (path = ? OR path GLOB ? || '/*')",
-        (current_run_id, target_root, target_root),
+        "AND (path = ? OR substr(path, 1, ?) = ?)",
+        (current_run_id, target_root, len(prefix), prefix),
     )
     return cur.rowcount or 0
 

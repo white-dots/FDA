@@ -477,56 +477,66 @@ class TestPrune:
         assert paths == ["/elsewhere/keep.pdf", "/t/new.pdf"]
         conn.close()
 
-    def test_prune_handles_target_root_with_like_metacharacters(self, tmp_path):
-        """Regression: a target_root containing `%` or `_` must not match
-        unrelated paths. With LIKE the prune would have falsely matched
-        `/uploads/100Xdone/x.pdf` against target `/uploads/100%_done`."""
+    def test_prune_handles_metacharacter_target_roots(self, tmp_path):
+        """A target_root containing LIKE OR GLOB metacharacters must not
+        match unrelated paths. Regression for both the old LIKE bug and
+        the GLOB bug Codex flagged in Task 13 review.
+        """
         from fda.metadata.store import (
             connect, init_schema, insert_run, prune_missing_paths,
             upsert_document, upsert_path,
         )
         from fda.metadata.schema import DocumentRow, PathRow
-        conn = connect(tmp_path / "m.db")
-        init_schema(conn)
-        target = "/uploads/100%_done"
-        insert_run(conn, run_id="r0", target_root=target,
-                   model="claude-sonnet-4-6", fda_version="0.1.0",
-                   business_context_sha256=None,
-                   started_at="2026-05-12T00:00:00Z")
-        insert_run(conn, run_id="r1", target_root=target,
-                   model="claude-sonnet-4-6", fda_version="0.1.0",
-                   business_context_sha256=None,
-                   started_at="2026-05-13T00:00:00Z")
-        sha = "c" * 64
-        upsert_document(conn, DocumentRow(
-            sha256=sha, mime="application/pdf", size_bytes=1,
-            language="ko", department="finance", document_type="invoice",
-            confidentiality="confidential", summary="x",
-            keywords_json='{"ko":[],"en":[]}', confidence=0.9,
-            fail_closed_override=False, extract_status="ok",
-            sharepoint_url=None, run_id="r1",
-            created_at="2026-05-13T00:00:00Z",
-            updated_at="2026-05-13T00:00:00Z",
-        ))
-        # An unrelated path that LIKE would match (because % is a wildcard).
-        # GLOB must treat the target_root chars literally.
-        upsert_path(conn, PathRow(path_id="f000", sha256=sha,
-                                   path="/uploads/100Xdone/x.pdf",
-                                   mtime="2026-05-13T00:00:00.000000Z",
-                                   last_seen_run="r0"))   # NOT current run
-        # A real descendant of the literal target.
-        upsert_path(conn, PathRow(path_id="f001", sha256=sha,
-                                   path=target + "/in_target.pdf",
-                                   mtime="2026-05-13T00:00:00.000000Z",
-                                   last_seen_run="r0"))   # NOT current run
-        # Current run is r1; prune should remove the in-target row, leave
-        # the unrelated row.
-        prune_missing_paths(conn, target_root=target, current_run_id="r1")
-        paths = sorted(r[0] for r in conn.execute(
-            "SELECT path FROM document_paths"
-        ).fetchall())
-        assert paths == ["/uploads/100Xdone/x.pdf"]
-        conn.close()
+        for target in ("/uploads/100%_done", "/data/[archive]"):
+            db = tmp_path / f"{abs(hash(target))}.db"
+            conn = connect(db)
+            init_schema(conn)
+            # Insert r0 first (FK required by document_paths.last_seen_run).
+            insert_run(conn, run_id="r0", target_root=target,
+                       model="claude-sonnet-4-6", fda_version="0.1.0",
+                       business_context_sha256=None,
+                       started_at="2026-05-12T00:00:00Z")
+            insert_run(conn, run_id="r1", target_root=target,
+                       model="claude-sonnet-4-6", fda_version="0.1.0",
+                       business_context_sha256=None,
+                       started_at="2026-05-13T00:00:00Z")
+            sha = "c" * 64
+            upsert_document(conn, DocumentRow(
+                sha256=sha, mime="application/pdf", size_bytes=1,
+                language="ko", department="finance",
+                document_type="invoice",
+                confidentiality="confidential", summary="x",
+                keywords_json='{"ko":[],"en":[]}', confidence=0.9,
+                fail_closed_override=False, extract_status="ok",
+                sharepoint_url=None, run_id="r1",
+                created_at="2026-05-13T00:00:00Z",
+                updated_at="2026-05-13T00:00:00Z",
+            ))
+            # Unrelated path that LIKE or GLOB would falsely match.
+            # For target /uploads/100%_done, LIKE %/% → unrelated.
+            # For target /data/[archive], GLOB treats [archive] as a
+            # character class, so /data/a would falsely match.
+            if "%" in target:
+                unrelated = "/uploads/100Xdone/x.pdf"
+            else:
+                unrelated = "/data/a"
+            upsert_path(conn, PathRow(path_id="f000", sha256=sha,
+                                       path=unrelated,
+                                       mtime="2026-05-13T00:00:00.000000Z",
+                                       last_seen_run="r0"))
+            # A real descendant of the literal target.
+            upsert_path(conn, PathRow(path_id="f001", sha256=sha,
+                                       path=target + "/in_target.pdf",
+                                       mtime="2026-05-13T00:00:00.000000Z",
+                                       last_seen_run="r0"))
+            prune_missing_paths(conn, target_root=target, current_run_id="r1")
+            paths = sorted(r[0] for r in conn.execute(
+                "SELECT path FROM document_paths"
+            ).fetchall())
+            assert paths == [unrelated], (
+                f"target={target!r}: expected only {unrelated!r}, got {paths}"
+            )
+            conn.close()
 
 
 class TestUpsertConflict:
