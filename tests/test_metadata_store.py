@@ -415,3 +415,145 @@ class TestPrune:
         # /t/new.pdf kept (seen this run).
         assert paths == ["/elsewhere/keep.pdf", "/t/new.pdf"]
         conn.close()
+
+    def test_prune_handles_target_root_with_like_metacharacters(self, tmp_path):
+        """Regression: a target_root containing `%` or `_` must not match
+        unrelated paths. With LIKE the prune would have falsely matched
+        `/uploads/100Xdone/x.pdf` against target `/uploads/100%_done`."""
+        from fda.metadata.store import (
+            connect, init_schema, insert_run, prune_missing_paths,
+            upsert_document, upsert_path,
+        )
+        from fda.metadata.schema import DocumentRow, PathRow
+        conn = connect(tmp_path / "m.db")
+        init_schema(conn)
+        target = "/uploads/100%_done"
+        insert_run(conn, run_id="r0", target_root=target,
+                   model="claude-sonnet-4-6", fda_version="0.1.0",
+                   business_context_sha256=None,
+                   started_at="2026-05-12T00:00:00Z")
+        insert_run(conn, run_id="r1", target_root=target,
+                   model="claude-sonnet-4-6", fda_version="0.1.0",
+                   business_context_sha256=None,
+                   started_at="2026-05-13T00:00:00Z")
+        sha = "c" * 64
+        upsert_document(conn, DocumentRow(
+            sha256=sha, mime="application/pdf", size_bytes=1,
+            language="ko", department="finance", document_type="invoice",
+            confidentiality="confidential", summary="x",
+            keywords_json='{"ko":[],"en":[]}', confidence=0.9,
+            fail_closed_override=False, extract_status="ok",
+            sharepoint_url=None, run_id="r1",
+            created_at="2026-05-13T00:00:00Z",
+            updated_at="2026-05-13T00:00:00Z",
+        ))
+        # An unrelated path that LIKE would match (because % is a wildcard).
+        # GLOB must treat the target_root chars literally.
+        upsert_path(conn, PathRow(path_id="f000", sha256=sha,
+                                   path="/uploads/100Xdone/x.pdf",
+                                   mtime="2026-05-13T00:00:00.000000Z",
+                                   last_seen_run="r0"))   # NOT current run
+        # A real descendant of the literal target.
+        upsert_path(conn, PathRow(path_id="f001", sha256=sha,
+                                   path=target + "/in_target.pdf",
+                                   mtime="2026-05-13T00:00:00.000000Z",
+                                   last_seen_run="r0"))   # NOT current run
+        # Current run is r1; prune should remove the in-target row, leave
+        # the unrelated row.
+        prune_missing_paths(conn, target_root=target, current_run_id="r1")
+        paths = sorted(r[0] for r in conn.execute(
+            "SELECT path FROM document_paths"
+        ).fetchall())
+        assert paths == ["/uploads/100Xdone/x.pdf"]
+        conn.close()
+
+
+class TestUpsertConflict:
+    def _setup(self, tmp_path):
+        from fda.metadata.store import connect, init_schema, insert_run
+        conn = connect(tmp_path / "m.db")
+        init_schema(conn)
+        insert_run(conn, run_id="r1", target_root="/t",
+                   model="claude-sonnet-4-6", fda_version="0.1.0",
+                   business_context_sha256=None,
+                   started_at="2026-05-13T00:00:00Z")
+        return conn
+
+    def test_upsert_document_conflict_preserves_created_at(self, tmp_path):
+        from fda.metadata.store import upsert_document
+        from fda.metadata.schema import DocumentRow
+        conn = self._setup(tmp_path)
+        try:
+            sha = "d" * 64
+            orig = DocumentRow(
+                sha256=sha, mime="application/pdf", size_bytes=10,
+                language="ko", department="finance", document_type="invoice",
+                confidentiality="confidential", summary="orig",
+                keywords_json='{"ko":[],"en":[]}', confidence=0.9,
+                fail_closed_override=False, extract_status="ok",
+                sharepoint_url=None, run_id="r1",
+                created_at="2026-05-13T00:00:00Z",
+                updated_at="2026-05-13T00:00:00Z",
+            )
+            upsert_document(conn, orig)
+            # Re-upsert with a new created_at and updated_at; existing
+            # created_at must NOT be bumped.
+            updated = DocumentRow(
+                sha256=sha, mime="application/pdf", size_bytes=20,
+                language="ko", department="finance", document_type="invoice",
+                confidentiality="confidential", summary="new",
+                keywords_json='{"ko":[],"en":[]}', confidence=0.95,
+                fail_closed_override=False, extract_status="ok",
+                sharepoint_url=None, run_id="r1",
+                created_at="2099-01-01T00:00:00Z",  # ignored on conflict
+                updated_at="2026-05-13T05:00:00Z",
+            )
+            upsert_document(conn, updated)
+            row = conn.execute(
+                "SELECT created_at, updated_at, summary, size_bytes "
+                "FROM documents WHERE sha256 = ?", (sha,),
+            ).fetchone()
+            assert row[0] == "2026-05-13T00:00:00Z"  # original preserved
+            assert row[1] == "2026-05-13T05:00:00Z"
+            assert row[2] == "new"
+            assert row[3] == 20
+        finally:
+            conn.close()
+
+    def test_upsert_document_conflict_preserves_sharepoint_url(self, tmp_path):
+        from fda.metadata.store import upsert_document
+        from fda.metadata.schema import DocumentRow
+        conn = self._setup(tmp_path)
+        try:
+            sha = "e" * 64
+            with_url = DocumentRow(
+                sha256=sha, mime="application/pdf", size_bytes=1,
+                language="ko", department="finance", document_type="invoice",
+                confidentiality="confidential", summary="x",
+                keywords_json='{"ko":[],"en":[]}', confidence=0.9,
+                fail_closed_override=False, extract_status="ok",
+                sharepoint_url="https://example.sharepoint.com/abc",
+                run_id="r1",
+                created_at="2026-05-13T00:00:00Z",
+                updated_at="2026-05-13T00:00:00Z",
+            )
+            upsert_document(conn, with_url)
+            # Phase-1 re-run passes None; URL must survive via COALESCE.
+            without_url = DocumentRow(
+                sha256=sha, mime="application/pdf", size_bytes=1,
+                language="ko", department="finance", document_type="invoice",
+                confidentiality="confidential", summary="x",
+                keywords_json='{"ko":[],"en":[]}', confidence=0.9,
+                fail_closed_override=False, extract_status="ok",
+                sharepoint_url=None, run_id="r1",
+                created_at="2026-05-13T00:00:00Z",
+                updated_at="2026-05-13T01:00:00Z",
+            )
+            upsert_document(conn, without_url)
+            url = conn.execute(
+                "SELECT sharepoint_url FROM documents WHERE sha256 = ?",
+                (sha,),
+            ).fetchone()[0]
+            assert url == "https://example.sharepoint.com/abc"
+        finally:
+            conn.close()

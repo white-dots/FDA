@@ -188,7 +188,7 @@ def prune_missing_paths(
     """
     cur = conn.execute(
         "DELETE FROM document_paths WHERE last_seen_run != ? "
-        "AND (path = ? OR path LIKE ? || '/%')",
+        "AND (path = ? OR path GLOB ? || '/*')",
         (current_run_id, target_root, target_root),
     )
     return cur.rowcount or 0
