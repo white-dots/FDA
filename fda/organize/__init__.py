@@ -28,6 +28,79 @@ from fda.organize.models import (
 logger = logging.getLogger(__name__)
 
 
+def _translate_catalog_for_stage5(catalog, outcomes):
+    """Return a Catalog whose entries point at POST-move paths.
+
+    Stage 1 records each entry's original on-disk path. Stage 4 then moves
+    files. Stage 5 reads file bytes (for sha256/mime/mtime), so it must see
+    the post-move locations. Only applied/rescued MOVE outcomes update
+    paths; failed/skipped moves and CREATE_DIR/DELETE outcomes leave the
+    entry path alone.
+    """
+    import dataclasses
+    from fda.organize.models import Catalog, OperationKind
+    move_map = {
+        o.operation.source: o.operation.destination
+        for o in outcomes
+        if o.status in ("applied", "rescued")
+        and o.operation.kind == OperationKind.MOVE
+        and o.operation.source and o.operation.destination
+    }
+    translated_entries = tuple(
+        dataclasses.replace(e, path=move_map.get(e.path, e.path))
+        for e in catalog.entries
+    )
+    return Catalog(
+        target=catalog.target,
+        entries=translated_entries,
+        git_repos_skipped=catalog.git_repos_skipped,
+    )
+
+
+def _run_metadata_stage(
+    *,
+    target_path: Path,
+    catalog,
+    backend,
+    olog: OrganizeLogger,
+    progress_callback: Callable[[str], None] | None,
+) -> None:
+    """Invoke stage 5 (metadata). Defensive: never raises.
+
+    Crashes here MUST NOT invalidate the on-disk tree from stages 1-4.
+    Counts (and any fatal error) surface to `progress_callback` so the
+    user sees what happened — stage 5 is slow (~20 LLM calls per 200
+    files), so silent failures would be a real footgun.
+    """
+    try:
+        from fda.metadata import run as metadata_run
+        m_report = metadata_run(
+            target_path=target_path, catalog=catalog,
+            backend=backend, logger=olog,
+            progress_callback=progress_callback,
+        )
+        if progress_callback:
+            try:
+                progress_callback(
+                    f"metadata: {m_report.files_classified}/"
+                    f"{m_report.files_seen} classified, "
+                    f"{m_report.files_failed} failed"
+                )
+            except Exception:
+                logger.debug("progress_callback raised", exc_info=True)
+    except Exception as e:  # noqa: BLE001
+        logger.error("metadata stage failed: %s", e, exc_info=True)
+        olog.log("METADATA_FAIL_FATAL", error=str(e))
+        if progress_callback:
+            try:
+                progress_callback(
+                    f"⚠ metadata stage failed: {type(e).__name__}: {e}"
+                    " — see log; organize stages 1-4 succeeded."
+                )
+            except Exception:
+                logger.debug("progress_callback raised", exc_info=True)
+
+
 def organize(
     target: str,
     instructions: str = "",
@@ -38,6 +111,7 @@ def organize(
     progress_callback: Callable[[str], None] | None = None,
     log_path: Path | bool | None = None,
     route: bool = True,
+    metadata: bool = True,
 ) -> Plan | PlanResult:
     """Plan and (unless preview) execute organization for `target`."""
     if backend is None:
@@ -180,6 +254,19 @@ def organize(
                 # and continue. The organized tree is already on disk.
                 logger.error("router stage failed: %s", e, exc_info=True)
                 olog.log("ROUTER_FAIL_FATAL", error=str(e))
+        # Stage 5 — runs independently of routing. --no-metadata skips it.
+        # Hook is in _run_metadata_stage (testable independently of stages 1-4).
+        # Catalog from stage 1 has pre-move paths; translate to post-move
+        # so enrich.sha256_of() can actually open the files.
+        if metadata:
+            stage5_catalog = _translate_catalog_for_stage5(
+                catalog, result.outcomes,
+            )
+            _run_metadata_stage(
+                target_path=target_path, catalog=stage5_catalog,
+                backend=backend, olog=olog,
+                progress_callback=progress_callback,
+            )
         olog.log("RUN_END", status="success",
                  ops=len(plan.operations),
                  discrepancies=len(result.discrepancies))
@@ -232,6 +319,8 @@ def apply_plan(
 __all__ = [
     "organize",
     "apply_plan",
+    "_run_metadata_stage",
+    "_translate_catalog_for_stage5",
     "Plan",
     "Operation",
     "OperationKind",

@@ -122,6 +122,7 @@ class TestOrganize:
             "sort",
             backend=backend,
             allowed_roots=[workspace.parent],
+            metadata=False,
         )
         assert isinstance(result, PlanResult)
         # Both files moved into Texts/
@@ -200,6 +201,7 @@ class TestOrganizeRouting:
             str(workspace), instructions="",
             backend=backend,
             allowed_roots=[workspace.parent],
+            metadata=False,
         )
         assert (workspace / "routing-report.json").exists()
         assert (workspace / "routing-report.md").exists()
@@ -213,6 +215,7 @@ class TestOrganizeRouting:
             backend=backend,
             allowed_roots=[workspace.parent],
             route=False,
+            metadata=False,
         )
         assert not (workspace / "routing-report.json").exists()
         assert not (workspace / "routing-report.md").exists()

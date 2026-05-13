@@ -903,16 +903,48 @@ IMPORTANT RULES:
         progress_callback: Optional[Callable[[str], None]] = None,
         *,
         route: bool = True,
+        metadata: bool = True,
+        metadata_only: bool = False,
     ) -> dict[str, Any]:
         """Organize files in `target_path` via the
-        reader+classifier+plan_builder+executor+verifier pipeline. Returns
-        the back-compat dict shape used by Telegram, the web UI, and the
-        orchestrator."""
+        reader+classifier+plan_builder+executor+verifier+router+metadata
+        pipeline. Returns the back-compat dict shape used by Telegram, the
+        web UI, and the orchestrator.
+
+        --metadata-only short-circuits stages 1-4 + router; only stage 5
+        runs. The reader is still invoked to build a Catalog over the
+        already-organized tree.
+        """
         from fda.organize import organize as _organize
         from fda.organize.models import PlanResult
 
         try:
             target_path = self.resolve_project_path(target_path)
+            if metadata_only:
+                from fda.metadata import run as metadata_run
+                from fda.organize import reader
+                from fda.organize._logger import OrganizeLogger
+                olog = OrganizeLogger(
+                    log_path=None,
+                    target_basename=Path(target_path).name,
+                    progress_callback=progress_callback,
+                )
+                catalog = reader.read(
+                    Path(target_path), backend=self._backend, logger=olog,
+                )
+                report = metadata_run(
+                    target_path=Path(target_path), catalog=catalog,
+                    backend=self._backend, logger=olog,
+                    progress_callback=progress_callback,
+                )
+                return {
+                    "success": True,
+                    "metadata_only": True,
+                    "run_id": report.run_id,
+                    "files_seen": report.files_seen,
+                    "files_classified": report.files_classified,
+                    "files_failed": report.files_failed,
+                }
             result = _organize(
                 target_path,
                 instructions,
@@ -920,6 +952,7 @@ IMPORTANT RULES:
                 allowed_roots=self.projects,
                 progress_callback=progress_callback,
                 route=route,
+                metadata=metadata,
             )
         except ValueError as e:
             return {"success": False, "error": str(e)}

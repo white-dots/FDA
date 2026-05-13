@@ -1245,6 +1245,16 @@ def handle_projects(args: argparse.Namespace) -> int:
 
 def handle_organize(args: argparse.Namespace) -> int:
     """Organize files in a local directory."""
+    if getattr(args, "metadata_only", False) and (
+        getattr(args, "no_route", False) or getattr(args, "no_metadata", False)
+    ):
+        print(
+            "error: --metadata-only is mutually exclusive with --no-route "
+            "and --no-metadata",
+            file=sys.stderr,
+        )
+        return 2
+
     from fda.local_worker_agent import LocalWorkerAgent
 
     target_path = str(Path(args.path).expanduser().resolve())
@@ -1274,6 +1284,8 @@ def handle_organize(args: argparse.Namespace) -> int:
         instructions=instructions,
         progress_callback=progress,
         route=not args.no_route,
+        metadata=not args.no_metadata,
+        metadata_only=args.metadata_only,
     )
 
     if not result.get("success"):
@@ -1958,7 +1970,22 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--no-route", action="store_true", dest="no_route",
         help="Skip the cloud-destination routing stage (no sidecar reports).",
     )
+    organize_parser.add_argument(
+        "--no-metadata", action="store_true", dest="no_metadata",
+        help="Skip the metadata stage (no SQLite index update).",
+    )
+    organize_parser.add_argument(
+        "--metadata-only", action="store_true", dest="metadata_only",
+        help=("Skip organize stages 1–4 and routing; only run the metadata "
+              "stage on the already-organized tree."),
+    )
     organize_parser.set_defaults(func=handle_organize)
+
+    from fda.metadata.cli import (
+        register_metadata_subparser, register_search_subparser,
+    )
+    register_metadata_subparser(subparsers)
+    register_search_subparser(subparsers)
 
     # -- index command --
     index_parser = subparsers.add_parser(
