@@ -15,11 +15,15 @@ from typing import Mapping, Sequence
 
 from fda.organize import _fs
 from fda.organize.models import (
+    CatalogEntry,
     Grouping,
     Groupings,
     Operation,
     OperationKind,
     Plan,
+    QUARANTINE_FAILED,
+    QUARANTINE_NO_EXTRACTOR,
+    quarantine_bucket,
 )
 
 logger = logging.getLogger(__name__)
@@ -135,6 +139,8 @@ def build(
     groupings: Groupings,
     path_by_id: Mapping[str, str],
     junk_paths: Sequence[str],
+    *,
+    quarantine: Sequence[CatalogEntry] = (),
 ) -> Plan:
     """Construct a Plan from Groupings."""
     target = Path(target_dir).resolve()
@@ -204,7 +210,10 @@ def build(
     # Snapshot of all paths that *will* leave their current location, so
     # _resolve_basename can ignore on-disk "collisions" with files that
     # are themselves planned sources moving away.
-    planned_sources = frozenset(src.resolve() for _, src, _, _ in candidates)
+    planned_sources = frozenset(
+        list(src.resolve() for _, src, _, _ in candidates)
+        + list(Path(e.path).resolve() for e in quarantine if Path(e.path).is_file())
+    )
 
     # Resolve basenames deterministically. Sort by source path so collisions
     # break ties alphabetically and reproducibly.
@@ -228,6 +237,53 @@ def build(
             _fs.validate_operation(op, target)
         except ValueError as e:
             logger.info("dropping invalid move %s -> %s: %s", src, dest_dir / basename, e)
+            planned.discard(key)
+            continue
+        move_ops.append(op)
+
+    # ---- quarantine MOVEs --------------------------------------------------
+    # Entries here had a non-ok extract_status; the reader skipped the LLM
+    # call. We synthesize a reason from the bucket + extractor note and
+    # route them under <target>/<bucket>/<ext>/<basename>.
+    quarantine_candidates: list[tuple[Path, Path, str]] = []  # (src, dest_dir, reason)
+    for entry in quarantine:
+        bucket = quarantine_bucket(entry)
+        if bucket is None:
+            # Defensive: caller passed something that doesn't belong here.
+            logger.info("dropping non-quarantine entry from quarantine list: %s", entry.path)
+            continue
+        src = Path(entry.path)
+        if not src.is_file():
+            logger.info("dropping quarantine source that is not a file: %s", src)
+            continue
+        ext_segment = entry.ext.lstrip(".") or "_no_ext"
+        dest_dir = _resolve_destination_dir(target, f"{bucket}/{ext_segment}")
+        if bucket == QUARANTINE_NO_EXTRACTOR:
+            reason = f"no extractor registered for {entry.ext}"
+        else:
+            reason = entry.quarantine_note or entry.extract_status
+        quarantine_candidates.append((src, dest_dir, reason))
+
+    # Deterministic basename resolution: sort by source path so collisions
+    # break ties alphabetically and reproducibly across runs.
+    quarantine_candidates.sort(key=lambda t: str(t[0]))
+    for src, dest_dir, reason in quarantine_candidates:
+        basename = _resolve_basename(
+            dest_dir, src, planned,
+            on_disk_check=True, planned_sources=planned_sources,
+        )
+        key = (str(dest_dir), basename.casefold())
+        planned.add(key)
+        op = Operation(
+            kind=OperationKind.MOVE,
+            source=str(src),
+            destination=str(dest_dir / basename),
+            reason=reason,
+        )
+        try:
+            _fs.validate_operation(op, target)
+        except ValueError as e:
+            logger.info("dropping invalid quarantine move %s -> %s: %s", src, dest_dir / basename, e)
             planned.discard(key)
             continue
         move_ops.append(op)
@@ -262,7 +318,7 @@ def build(
 
     operations = tuple(create_dir_ops + move_ops + delete_ops)
 
-    had_input = bool(groupings.items) or bool(junk_paths)
+    had_input = bool(groupings.items) or bool(junk_paths) or bool(quarantine)
     if had_input and not operations:
         raise PlanBuilderError(
             "nothing to do — all operations dropped "

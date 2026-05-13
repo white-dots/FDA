@@ -136,6 +136,9 @@ class TestEachConstantHasOneHome:
 
 class TestPlanBuilderDoesNotImportCatalog:
     def test_no_Catalog_import(self):
+        # plan_builder takes individual CatalogEntry values as quarantine
+        # input (per the 2026-05-13 extractor-coverage-honesty design), but
+        # must still never depend on the whole-corpus `Catalog` aggregate.
         text = (ORGANIZE_DIR / "plan_builder.py").read_text(encoding="utf-8")
         tree = ast.parse(text)
         for node in ast.walk(tree):
@@ -143,7 +146,6 @@ class TestPlanBuilderDoesNotImportCatalog:
                and node.module.endswith("models"):
                 names = {a.name for a in node.names}
                 assert "Catalog" not in names, "plan_builder must not import Catalog"
-                assert "CatalogEntry" not in names, "plan_builder must not import CatalogEntry"
 
 
 class TestSkillContents:

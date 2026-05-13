@@ -428,3 +428,201 @@ class TestCollisionRetryCap:
         with pytest.raises(plan_builder.PlanBuilderError) as exc:
             plan_builder.build(str(workspace), groupings, path_by_id, [])
         assert "too many basename collisions" in str(exc.value)
+
+
+class TestQuarantine:
+    def _q(self, path, *, extract_status, note=""):
+        from fda.organize.models import CatalogEntry
+        return CatalogEntry(
+            path_id="",
+            path=str(path),
+            ext=Path(path).suffix.lower(),
+            size_bytes=10,
+            summary="",
+            type_label="",
+            is_junk=False,
+            summary_failed=False,
+            extract_status=extract_status,
+            quarantine_note=note,
+        )
+
+    def test_no_extractor_doc_moves_into_NoExtractor_doc(self, workspace):
+        from fda.organize import plan_builder
+        from fda.organize.models import OperationKind
+
+        f = workspace / "old-quote.doc"
+        f.write_bytes(b"fake")
+        plan = plan_builder.build(
+            target_dir=str(workspace),
+            groupings=_groupings(),  # no categories
+            path_by_id={},
+            junk_paths=[],
+            quarantine=[self._q(f, extract_status="no_extractor")],
+        )
+        moves = [op for op in plan.operations if op.kind == OperationKind.MOVE]
+        create_dirs = [op for op in plan.operations if op.kind == OperationKind.CREATE_DIR]
+        assert len(moves) == 1
+        assert moves[0].destination == str(workspace / "_NoExtractor" / "doc" / "old-quote.doc")
+        assert moves[0].reason == "no extractor registered for .doc"
+        assert any(
+            op.destination == str(workspace / "_NoExtractor" / "doc")
+            for op in create_dirs
+        )
+
+    def test_failed_pdf_moves_into_ExtractionFailed_pdf_with_note_reason(self, workspace):
+        from fda.organize import plan_builder
+        from fda.organize.models import OperationKind
+
+        f = workspace / "scan.pdf"
+        f.write_bytes(b"%PDF")
+        plan = plan_builder.build(
+            target_dir=str(workspace),
+            groupings=_groupings(),
+            path_by_id={},
+            junk_paths=[],
+            quarantine=[self._q(
+                f, extract_status="failed", note="image-only PDF?",
+            )],
+        )
+        moves = [op for op in plan.operations if op.kind == OperationKind.MOVE]
+        assert len(moves) == 1
+        assert moves[0].destination == str(workspace / "_ExtractionFailed" / "pdf" / "scan.pdf")
+        assert moves[0].reason == "image-only PDF?"
+
+    def test_failed_without_note_falls_back_to_extract_status(self, workspace):
+        from fda.organize import plan_builder
+
+        f = workspace / "scan.pdf"
+        f.write_bytes(b"%PDF")
+        plan = plan_builder.build(
+            target_dir=str(workspace), groupings=_groupings(),
+            path_by_id={}, junk_paths=[],
+            quarantine=[self._q(f, extract_status="failed", note="")],
+        )
+        moves = [op for op in plan.operations if op.kind.value == "move"]
+        assert moves[0].reason == "failed"
+
+    def test_no_extension_falls_back_to_no_ext_subfolder(self, workspace):
+        from fda.organize import plan_builder
+
+        f = workspace / "README"
+        f.write_text("readme")
+        plan = plan_builder.build(
+            target_dir=str(workspace), groupings=_groupings(),
+            path_by_id={}, junk_paths=[],
+            quarantine=[self._q(f, extract_status="no_extractor")],
+        )
+        moves = [op for op in plan.operations if op.kind.value == "move"]
+        assert moves[0].destination == str(workspace / "_NoExtractor" / "_no_ext" / "README")
+        # The dot is genuinely absent — the synthesized reason is honest.
+        assert moves[0].reason == "no extractor registered for "
+
+    def test_collision_within_quarantine_bucket_resolves_deterministically(
+        self, workspace
+    ):
+        """Two .doc files with the same basename from different source dirs
+        land in the same bucket. After the deterministic sorted-by-source
+        tiebreak in _resolve_basename, the lexicographically earlier source
+        keeps the original basename and the other gets ' (2)'."""
+        from fda.organize import plan_builder
+
+        (workspace / "a").mkdir()
+        (workspace / "b").mkdir()
+        f_a = workspace / "a" / "quote.doc"
+        f_b = workspace / "b" / "quote.doc"
+        f_a.write_bytes(b"a")
+        f_b.write_bytes(b"b")
+        plan = plan_builder.build(
+            target_dir=str(workspace), groupings=_groupings(),
+            path_by_id={}, junk_paths=[],
+            quarantine=[
+                self._q(f_a, extract_status="no_extractor"),
+                self._q(f_b, extract_status="no_extractor"),
+            ],
+        )
+        destinations = sorted(
+            op.destination for op in plan.operations if op.kind.value == "move"
+        )
+        # Sorted by source path: workspace/a/quote.doc < workspace/b/quote.doc
+        # → the 'a/' source wins the original basename.
+        assert destinations == [
+            str(workspace / "_NoExtractor" / "doc" / "quote (2).doc"),
+            str(workspace / "_NoExtractor" / "doc" / "quote.doc"),
+        ]
+
+    def test_quarantine_move_passes_fs_validation(self, workspace):
+        """Quarantine MOVE goes through _fs.validate_operation — target-
+        relative, no path traversal. We verify by passing _fs explicitly."""
+        from fda.organize import _fs, plan_builder
+
+        f = workspace / "a.doc"
+        f.write_bytes(b"a")
+        plan = plan_builder.build(
+            target_dir=str(workspace), groupings=_groupings(),
+            path_by_id={}, junk_paths=[],
+            quarantine=[self._q(f, extract_status="no_extractor")],
+        )
+        for op in plan.operations:
+            if op.kind.value == "move":
+                _fs.validate_operation(op, workspace)  # must not raise
+
+    def test_mixed_groupings_quarantine_junk_produces_all_three(self, workspace):
+        from fda.organize import plan_builder
+        from fda.organize.models import OperationKind
+
+        (workspace / "a.txt").write_text("a")
+        (workspace / "old.doc").write_bytes(b"d")
+        (workspace / ".DS_Store").write_bytes(b"\x00")
+        plan = plan_builder.build(
+            target_dir=str(workspace),
+            groupings=_groupings(_grouping("Texts", "Texts", ["f000"])),
+            path_by_id={"f000": str(workspace / "a.txt")},
+            junk_paths=[str(workspace / ".DS_Store")],
+            quarantine=[self._q(workspace / "old.doc", extract_status="no_extractor")],
+        )
+        moves = [op for op in plan.operations if op.kind == OperationKind.MOVE]
+        deletes = [op for op in plan.operations if op.kind == OperationKind.DELETE]
+        create_dirs = [op for op in plan.operations if op.kind == OperationKind.CREATE_DIR]
+        # 1 category move + 1 quarantine move
+        assert len(moves) == 2
+        # 1 junk delete
+        assert len(deletes) == 1
+        # CREATE_DIRs cover both destinations (Texts/ + _NoExtractor/doc/)
+        dest_dirs = {op.destination for op in create_dirs}
+        assert str(workspace / "Texts") in dest_dirs
+        assert str(workspace / "_NoExtractor" / "doc") in dest_dirs
+
+    def test_empty_groupings_with_quarantine_does_not_raise(self, workspace):
+        """Plan with only quarantine MOVEs is valid — does not trip the
+        'nothing to do' guard."""
+        from fda.organize import plan_builder
+
+        f = workspace / "x.doc"
+        f.write_bytes(b"x")
+        plan = plan_builder.build(
+            target_dir=str(workspace), groupings=_groupings(),
+            path_by_id={}, junk_paths=[],
+            quarantine=[self._q(f, extract_status="no_extractor")],
+        )
+        assert any(op.kind.value == "move" for op in plan.operations)
+
+    def test_all_dropped_quarantine_raises_nothing_to_do(self, workspace):
+        """When the only input is a quarantine entry whose source vanished
+        from disk, all ops are dropped → the 'nothing to do' guard fires.
+        (Truly-empty input — no groupings, no junk, no quarantine — keeps
+        its existing 'empty plan' behavior; see TestEmptyEverything at
+        test_organize_plan_builder.py:157.)"""
+        from fda.organize import plan_builder
+        from fda.organize.models import CatalogEntry
+
+        ghost = CatalogEntry(
+            path_id="", path=str(workspace / "ghost.doc"),
+            ext=".doc", size_bytes=0, summary="", type_label="",
+            is_junk=False, summary_failed=False,
+            extract_status="no_extractor", quarantine_note="",
+        )
+        with pytest.raises(plan_builder.PlanBuilderError):
+            plan_builder.build(
+                target_dir=str(workspace), groupings=_groupings(),
+                path_by_id={}, junk_paths=[], quarantine=[ghost],
+            )
