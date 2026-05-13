@@ -28,6 +28,35 @@ from fda.organize.models import (
 logger = logging.getLogger(__name__)
 
 
+def _translate_catalog_for_stage5(catalog, outcomes):
+    """Return a Catalog whose entries point at POST-move paths.
+
+    Stage 1 records each entry's original on-disk path. Stage 4 then moves
+    files. Stage 5 reads file bytes (for sha256/mime/mtime), so it must see
+    the post-move locations. Only applied/rescued MOVE outcomes update
+    paths; failed/skipped moves and CREATE_DIR/DELETE outcomes leave the
+    entry path alone.
+    """
+    import dataclasses
+    from fda.organize.models import Catalog, OperationKind
+    move_map = {
+        o.operation.source: o.operation.destination
+        for o in outcomes
+        if o.status in ("applied", "rescued")
+        and o.operation.kind == OperationKind.MOVE
+        and o.operation.source and o.operation.destination
+    }
+    translated_entries = tuple(
+        dataclasses.replace(e, path=move_map.get(e.path, e.path))
+        for e in catalog.entries
+    )
+    return Catalog(
+        target=catalog.target,
+        entries=translated_entries,
+        git_repos_skipped=catalog.git_repos_skipped,
+    )
+
+
 def _run_metadata_stage(
     *,
     target_path: Path,
@@ -217,9 +246,14 @@ def organize(
                 olog.log("ROUTER_FAIL_FATAL", error=str(e))
         # Stage 5 — runs independently of routing. --no-metadata skips it.
         # Hook is in _run_metadata_stage (testable independently of stages 1-4).
+        # Catalog from stage 1 has pre-move paths; translate to post-move
+        # so enrich.sha256_of() can actually open the files.
         if metadata:
+            stage5_catalog = _translate_catalog_for_stage5(
+                catalog, result.outcomes,
+            )
             _run_metadata_stage(
-                target_path=target_path, catalog=catalog,
+                target_path=target_path, catalog=stage5_catalog,
                 backend=backend, olog=olog,
                 progress_callback=progress_callback,
             )
@@ -276,6 +310,7 @@ __all__ = [
     "organize",
     "apply_plan",
     "_run_metadata_stage",
+    "_translate_catalog_for_stage5",
     "Plan",
     "Operation",
     "OperationKind",
