@@ -62,7 +62,8 @@ def handle_search(args: argparse.Namespace) -> int:
         ko_label_for_document_type,
     )
 
-    db = Path.home() / ".fda" / "metadata.db"
+    from fda.metadata import fda_home
+    db = fda_home() / "metadata.db"
     if not db.exists():
         print(f"error: no metadata DB at {db}; run `fda metadata <folder>` first",
               file=sys.stderr)

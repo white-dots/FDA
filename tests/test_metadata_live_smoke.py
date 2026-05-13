@@ -26,7 +26,7 @@ def _live() -> bool:
 @pytest.mark.skipif(not _live(),
                     reason="set FDA_LIVE_SMOKE=1 to run against real Sonnet")
 def test_metadata_live_smoke_on_fixture_corpus(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("FDA_HOME", str(tmp_path / ".fda"))
     from fda.claude_backend import get_claude_backend
     from fda.metadata import run as metadata_run
     from fda.metadata.vocab import (

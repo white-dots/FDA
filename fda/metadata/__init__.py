@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -61,7 +62,16 @@ def _new_run_id(target_root: str) -> str:
     return f"{stamp}-{h}"
 
 
-def _fda_home() -> Path:
+def fda_home() -> Path:
+    """Return FDA's per-machine state directory.
+
+    Reads `FDA_HOME` env var if set (used by tests and power users to
+    redirect state without touching `$HOME` — the latter would also
+    break the `claude` CLI's auth lookup).
+    """
+    override = os.environ.get("FDA_HOME")
+    if override:
+        return Path(override)
     return Path.home() / ".fda"
 
 
@@ -103,7 +113,7 @@ def _write_audit_sidecar(
     business_context_path: Path, business_context_sha256: str | None,
     failed_path_ids: list[str], failed_path_map: dict[str, str],
 ) -> Path:
-    home = _fda_home()
+    home = fda_home()
     sidecar_dir = home / "runs"
     sidecar_dir.mkdir(parents=True, exist_ok=True)
     sidecar = sidecar_dir / f"{run_id}.md"
@@ -145,7 +155,7 @@ def run(
     progress_callback: Callable[[str], None] | None = None,
 ) -> RunReport:
     """Run the metadata layer over a Catalog. See module docstring."""
-    home = _fda_home()
+    home = fda_home()
     home.mkdir(parents=True, exist_ok=True)
     db_path = home / "metadata.db"
     lock_path = home / "metadata.db.lock"
@@ -311,4 +321,4 @@ def run(
             conn.close()
 
 
-__all__ = ["run", "RunReport"]
+__all__ = ["run", "RunReport", "fda_home"]
