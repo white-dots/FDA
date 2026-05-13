@@ -497,6 +497,21 @@ def _report_to_dict(report: RoutingReport) -> dict[str, Any]:
             }
             for c in report.categories
         ],
+        "quarantine": [
+            {
+                "bucket": g.bucket,
+                "ext": g.ext,
+                "entries": [
+                    {
+                        "relative_path": e.relative_path,
+                        "size_bytes": e.size_bytes,
+                        "note": e.note,
+                    }
+                    for e in g.entries
+                ],
+            }
+            for g in report.quarantine
+        ],
     }
 
 
@@ -509,14 +524,28 @@ def _write_json_report(report: RoutingReport, path: Path) -> None:
 
 def _write_md_report(report: RoutingReport, path: Path) -> None:
     total_files = sum(c.signals.file_count for c in report.categories)
+    no_ext_groups = [
+        g for g in report.quarantine if g.bucket == QUARANTINE_NO_EXTRACTOR
+    ]
+    failed_groups = [
+        g for g in report.quarantine if g.bucket == QUARANTINE_FAILED
+    ]
+    no_ext_count = sum(len(g.entries) for g in no_ext_groups)
+    failed_count = sum(len(g.entries) for g in failed_groups)
+    total_skipped = no_ext_count + failed_count
+
     lines: list[str] = []
     lines.append("# 라우팅 보고서")
     lines.append("")
     lines.append(f"생성 시각: {report.generated_at}")
     lines.append(f"대상 루트: {report.target_root}")
-    lines.append(
-        f"총 카테고리: {len(report.categories)} · 총 파일: {total_files}"
-    )
+    summary = f"총 카테고리: {len(report.categories)} · 총 파일: {total_files}"
+    if total_skipped > 0:
+        summary += (
+            f" · 건너뜀: {total_skipped} "
+            f"(추출기 없음 {no_ext_count}, 추출 실패 {failed_count})"
+        )
+    lines.append(summary)
     lines.append("")
     lines.append("## 카테고리별 라우팅")
     lines.append("")
@@ -549,4 +578,35 @@ def _write_md_report(report: RoutingReport, path: Path) -> None:
                     f"{m.suggested_destination} — {m.reason}"
                 )
             lines.append("")
+
+    if no_ext_groups:
+        lines.append("## 건너뜀 — 추출기 없음 (No Extractor)")
+        lines.append("")
+        lines.append(
+            f"총 {no_ext_count}개 파일 · 추출기 등록 시 일반 카테고리로 흐름"
+        )
+        lines.append("")
+        for g in no_ext_groups:
+            lines.append(f"### .{g.ext} ({len(g.entries)}개)")
+            for e in g.entries:
+                lines.append(
+                    f"- `{e.relative_path}` ({e.size_bytes:,} 바이트) — {e.note}"
+                )
+            lines.append("")
+
+    if failed_groups:
+        lines.append("## 건너뜀 — 추출 실패 (Extraction Failed)")
+        lines.append("")
+        lines.append(
+            f"총 {failed_count}개 파일 · 파일 자체 문제로 본문을 읽지 못함"
+        )
+        lines.append("")
+        for g in failed_groups:
+            lines.append(f"### .{g.ext} ({len(g.entries)}개)")
+            for e in g.entries:
+                lines.append(
+                    f"- `{e.relative_path}` ({e.size_bytes:,} 바이트) — {e.note}"
+                )
+            lines.append("")
+
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
