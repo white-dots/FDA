@@ -86,6 +86,7 @@ class CatalogEntry:
     extract_status: ExtractStatus
     verbatim_head: str = ""
     sections: tuple[str, ...] = ()
+    quarantine_note: str = ""
 
 
 @dataclass(frozen=True)
@@ -163,9 +164,44 @@ class RoutedCategory:
     misfits: tuple[Misfit, ...]
 
 
+QUARANTINE_NO_EXTRACTOR = "_NoExtractor"
+QUARANTINE_FAILED = "_ExtractionFailed"
+
+
+def quarantine_bucket(entry: CatalogEntry) -> str | None:
+    """Return the quarantine bucket name, or None when the entry is processed normally.
+
+    None for junk files (DELETE path) and for `extract_status == "ok"`.
+    `_NoExtractor` for `extract_status == "no_extractor"`.
+    `_ExtractionFailed` for `extract_status in {"failed", "tool_missing"}`.
+    """
+    if entry.is_junk:
+        return None
+    if entry.extract_status == "ok":
+        return None
+    if entry.extract_status == "no_extractor":
+        return QUARANTINE_NO_EXTRACTOR
+    return QUARANTINE_FAILED
+
+
+@dataclass(frozen=True)
+class QuarantineEntry:
+    relative_path: str
+    size_bytes: int
+    note: str
+
+
+@dataclass(frozen=True)
+class QuarantineGroup:
+    bucket: str
+    ext: str
+    entries: tuple[QuarantineEntry, ...]
+
+
 @dataclass(frozen=True)
 class RoutingReport:
     version: str
     generated_at: str
     target_root: str
     categories: tuple[RoutedCategory, ...]
+    quarantine: tuple[QuarantineGroup, ...] = ()

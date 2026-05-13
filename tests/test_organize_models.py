@@ -294,3 +294,87 @@ class TestCatalogEntrySections:
             sections=("Shipping Details", "Products"),
         )
         assert e.sections == ("Shipping Details", "Products")
+
+
+class TestQuarantineBucket:
+    def _entry(self, *, is_junk=False, extract_status="ok", quarantine_note=""):
+        from fda.organize.models import CatalogEntry
+        return CatalogEntry(
+            path_id="f000",
+            path="/tmp/x",
+            ext=".x",
+            size_bytes=0,
+            summary="",
+            type_label="",
+            is_junk=is_junk,
+            summary_failed=False,
+            extract_status=extract_status,
+            quarantine_note=quarantine_note,
+        )
+
+    def test_ok_returns_none(self):
+        from fda.organize.models import quarantine_bucket
+        assert quarantine_bucket(self._entry(extract_status="ok")) is None
+
+    def test_junk_returns_none_even_when_no_extractor(self):
+        from fda.organize.models import quarantine_bucket
+        e = self._entry(is_junk=True, extract_status="no_extractor")
+        assert quarantine_bucket(e) is None
+
+    def test_no_extractor_returns_no_extractor_bucket(self):
+        from fda.organize.models import quarantine_bucket, QUARANTINE_NO_EXTRACTOR
+        e = self._entry(extract_status="no_extractor")
+        assert quarantine_bucket(e) == QUARANTINE_NO_EXTRACTOR
+
+    def test_failed_returns_failed_bucket(self):
+        from fda.organize.models import quarantine_bucket, QUARANTINE_FAILED
+        assert quarantine_bucket(self._entry(extract_status="failed")) == QUARANTINE_FAILED
+
+    def test_tool_missing_returns_failed_bucket(self):
+        from fda.organize.models import quarantine_bucket, QUARANTINE_FAILED
+        assert quarantine_bucket(self._entry(extract_status="tool_missing")) == QUARANTINE_FAILED
+
+
+class TestQuarantineDataclasses:
+    def test_quarantine_entry_fields(self):
+        from fda.organize.models import QuarantineEntry
+        qe = QuarantineEntry(
+            relative_path="_NoExtractor/doc/x.doc",
+            size_bytes=42,
+            note="no extractor registered for .doc",
+        )
+        assert qe.relative_path == "_NoExtractor/doc/x.doc"
+        assert qe.size_bytes == 42
+
+    def test_quarantine_group_fields(self):
+        from fda.organize.models import QuarantineEntry, QuarantineGroup
+        qe = QuarantineEntry(relative_path="_NoExtractor/doc/x.doc", size_bytes=1, note="")
+        qg = QuarantineGroup(bucket="_NoExtractor", ext="doc", entries=(qe,))
+        assert qg.bucket == "_NoExtractor"
+        assert qg.ext == "doc"
+        assert qg.entries == (qe,)
+
+    def test_routing_report_quarantine_defaults_empty(self):
+        from fda.organize.models import RoutingReport
+        r = RoutingReport(
+            version="1.0",
+            generated_at="2026-05-13T00:00:00Z",
+            target_root="/tmp/x",
+            categories=(),
+        )
+        assert r.quarantine == ()
+
+    def test_catalog_entry_quarantine_note_defaults_empty(self):
+        from fda.organize.models import CatalogEntry
+        e = CatalogEntry(
+            path_id="f000",
+            path="/tmp/x",
+            ext=".x",
+            size_bytes=0,
+            summary="",
+            type_label="",
+            is_junk=False,
+            summary_failed=False,
+            extract_status="ok",
+        )
+        assert e.quarantine_note == ""
