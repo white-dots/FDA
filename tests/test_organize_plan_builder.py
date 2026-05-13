@@ -626,3 +626,32 @@ class TestQuarantine:
                 target_dir=str(workspace), groupings=_groupings(),
                 path_by_id={}, junk_paths=[], quarantine=[ghost],
             )
+
+    def test_quarantine_already_in_dest_is_dropped_no_op(self, workspace):
+        """Idempotency: if a quarantine source is already at the resolved
+        destination directory (e.g. an organize rerun over a tree that
+        previously quarantined the file), no MOVE op should be emitted.
+        Matches the no-op guard the category path has at plan_builder.py:205.
+
+        With only this entry as input, all ops drop out and the
+        'nothing to do' guard fires — same shape as
+        test_all_dropped_quarantine_raises_nothing_to_do above.
+        """
+        from fda.organize import plan_builder
+
+        # Pre-existing quarantine layout: the file is already under
+        # _NoExtractor/doc/ in the target. A rerun should NOT plan to move
+        # it onto itself.
+        no_ext_dir = workspace / "_NoExtractor" / "doc"
+        no_ext_dir.mkdir(parents=True)
+        existing = no_ext_dir / "old.doc"
+        existing.write_bytes(b"already-quarantined")
+
+        with pytest.raises(plan_builder.PlanBuilderError):
+            plan_builder.build(
+                target_dir=str(workspace),
+                groupings=_groupings(),
+                path_by_id={},
+                junk_paths=[],
+                quarantine=[self._q(existing, extract_status="no_extractor")],
+            )

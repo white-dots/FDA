@@ -262,6 +262,9 @@ def build(
             continue
         ext_segment = entry.ext.lstrip(".") or "_no_ext"
         dest_dir = _resolve_destination_dir(target, f"{bucket}/{ext_segment}")
+        if src.parent.resolve() == dest_dir:
+            logger.info("dropping no-op quarantine move (already in dest): %s", src)
+            continue
         if bucket == QUARANTINE_NO_EXTRACTOR:
             reason = f"no extractor registered for {entry.ext}"
         else:
