@@ -102,3 +102,39 @@ class TestClassifyBatch:
                 {"path_id": "f001", "ext": ".pdf", "language_hint": "en",
                  "summary": "s", "verbatim_head": "h"},
             ], backend=backend, skill=skill, business_context="")
+
+    def test_classify_batch_embeds_business_context_and_files_in_prompt(self):
+        """Regression guard: the payload returned by _build_prompt_payload
+        must actually reach the backend as the user-message content.
+        Without this, a refactor that breaks the wiring would pass the
+        happy-path test as long as the mocked response is still parseable.
+        """
+        from fda.metadata.classifier import classify_batch
+        records = [_record_dict()]
+        backend = MagicMock()
+        backend.complete.return_value = json.dumps(records)
+        skill = MagicMock(body="prompt", model="claude-sonnet-4-6")
+        files = [
+            {"path_id": "f042", "ext": ".hwp", "language_hint": "ko",
+             "summary": "매출 보고서", "verbatim_head": "2025년 3분기"},
+        ]
+        classify_batch(
+            files=files, backend=backend, skill=skill,
+            business_context="## Departments\n- 영업기획부 (sales)\n",
+        )
+        # Inspect the call.
+        kwargs = backend.complete.call_args.kwargs
+        messages = kwargs["messages"]
+        assert isinstance(messages, list) and len(messages) == 1
+        content = messages[0]["content"]
+        # The user content must contain the business_context, the path_id,
+        # the Korean summary text, and the language_hint — all evidence
+        # that _build_prompt_payload assembled and wired through correctly.
+        assert "영업기획부" in content
+        assert "f042" in content
+        assert "매출 보고서" in content
+        assert '"language_hint": "ko"' in content
+        # system prompt is the skill body
+        assert kwargs["system"] == "prompt"
+        assert kwargs["model"] == "claude-sonnet-4-6"
+        assert kwargs["temperature"] == 0.0
