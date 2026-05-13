@@ -109,3 +109,33 @@ class TestSearch:
         assert len(hits) == 2
         assert {h.path for h in hits} == {"/t/0.pdf", "/t/copy/0.pdf"}
         conn.close()
+
+    def test_short_query_with_percent_does_not_match_unrelated(self, tmp_path):
+        """Regression: a short query containing `%` must match the literal
+        character, not act as a LIKE wildcard. Pre-fix, search("매%") would
+        have matched every row containing `매` followed by anything.
+        """
+        from fda.metadata.search import search
+        conn = _seed(tmp_path, [
+            {"summary": "매출 보고서", "keywords": {"ko": ["매출"], "en": []}},
+            {"summary": "literal 매%percent", "keywords": {"ko": ["매%"], "en": []}},
+        ])
+        # Query containing % must be escaped so it only matches the literal row.
+        hits = search(conn, query="매%")
+        paths_seen = {h.path for h in hits}
+        # Only the row containing the literal `매%` should match.
+        # The first row contains `매` but NOT `매%`, so it must NOT match.
+        assert paths_seen == {"/t/1.pdf"}, f"got {paths_seen}"
+        conn.close()
+
+    def test_short_query_with_underscore_does_not_match_unrelated(self, tmp_path):
+        """Same regression for LIKE's `_` (any single char) wildcard."""
+        from fda.metadata.search import search
+        conn = _seed(tmp_path, [
+            {"summary": "매출 보고서", "keywords": {"ko": ["매출"], "en": []}},
+            {"summary": "literal 매_underscore", "keywords": {"ko": ["매_"], "en": []}},
+        ])
+        hits = search(conn, query="매_")
+        paths_seen = {h.path for h in hits}
+        assert paths_seen == {"/t/1.pdf"}, f"got {paths_seen}"
+        conn.close()

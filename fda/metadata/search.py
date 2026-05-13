@@ -58,11 +58,23 @@ def search(
         )
         params: list = [query]
     elif query:
-        like_pat = f"%{query}%"
+        # Escape `%`, `_`, and `\` in the user-supplied query so they
+        # match literally instead of acting as LIKE wildcards. The ESCAPE
+        # clause tells SQLite which character is our escape prefix.
+        # Note: short-query fallback scans `documents` directly (no FTS
+        # index), so it's O(N) — acceptable for Phase 1, may revisit if
+        # corpora grow much larger.
+        escaped = (
+            query.replace("\\", "\\\\")
+                 .replace("%", "\\%")
+                 .replace("_", "\\_")
+        )
+        like_pat = f"%{escaped}%"
         sql = (
             f"SELECT {select_cols} FROM documents d "
             "JOIN document_paths p ON p.sha256 = d.sha256 "
-            "WHERE (d.summary LIKE ? OR d.keywords LIKE ?)"
+            "WHERE (d.summary LIKE ? ESCAPE '\\' "
+            "OR d.keywords LIKE ? ESCAPE '\\')"
         )
         params = [like_pat, like_pat]
     else:
