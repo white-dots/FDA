@@ -77,5 +77,5 @@ def init_schema(conn: sqlite3.Connection) -> None:
     # Conditional one-shot rebuild for pre-existing rows without FTS sync.
     n_docs = conn.execute("SELECT count(*) FROM documents").fetchone()[0]
     n_fts = conn.execute("SELECT count(*) FROM documents_fts").fetchone()[0]
-    if n_docs > 0 and n_fts == 0:
+    if n_fts != n_docs:
         conn.execute("INSERT INTO documents_fts(documents_fts) VALUES('rebuild')")
