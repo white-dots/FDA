@@ -544,3 +544,172 @@ class TestReportWriters:
               backend=backend, logger=_Logger())
         assert (tmp_path / "routing-report.json").exists()
         assert (tmp_path / "routing-report.md").exists()
+
+
+class TestQuarantineRouting:
+    """Router never invokes the destination-router skill for quarantine
+    moves. It partitions plan.operations by destination prefix and emits
+    QuarantineGroups grouped by (bucket, ext)."""
+
+    def _build_plan(self, target, *, category_moves=(), quarantine_moves=()):
+        """Helper: build a minimal Plan with MOVE ops only."""
+        from fda.organize.models import Operation, OperationKind, Plan
+        ops = []
+        for src, dst, reason in category_moves:
+            ops.append(Operation(
+                kind=OperationKind.MOVE,
+                source=str(src), destination=str(dst), reason=reason,
+            ))
+        for src, dst, reason in quarantine_moves:
+            ops.append(Operation(
+                kind=OperationKind.MOVE,
+                source=str(src), destination=str(dst), reason=reason,
+            ))
+        return Plan(target=str(target), instructions="", operations=tuple(ops), grouping_summary="")
+
+    def test_quarantine_only_plan_does_not_call_skill(self, tmp_path):
+        from unittest.mock import MagicMock
+
+        from fda.organize import router
+        from fda.organize.models import Catalog, Groupings
+
+        backend = MagicMock()
+        log = _Logger()
+        target = tmp_path
+        plan = self._build_plan(
+            target,
+            quarantine_moves=[
+                (target / "a.doc", target / "_NoExtractor" / "doc" / "a.doc",
+                 "no extractor registered for .doc"),
+            ],
+        )
+        catalog = Catalog(target=str(target), entries=(), git_repos_skipped=())
+        report = router.route(
+            catalog=catalog, groupings=Groupings(items=(), overall_reason=""),
+            target_path=target, backend=backend, logger=log, plan=plan,
+        )
+        assert backend.complete.call_count == 0
+        assert report.categories == ()
+        assert len(report.quarantine) == 1
+        g = report.quarantine[0]
+        assert g.bucket == "_NoExtractor"
+        assert g.ext == "doc"
+        assert g.entries[0].relative_path == "_NoExtractor/doc/a.doc"
+        assert g.entries[0].note == "no extractor registered for .doc"
+
+    def test_mixed_plan_skill_only_called_for_category_grouping(self, tmp_path):
+        import json
+        from unittest.mock import MagicMock
+
+        from fda.organize import router
+        from fda.organize.models import Catalog, CatalogEntry, Groupings
+
+        backend = MagicMock()
+        backend.complete.return_value = json.dumps(
+            {"destination": "sharepoint", "reason": "ok", "misfits": []}
+        )
+        log = _Logger()
+        target = tmp_path
+
+        # One category file + one quarantine file
+        entry_ok = CatalogEntry(
+            path_id="f000",
+            path=str(target / "Texts" / "a.txt"),
+            ext=".txt", size_bytes=1, summary="ok", type_label="doc",
+            is_junk=False, summary_failed=False, extract_status="ok",
+        )
+        catalog = Catalog(target=str(target), entries=(entry_ok,), git_repos_skipped=())
+        plan = self._build_plan(
+            target,
+            category_moves=[
+                (target / "a.txt", target / "Texts" / "a.txt", "text-shaped"),
+            ],
+            quarantine_moves=[
+                (target / "b.doc", target / "_NoExtractor" / "doc" / "b.doc",
+                 "no extractor registered for .doc"),
+            ],
+        )
+        groupings = Groupings(
+            items=(_grouping("Texts", ["f000"], subpath="Texts"),),
+            overall_reason="",
+        )
+        report = router.route(
+            catalog=catalog, groupings=groupings,
+            target_path=target, backend=backend, logger=log, plan=plan,
+        )
+        # Skill called once for the single non-Misc category, never for quarantine
+        assert backend.complete.call_count == 1
+        assert len(report.categories) == 1
+        assert len(report.quarantine) == 1
+
+    def test_groups_keyed_by_bucket_and_ext_then_alphabetical(self, tmp_path):
+        from unittest.mock import MagicMock
+
+        from fda.organize import router
+        from fda.organize.models import Catalog, Groupings
+
+        log = _Logger()
+        target = tmp_path
+        # Quarantine: two .doc no_extractor + one .xls no_extractor + one .pdf failed
+        plan = self._build_plan(
+            target,
+            quarantine_moves=[
+                (target / "z.doc", target / "_NoExtractor" / "doc" / "z.doc", "n"),
+                (target / "a.doc", target / "_NoExtractor" / "doc" / "a.doc", "n"),
+                (target / "c.xls", target / "_NoExtractor" / "xls" / "c.xls", "n"),
+                (target / "s.pdf", target / "_ExtractionFailed" / "pdf" / "s.pdf", "image-only"),
+            ],
+        )
+        catalog = Catalog(target=str(target), entries=(), git_repos_skipped=())
+        report = router.route(
+            catalog=catalog, groupings=Groupings(items=(), overall_reason=""),
+            target_path=target, backend=MagicMock(), logger=log, plan=plan,
+        )
+        # Groups: _NoExtractor first (doc, xls alphabetical), then _ExtractionFailed (pdf)
+        assert [(g.bucket, g.ext) for g in report.quarantine] == [
+            ("_NoExtractor", "doc"),
+            ("_NoExtractor", "xls"),
+            ("_ExtractionFailed", "pdf"),
+        ]
+        # Within the doc group: entries sorted by relative_path
+        doc_group = report.quarantine[0]
+        assert [e.relative_path for e in doc_group.entries] == [
+            "_NoExtractor/doc/a.doc",
+            "_NoExtractor/doc/z.doc",
+        ]
+
+    def test_fully_extractable_plan_emits_empty_quarantine_tuple(self, tmp_path):
+        import json
+        from unittest.mock import MagicMock
+
+        from fda.organize import router
+        from fda.organize.models import Catalog, CatalogEntry, Groupings
+
+        backend = MagicMock()
+        backend.complete.return_value = json.dumps(
+            {"destination": "sharepoint", "reason": "ok", "misfits": []}
+        )
+        log = _Logger()
+        target = tmp_path
+        entry = CatalogEntry(
+            path_id="f000",
+            path=str(target / "Texts" / "a.txt"),
+            ext=".txt", size_bytes=1, summary="ok", type_label="doc",
+            is_junk=False, summary_failed=False, extract_status="ok",
+        )
+        catalog = Catalog(target=str(target), entries=(entry,), git_repos_skipped=())
+        plan = self._build_plan(
+            target,
+            category_moves=[
+                (target / "a.txt", target / "Texts" / "a.txt", "text-shaped"),
+            ],
+        )
+        groupings = Groupings(
+            items=(_grouping("Texts", ["f000"], subpath="Texts"),),
+            overall_reason="",
+        )
+        report = router.route(
+            catalog=catalog, groupings=groupings,
+            target_path=target, backend=backend, logger=log, plan=plan,
+        )
+        assert report.quarantine == ()

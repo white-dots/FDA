@@ -26,6 +26,11 @@ from fda.organize.models import (
     Misfit,
     OperationKind,
     OperationOutcome,
+    Plan,
+    QUARANTINE_FAILED,
+    QUARANTINE_NO_EXTRACTOR,
+    QuarantineEntry,
+    QuarantineGroup,
     RoutedCategory,
     RoutingReport,
     RoutingSignals,
@@ -270,6 +275,62 @@ def _final_paths_from_outcomes(
     return final
 
 
+_QUARANTINE_BUCKETS: frozenset[str] = frozenset({
+    QUARANTINE_NO_EXTRACTOR, QUARANTINE_FAILED,
+})
+
+
+def _is_quarantine_dest(destination: str, target: Path) -> bool:
+    try:
+        rel = Path(destination).relative_to(target)
+    except ValueError:
+        return False
+    return bool(rel.parts) and rel.parts[0] in _QUARANTINE_BUCKETS
+
+
+def _build_quarantine_groups(
+    plan: Plan, target: Path, logger: OrganizeLogger,
+) -> tuple[QuarantineGroup, ...]:
+    """Walk plan.operations, collect quarantine MOVEs, group by (bucket, ext)."""
+    by_key: dict[tuple[str, str], list[QuarantineEntry]] = {}
+    for op in plan.operations:
+        if op.kind != OperationKind.MOVE or not op.destination:
+            continue
+        if not _is_quarantine_dest(op.destination, target):
+            continue
+        rel = Path(op.destination).relative_to(target)
+        parts = rel.parts
+        if len(parts) < 3:
+            # Defensive: malformed quarantine destination (expected
+            # bucket/ext/basename). Skip.
+            continue
+        bucket, ext = parts[0], parts[1]
+        try:
+            size = Path(op.destination).stat().st_size
+        except OSError:
+            # File may not be on disk in unit tests where the executor
+            # didn't run — fall back to 0.
+            size = 0
+        by_key.setdefault((bucket, ext), []).append(QuarantineEntry(
+            relative_path=str(rel),
+            size_bytes=size,
+            note=op.reason,
+        ))
+
+    bucket_order = {QUARANTINE_NO_EXTRACTOR: 0, QUARANTINE_FAILED: 1}
+    groups: list[QuarantineGroup] = []
+    for (bucket, ext) in sorted(
+        by_key.keys(), key=lambda k: (bucket_order.get(k[0], 99), k[1]),
+    ):
+        entries = sorted(by_key[(bucket, ext)], key=lambda e: e.relative_path)
+        groups.append(QuarantineGroup(bucket=bucket, ext=ext, entries=tuple(entries)))
+        logger.log(
+            "ROUTER_QUARANTINE_GROUP",
+            bucket=bucket, ext=ext, count=len(entries),
+        )
+    return tuple(groups)
+
+
 def route(
     *,
     catalog: Catalog,
@@ -278,6 +339,7 @@ def route(
     backend,
     logger: OrganizeLogger,
     outcomes: tuple[OperationOutcome, ...] = (),
+    plan: Plan | None = None,
 ) -> RoutingReport:
     """Top-level router. Iterate per-category groupings, short-circuit or
     invoke the destination-router skill, resolve misfit paths, build the
@@ -383,15 +445,24 @@ def route(
             misfits=len(misfits),
         )
 
+    quarantine_groups = (
+        _build_quarantine_groups(plan, target_path, logger)
+        if plan is not None else ()
+    )
+
     report = RoutingReport(
         version="1.0",
         generated_at=_now_iso(),
         target_root=str(target_path),
         categories=tuple(routed),
+        quarantine=quarantine_groups,
     )
     _write_json_report(report, target_path / "routing-report.json")
     _write_md_report(report, target_path / "routing-report.md")
-    logger.log("ROUTER_DONE", categories=len(routed))
+    logger.log(
+        "ROUTER_DONE",
+        categories=len(routed), quarantine=len(quarantine_groups),
+    )
     return report
 
 
