@@ -212,7 +212,11 @@ def build(
     # are themselves planned sources moving away.
     planned_sources = frozenset(
         list(src.resolve() for _, src, _, _ in candidates)
-        + list(Path(e.path).resolve() for e in quarantine if Path(e.path).is_file())
+        + list(
+            Path(e.path).resolve()
+            for e in quarantine
+            if quarantine_bucket(e) is not None and Path(e.path).is_file()
+        )
     )
 
     # Resolve basenames deterministically. Sort by source path so collisions
