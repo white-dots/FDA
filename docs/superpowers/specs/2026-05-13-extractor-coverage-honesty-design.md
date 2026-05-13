@@ -27,7 +27,9 @@ format (matching the existing per-format sub-project pattern:
 
 For each file in the target tree:
 
-1. **Reader runs the extractor first.** Existing behavior; no change.
+1. **Reader runs the extractor first** (for non-junk files; junk files
+   are filtered before extraction, as today). Existing behavior; no
+   change.
 2. **If `extract_status != "ok"` AND the file is not junk**, reader
    skips the per-file LLM summary call and emits a **quarantine
    catalog entry** (empty `summary` and `type_label`, `extract_status`
@@ -81,37 +83,57 @@ Alternative seams considered and rejected during brainstorming:
 
 ### In scope (changes in this v1)
 
-1. **`fda/organize/reader.py`** — `_summarize_one` short-circuits the
+1. **`fda/organize/__init__.py`** — `organize()` computes the
+   quarantine subset (`quarantine_bucket(e) is not None`) from the
+   catalog, narrows `path_by_id` to extractable entries only (so the
+   classifier-aligned id map stays correct), and passes
+   `quarantine=...` to `plan_builder.build()`.
+2. **`fda/organize/reader.py`** — `_summarize_one` short-circuits the
    backend call when `extraction.status != "ok"`. New `_quarantine_entry`
-   helper. New `READER_QUARANTINE` log event.
-2. **`fda/organize/models.py`** — two new module constants
+   helper. New `READER_QUARANTINE` log event. `read()`'s finalization
+   loop copies the new `quarantine_note` field onto every
+   `CatalogEntry` it reconstructs; `READER_END` excludes quarantine
+   entries from the `ok` count and adds a `quarantine` count.
+3. **`fda/organize/models.py`** — two new module constants
    (`QUARANTINE_NO_EXTRACTOR = "_NoExtractor"`,
-   `QUARANTINE_FAILED = "_ExtractionFailed"`) and one new pure helper
-   (`quarantine_bucket(entry: CatalogEntry) -> str | None`). New
-   `QuarantineEntry` and `QuarantineGroup` dataclasses. `RoutingReport`
-   gains a `quarantine: tuple[QuarantineGroup, ...]` field.
-3. **`fda/organize/classifier.py`** — filter out entries where
+   `QUARANTINE_FAILED = "_ExtractionFailed"`), one new field on
+   `CatalogEntry` (`quarantine_note: str = ""`), and one new pure
+   helper (`quarantine_bucket(entry: CatalogEntry) -> str | None`).
+   New `QuarantineEntry` and `QuarantineGroup` dataclasses.
+   `RoutingReport` gains a `quarantine: tuple[QuarantineGroup, ...]`
+   field.
+4. **`fda/organize/classifier.py`** — filter out entries where
    `quarantine_bucket(e) is not None` before the LLM grouping pass.
-   Empty extractable input emits empty `Groupings` (existing code path).
-4. **`fda/organize/plan_builder.py`** — `build()` gains a keyword-only
+   When the resulting extractable subset is empty, the classifier
+   returns `Groupings(items=(), overall_reason="")` *before* loading
+   skills or invoking the LLM. The failed-summary threshold is
+   computed over the extractable subset, not over `real` — otherwise
+   quarantine entries (which carry `summary_failed=False`) would
+   dilute the denominator and mask genuine LLM-summary failures.
+5. **`fda/organize/plan_builder.py`** — `build()` gains a keyword-only
    `quarantine: Sequence[CatalogEntry] = ()` parameter. For each entry,
    emit a MOVE op with destination
    `<target>/<bucket>/<ext>/<basename>` and a synthesized reason
    (`"no extractor registered for .doc"` or the extractor's `note`).
    Existing collision-resolution, path-traversal, and
    `_fs.validate_operation` checks apply unchanged.
-5. **`fda/organize/router.py`** — `route()` partitions plan move
-   operations into category moves and quarantine moves by destination
-   prefix. Quarantine moves are grouped into `QuarantineGroup`s
-   (keyed by bucket + extension) and attached to `RoutingReport`. No
-   destination-router skill invocation for quarantine moves. New
-   `ROUTER_QUARANTINE_GROUP` log event.
-6. **`_write_json_report` / `_write_md_report`** — JSON sidecar gains
+6. **`fda/organize/router.py`** — `route()` signature gains a
+   `plan: Plan` keyword argument so the router has direct access to
+   the full operation list (without depending on `outcomes`, which is
+   empty in unit tests that bypass the executor). The router walks
+   `plan.operations`, partitions MOVEs into category moves and
+   quarantine moves by destination prefix, groups quarantine moves
+   into `QuarantineGroup`s (keyed by bucket + extension), and
+   attaches them to `RoutingReport`. No destination-router skill
+   invocation for quarantine moves. New `ROUTER_QUARANTINE_GROUP` log
+   event. Callers (today: `fda/organize/__init__.py`) thread `plan`
+   into the `route()` call.
+7. **`_write_json_report` / `_write_md_report`** — JSON sidecar gains
    a top-level `quarantine` key parallel to `categories`. Markdown
    report appends two new sections (Korean primary, English bucket
    name in parens) when non-empty. Header summary line gains a skip
    count when non-empty.
-7. **Tests** — new unit tests per stage (reader, plan_builder, router,
+8. **Tests** — new unit tests per stage (reader, plan_builder, router,
    report writer) plus extensions to the existing organize integration
    fixture. Regression sweep of existing tests that fed `.doc`/`.xls`/
    `.ppt`/`.html` fixtures expecting `Misc/` placement.
@@ -250,10 +272,22 @@ user = _build_user_message(path, extraction, size)
 - `quarantine_note=extraction.note or ""`
 - `verbatim_head=""`, `sections=()`
 
+The `read()` finalization loop (currently line 307-319) reconstructs
+every `CatalogEntry` field-by-field while assigning `path_id`s. That
+reconstruction must explicitly include the new `quarantine_note`
+field; otherwise it gets silently dropped between the worker's
+output and the final catalog.
+
 The "quarantine" log kind is handled in the `read()` loop alongside
 `done` / `timeout` / `fail` / `deadline`, emitting a single
 `READER_QUARANTINE` log event with `path`, `extract_status`, and
 `note=extraction.note` (no `elapsed_ms` — no LLM call to measure).
+
+`READER_END`'s summary counts (currently line 322-324) shift: the
+`ok` count excludes quarantine entries
+(`not summary_failed and not is_junk and quarantine_bucket(e) is None`),
+and a new `quarantine` count is emitted alongside `ok` / `failed` /
+`total`.
 
 The existing `_build_user_message`'s no-extractor / tool-missing /
 failed branches become dead code once this ships. They are deleted in
@@ -261,22 +295,30 @@ the same change to keep the module honest.
 
 ### Classifier (`fda/organize/classifier.py`)
 
-One filter pass at the top of the function that consumes the catalog
+Two changes at the top of the function that consumes the catalog
 for LLM grouping:
 
 ```python
+real = [e for e in catalog.entries if not e.is_junk]
 extractable = [e for e in real if quarantine_bucket(e) is None]
+
+# Empty extractable subset (e.g., all non-junk files were
+# unextractable) returns immediately. No skill load, no LLM call.
+if not extractable:
+    return Groupings(items=(), overall_reason="")
+
+# Failed-summary threshold operates over the extractable subset,
+# not over `real`. Quarantine entries (summary_failed=False) would
+# otherwise dilute the denominator and mask real classifier failures.
+failed = [e for e in extractable if e.summary_failed]
+if extractable and len(failed) / len(extractable) > READER_FAILED_SUMMARY_THRESHOLD:
+    raise ClassifierError(...)
 # ... existing grouping logic operates on `extractable` ...
 ```
 
-Where `real` is today's `[e for e in catalog.entries if not e.is_junk]`.
-No change to the classifier prompt. The failed-summary threshold check
-(line 593-602) continues to compare `summary_failed` over `real`; the
-threshold's semantics get cleaner because extractor failures no longer
-inflate the count.
-
-The taxonomy-proposer Sonnet skill is unaffected (it receives the
-extractable subset; format unchanged).
+No change to the classifier prompt. The taxonomy-proposer Sonnet
+skill is unaffected — it receives the extractable subset, format
+unchanged.
 
 ### Plan builder (`fda/organize/plan_builder.py`)
 
@@ -324,8 +366,11 @@ when deciding whether to raise.
 
 ### Router (`fda/organize/router.py`)
 
-After the executor has run, the router walks `plan.operations` and
-partitions MOVEs:
+`route()` signature gains a keyword-only `plan: Plan` argument so
+the router has direct access to the full operation list. The
+existing `outcomes` parameter still feeds `final_path_by_id` for
+post-move path resolution. After the executor has run, the router
+walks `plan.operations` and partitions MOVEs:
 
 ```python
 def _is_quarantine_dest(destination: str, target: Path) -> bool:
@@ -420,10 +465,20 @@ non-empty:
 Within each bucket, extensions are listed in alphabetical order;
 within each extension, entries are listed by `relative_path`.
 
-Size formatting matches the existing report style (raw bytes for the
-JSON sidecar; human-readable in the markdown). The existing
-`{size_bytes:,}` style is preserved verbatim in the markdown to keep
-the report visually consistent.
+Size formatting for per-file lines: comma-grouped bytes
+(`{size_bytes:,}` followed by `바이트`), matching the existing
+category-total style at `_write_md_report` (`총 용량(바이트):
+{c.signals.total_size_bytes:,}`). The earlier examples in this
+section use `24KB` / `180KB` for compactness; the implementation
+must use comma-grouped bytes:
+
+```markdown
+### .doc (8개)
+- `_NoExtractor/doc/old-quote.doc` (24,576 바이트) — no extractor registered for .doc
+- `_NoExtractor/doc/contract-v2.doc` (48,128 바이트) — no extractor registered for .doc
+```
+
+JSON sidecar continues to emit `size_bytes` as a raw integer.
 
 ## Edge cases
 
@@ -439,14 +494,21 @@ the report visually consistent.
 - **`summary_failed=True` with `extract_status="ok"`.** Not
   quarantined. The classifier still has `verbatim_head` and `sections`
   to work with; existing behavior preserved.
-- **All files in a target are quarantined.** Classifier sees an empty
-  extractable set, emits empty `Groupings` (existing path), plan_builder
-  emits only quarantine MOVEs + CREATE_DIRs, executor applies, router
-  walks the empty `groupings.items` and emits only `QuarantineGroup`s,
-  report shows only the Skipped sections. No crash. The
-  `READER_FAILED_SUMMARY_THRESHOLD` check (which guards "too many
-  classifier failures") is unaffected — quarantine entries are no
-  longer counted as classifier failures.
+- **All files in a target are quarantined.** Classifier's new
+  early-return path (extractable subset empty → emit empty
+  `Groupings`, no skill load, no LLM call) keeps the run alive.
+  Plan_builder emits only quarantine MOVEs + CREATE_DIRs, executor
+  applies, router walks the empty `groupings.items` and emits only
+  `QuarantineGroup`s, report shows only the Skipped sections. No
+  crash.
+- **`READER_FAILED_SUMMARY_THRESHOLD` semantics.** The classifier
+  threshold is recomputed over the extractable subset (not over
+  `real`). Quarantine entries carry `summary_failed=False`, so
+  leaving them in `real` would inflate the denominator and let a
+  high genuine-failure rate slip below the threshold. The new
+  scope tracks exactly what the threshold is meant to measure:
+  "classifier saw too many LLM-summary failures among the files it
+  was actually asked to classify."
 - **Existing `_MISC_CATEGORY_NAMES` and `all_extraction_failed`
   signal** in `router.py` (line 75, 56) become effectively dead for
   non-junk corpora — quarantine takes over the "no usable signal"
@@ -469,8 +531,11 @@ the report visually consistent.
    `extract_status="no_extractor"`, `summary=""`, `type_label=""`,
    `is_junk=False`, `summary_failed=False`.
 2. Same for `status="failed"` and `status="tool_missing"`.
-3. Junk file with `status="no_extractor"` → still gets `_junk_entry`
-   treatment (`is_junk=True`, `type_label="junk"`); not quarantine.
+3. Junk file (e.g., `.DS_Store`) is filtered before extraction;
+   `_junk_entry` is constructed with `is_junk=True`,
+   `type_label="junk"`, `extract_status="no_extractor"`, and *neither*
+   `_extractors.extract` nor `backend.complete` is called. Not
+   quarantine.
 4. Successful extraction (`status="ok"`) still routes through the
    backend.complete LLM-summary path (regression).
 5. `READER_QUARANTINE` log event emitted with `path`,
@@ -484,8 +549,12 @@ the report visually consistent.
 2. Single failed PDF → MOVE to `_ExtractionFailed/pdf/scan.pdf` with
    the extractor's note as reason.
 3. No-extension file (`path.suffix == ""`) → `_NoExtractor/_no_ext/`.
-4. Collision: two `.doc` files with the same basename (different
-   source dirs) → second gets `name (2).doc`.
+4. Collision: two `.doc` files with the same basename from different
+   source directories → both planned into `_NoExtractor/doc/`. Per
+   the deterministic source-path sort in `_resolve_basename` (sorted
+   by source path, line 209-211), exactly one keeps the original
+   basename and the other gets `name (2).doc`. Assert on the
+   lexicographic invariant, not on insertion order.
 5. Quarantine MOVE passes `_fs.validate_operation` (target-relative
    destination, no path traversal).
 6. Mixed input: groupings + quarantine + junk → all three move/delete
@@ -499,12 +568,16 @@ the report visually consistent.
 ### Router unit tests (`tests/test_organize_router.py`)
 
 1. Plan with mixed category + quarantine MOVEs → destination-router
-   skill mock called only for category MOVEs (assert call count).
+   skill mock called exactly once per non-quarantine grouping (the
+   router loops over `groupings.items`, not per move). Assert the
+   call count equals the number of routable category groupings,
+   ignoring short-circuited and quarantine cases.
 2. `RoutingReport.quarantine` populated correctly: groups keyed by
    `(bucket, ext)`, entries ordered by `relative_path`, alphabetical
    ext order within each bucket.
-3. Plan with only quarantine MOVEs → `RoutingReport.categories == ()`,
-   `RoutingReport.quarantine` non-empty.
+3. Plan with only quarantine MOVEs (and empty groupings) →
+   `RoutingReport.categories == ()`, `RoutingReport.quarantine`
+   non-empty, destination-router skill mock never called.
 4. Plan with no quarantine MOVEs → `RoutingReport.quarantine == ()`
    (existing behavior preserved for fully-extractable corpora).
 
