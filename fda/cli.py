@@ -1284,6 +1284,8 @@ def handle_organize(args: argparse.Namespace) -> int:
         instructions=instructions,
         progress_callback=progress,
         route=not args.no_route,
+        metadata=not args.no_metadata,
+        metadata_only=args.metadata_only,
     )
 
     if not result.get("success"):
