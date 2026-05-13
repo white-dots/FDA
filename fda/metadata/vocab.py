@@ -43,7 +43,7 @@ _DOCUMENT_TYPE_KO: dict[str, str] = {
     "report": "보고서",
     "proposal": "제안서",
     "memo": "메모",
-    "policy": "정책문서",
+    "policy": "정책",
     "presentation": "발표자료",
     "spreadsheet": "스프레드시트",
     "image": "이미지",
@@ -56,8 +56,8 @@ _DOCUMENT_TYPE_KO: dict[str, str] = {
 _CONFIDENTIALITY_KO: dict[str, str] = {
     "public": "공개",
     "internal": "내부",
-    "confidential": "기밀",
-    "restricted": "제한",
+    "confidential": "대외비",
+    "restricted": "기밀",
 }
 
 

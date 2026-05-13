@@ -36,6 +36,18 @@ class TestVocab:
             label = ko_label_for_department(code)
             assert isinstance(label, str) and len(label) > 0
 
+    def test_korean_labels_resolve_for_every_document_type_code(self):
+        from fda.metadata.vocab import DOCUMENT_TYPES, ko_label_for_document_type
+        for code in DOCUMENT_TYPES:
+            label = ko_label_for_document_type(code)
+            assert isinstance(label, str) and len(label) > 0
+
+    def test_korean_labels_resolve_for_every_confidentiality_code(self):
+        from fda.metadata.vocab import CONFIDENTIALITY, ko_label_for_confidentiality
+        for code in CONFIDENTIALITY:
+            label = ko_label_for_confidentiality(code)
+            assert isinstance(label, str) and len(label) > 0
+
     def test_korean_label_for_unknown_code_falls_back_to_english(self):
         from fda.metadata.vocab import ko_label_for_department
         assert ko_label_for_department("not-a-real-code") == "not-a-real-code"
