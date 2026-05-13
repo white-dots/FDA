@@ -43,7 +43,7 @@ def test_metadata_live_smoke_on_fixture_corpus(tmp_path, monkeypatch):
     )
 
     backend = get_claude_backend()
-    olog = OrganizeLogger(log_path=None, target_basename="smoke",
+    olog = OrganizeLogger(log_path=False, target_basename="smoke",
                           progress_callback=lambda m: print(m))
     catalog = reader.read(fixture_dir, backend=backend, logger=olog)
     report = metadata_run(
