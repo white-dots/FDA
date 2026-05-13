@@ -76,4 +76,10 @@ Rules:
 - Each misfit's `path_id` MUST appear in the input `sample`.
 - Each misfit's `suggested_destination` MUST be different from the
   category's chosen `destination`.
+- Write `reason` (both the category's and each misfit's) in the
+  language matching the category's content. Judge content language
+  from the sample's `verbatim_head` and `summary` fields: if any file
+  in the sample contains Korean (Hangul), write the reason in Korean;
+  otherwise write it in English. `destination` and
+  `suggested_destination` stay English codes regardless.
 - Output ONLY the JSON object.
