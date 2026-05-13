@@ -233,3 +233,185 @@ class TestFtsTriggers:
             assert len(rows) == 1
         finally:
             conn.close()
+
+
+class TestUpsert:
+    def _setup(self, tmp_path):
+        from fda.metadata.store import connect, init_schema, insert_run
+        conn = connect(tmp_path / "m.db")
+        init_schema(conn)
+        insert_run(conn, run_id="r1", target_root="/t",
+                   model="claude-sonnet-4-6", fda_version="0.1.0",
+                   business_context_sha256=None,
+                   started_at="2026-05-13T00:00:00Z")
+        return conn
+
+    def test_one_sha256_with_two_paths_yields_two_path_rows(self, tmp_path):
+        from fda.metadata.store import upsert_document, upsert_path
+        from fda.metadata.schema import DocumentRow, PathRow
+        conn = self._setup(tmp_path)
+        try:
+            doc = DocumentRow(
+                sha256="a" * 64, mime="application/pdf", size_bytes=10,
+                language="ko", department="finance", document_type="invoice",
+                confidentiality="confidential", summary="x",
+                keywords_json='{"ko":[],"en":[]}', confidence=0.9,
+                fail_closed_override=False, extract_status="ok",
+                sharepoint_url=None, run_id="r1",
+                created_at="2026-05-13T00:00:00Z",
+                updated_at="2026-05-13T00:00:00Z",
+            )
+            upsert_document(conn, doc)
+            upsert_path(conn, PathRow(
+                path_id="f000", sha256="a" * 64, path="/t/a.pdf",
+                mtime="2026-05-13T00:00:00.000000Z", last_seen_run="r1",
+            ))
+            upsert_path(conn, PathRow(
+                path_id="f001", sha256="a" * 64, path="/t/copy/a.pdf",
+                mtime="2026-05-13T00:00:00.000000Z", last_seen_run="r1",
+            ))
+            rows = conn.execute(
+                "SELECT d.sha256, p.path FROM documents d "
+                "JOIN document_paths p ON p.sha256 = d.sha256 "
+                "ORDER BY p.path"
+            ).fetchall()
+            assert len(rows) == 2
+            assert rows[0][1] == "/t/a.pdf"
+            assert rows[1][1] == "/t/copy/a.pdf"
+        finally:
+            conn.close()
+
+    def test_rerun_same_path_bumps_last_seen(self, tmp_path):
+        from fda.metadata.store import (
+            upsert_document, upsert_path, insert_run,
+        )
+        from fda.metadata.schema import DocumentRow, PathRow
+        conn = self._setup(tmp_path)
+        try:
+            sha = "a" * 64
+            upsert_document(conn, DocumentRow(
+                sha256=sha, mime="application/pdf", size_bytes=1,
+                language="ko", department="finance", document_type="invoice",
+                confidentiality="confidential", summary="x",
+                keywords_json='{"ko":[],"en":[]}', confidence=0.9,
+                fail_closed_override=False, extract_status="ok",
+                sharepoint_url=None, run_id="r1",
+                created_at="2026-05-13T00:00:00Z",
+                updated_at="2026-05-13T00:00:00Z",
+            ))
+            upsert_path(conn, PathRow(
+                path_id="f000", sha256=sha, path="/t/a.pdf",
+                mtime="2026-05-13T00:00:00.000000Z", last_seen_run="r1",
+            ))
+            insert_run(conn, run_id="r2", target_root="/t",
+                       model="claude-sonnet-4-6", fda_version="0.1.0",
+                       business_context_sha256=None,
+                       started_at="2026-05-13T01:00:00Z")
+            upsert_path(conn, PathRow(
+                path_id="f000", sha256=sha, path="/t/a.pdf",
+                mtime="2026-05-13T01:00:00.000000Z", last_seen_run="r2",
+            ))
+            row = conn.execute(
+                "SELECT path_id, last_seen_run, mtime FROM document_paths "
+                "WHERE path = '/t/a.pdf'"
+            ).fetchone()
+            assert row == ("f000", "r2", "2026-05-13T01:00:00.000000Z")
+            n = conn.execute("SELECT count(*) FROM document_paths").fetchone()[0]
+            assert n == 1
+        finally:
+            conn.close()
+
+    def test_two_runs_can_both_use_f000_for_different_paths(self, tmp_path):
+        """path_id is per-run; different trees reuse it. The DB must allow
+        path_id='f000' to appear twice as long as the paths differ.
+        Regression guard against the original spec/plan bug where path_id
+        was PK and collisions silently dropped rows.
+        """
+        from fda.metadata.store import (
+            insert_run, upsert_document, upsert_path,
+        )
+        from fda.metadata.schema import DocumentRow, PathRow
+        conn = self._setup(tmp_path)
+        try:
+            sha_a, sha_b = "a" * 64, "b" * 64
+            for sha in (sha_a, sha_b):
+                upsert_document(conn, DocumentRow(
+                    sha256=sha, mime="application/pdf", size_bytes=1,
+                    language="ko", department="finance",
+                    document_type="invoice", confidentiality="confidential",
+                    summary="x", keywords_json='{"ko":[],"en":[]}',
+                    confidence=0.9, fail_closed_override=False,
+                    extract_status="ok", sharepoint_url=None, run_id="r1",
+                    created_at="2026-05-13T00:00:00Z",
+                    updated_at="2026-05-13T00:00:00Z",
+                ))
+            insert_run(conn, run_id="r2", target_root="/B",
+                       model="claude-sonnet-4-6", fda_version="0.1.0",
+                       business_context_sha256=None,
+                       started_at="2026-05-13T01:00:00Z")
+            upsert_path(conn, PathRow(path_id="f000", sha256=sha_a,
+                                       path="/A/x.pdf",
+                                       mtime="2026-05-13T00:00:00.000000Z",
+                                       last_seen_run="r1"))
+            upsert_path(conn, PathRow(path_id="f000", sha256=sha_b,
+                                       path="/B/x.pdf",
+                                       mtime="2026-05-13T01:00:00.000000Z",
+                                       last_seen_run="r2"))
+            paths = sorted(r[0] for r in conn.execute(
+                "SELECT path FROM document_paths"
+            ).fetchall())
+            assert paths == ["/A/x.pdf", "/B/x.pdf"]
+        finally:
+            conn.close()
+
+
+class TestPrune:
+    def test_prune_removes_paths_under_target_not_seen_this_run(self, tmp_path):
+        from fda.metadata.store import (
+            connect, init_schema, insert_run, prune_missing_paths,
+            upsert_document, upsert_path,
+        )
+        from fda.metadata.schema import DocumentRow, PathRow
+        conn = connect(tmp_path / "m.db")
+        init_schema(conn)
+        insert_run(conn, run_id="r1", target_root="/t",
+                   model="claude-sonnet-4-6", fda_version="0.1.0",
+                   business_context_sha256=None,
+                   started_at="2026-05-13T00:00:00Z")
+        sha = "b" * 64
+        upsert_document(conn, DocumentRow(
+            sha256=sha, mime="application/pdf", size_bytes=1,
+            language="ko", department="finance", document_type="invoice",
+            confidentiality="confidential", summary="x",
+            keywords_json='{"ko":[],"en":[]}', confidence=0.9,
+            fail_closed_override=False, extract_status="ok",
+            sharepoint_url=None, run_id="r1",
+            created_at="2026-05-13T00:00:00Z",
+            updated_at="2026-05-13T00:00:00Z",
+        ))
+        upsert_path(conn, PathRow(path_id="f000", sha256=sha,
+                                   path="/t/old.pdf",
+                                   mtime="2026-05-13T00:00:00.000000Z",
+                                   last_seen_run="r1"))
+        upsert_path(conn, PathRow(path_id="f001", sha256=sha,
+                                   path="/elsewhere/keep.pdf",
+                                   mtime="2026-05-13T00:00:00.000000Z",
+                                   last_seen_run="r1"))
+        # New run sees only /t/new.pdf under target /t.
+        insert_run(conn, run_id="r2", target_root="/t",
+                   model="claude-sonnet-4-6", fda_version="0.1.0",
+                   business_context_sha256=None,
+                   started_at="2026-05-13T01:00:00Z")
+        upsert_path(conn, PathRow(path_id="f002", sha256=sha,
+                                   path="/t/new.pdf",
+                                   mtime="2026-05-13T01:00:00.000000Z",
+                                   last_seen_run="r2"))
+        prune_missing_paths(conn, target_root="/t", current_run_id="r2")
+        paths = sorted(r[0] for r in conn.execute(
+            "SELECT path FROM document_paths"
+        ).fetchall())
+        # /t/old.pdf pruned (under target, not seen this run).
+        # /elsewhere/keep.pdf kept (not under target).
+        # /t/new.pdf kept (seen this run).
+        assert paths == ["/elsewhere/keep.pdf", "/t/new.pdf"]
+        conn.close()
