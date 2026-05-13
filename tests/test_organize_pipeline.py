@@ -227,3 +227,91 @@ class TestOrganizeRouting:
         )
         assert isinstance(result, Plan)
         assert not (workspace / "routing-report.json").exists()
+
+
+class TestQuarantineEndToEnd:
+    """End-to-end: mixed extractable + quarantine corpus lands the
+    quarantine files under _NoExtractor/<ext>/ and the report shows
+    them as Skipped sections."""
+
+    @pytest.fixture
+    def quarantine_only_workspace(self, tmp_path):
+        """Workspace whose every file lacks a registered extractor.
+
+        Deliberately does NOT use the shared `workspace` fixture (which
+        creates extractable .txt/.docx/.xlsx/.pptx/.csv/.hwpx) — this
+        test needs the classifier's empty-extractable early-return path.
+        """
+        root = tmp_path / "ws-q"
+        root.mkdir()
+        (root / "a.doc").write_bytes(b"a")
+        (root / "b.xls").write_bytes(b"b")
+        return root
+
+    def test_unsupported_extension_moved_to_NoExtractor_bucket(self, workspace):
+        from fda.organize import organize
+
+        # `workspace` fixture already created extractable files (.txt, .docx,
+        # .xlsx, .pptx, .csv, .hwpx). Add one unsupported-extension file so
+        # the test exercises both paths in the same run.
+        (workspace / "old-quote.doc").write_bytes(b"fake doc bytes")
+        backend = _scripted_backend(workspace)
+        # Router is invoked because route=True (default) — chain a router
+        # response onto the scripted backend, mirroring how TestOrganizeRouting
+        # at test_organize_pipeline.py:178-192 does it.
+        original = backend.complete.side_effect
+        def _route_or_default(*args, **kwargs):
+            body = kwargs["messages"][0]["content"]
+            try:
+                parsed = json.loads(body)
+            except Exception:
+                return original(*args, **kwargs)
+            if "category" in parsed and "signals" in parsed:
+                return json.dumps({
+                    "destination": "sharepoint",
+                    "reason": "test routing reason",
+                    "misfits": [],
+                })
+            return original(*args, **kwargs)
+        backend.complete.side_effect = _route_or_default
+
+        organize(
+            str(workspace),
+            instructions="",
+            backend=backend,
+            allowed_roots=[workspace.parent],
+        )
+        # The .doc goes to quarantine; extractable files keep flowing through
+        # their normal categories (assertions for those already live in
+        # TestOrganize.test_full_pipeline above).
+        assert (workspace / "_NoExtractor" / "doc" / "old-quote.doc").exists()
+        md = (workspace / "routing-report.md").read_text(encoding="utf-8")
+        assert "## 건너뜀 — 추출기 없음 (No Extractor)" in md
+        assert "`_NoExtractor/doc/old-quote.doc`" in md
+        data = json.loads(
+            (workspace / "routing-report.json").read_text(encoding="utf-8"),
+        )
+        assert any(g["bucket"] == "_NoExtractor" and g["ext"] == "doc"
+                   for g in data["quarantine"])
+
+    def test_all_quarantine_corpus_does_not_crash(self, quarantine_only_workspace):
+        """No extractable files at all → classifier short-circuits, plan_builder
+        emits only quarantine MOVEs, router emits only Skipped sections."""
+        from fda.organize import organize
+
+        workspace = quarantine_only_workspace
+        # The classifier short-circuits before any LLM call, so the scripted
+        # backend never sees a summarizer/Stage A/Stage B payload. A bare
+        # MagicMock with a never-called .complete is enough here.
+        backend = MagicMock()
+        organize(
+            str(workspace),
+            instructions="",
+            backend=backend,
+            allowed_roots=[workspace.parent],
+        )
+        assert backend.complete.call_count == 0
+        assert (workspace / "_NoExtractor" / "doc" / "a.doc").exists()
+        assert (workspace / "_NoExtractor" / "xls" / "b.xls").exists()
+        md = (workspace / "routing-report.md").read_text(encoding="utf-8")
+        assert "건너뜀: 2 (추출기 없음 2, 추출 실패 0)" in md

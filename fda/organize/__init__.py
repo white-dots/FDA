@@ -65,17 +65,26 @@ def organize(
         groupings = classifier.classify(
             catalog, instructions, backend=backend, logger=olog,
         )
-        # Filter junk: Classifier only emits groupings over non-junk entries
-        # (real = [e for e in catalog.entries if not e.is_junk]), so
-        # path_by_id should mirror that. Including junk here would trip
-        # PlanBuilder's overlap check between grouped sources and junk_paths.
-        path_by_id = {e.path_id: e.path for e in catalog.entries if not e.is_junk}
+        from fda.organize.models import quarantine_bucket
+        # Partition catalog. Classifier-aligned id map covers only files the
+        # classifier actually saw (non-junk, extractable). Junk goes through
+        # the DELETE path; quarantine goes through the MOVE path to a
+        # dedicated bucket; both are surfaced separately from path_by_id.
+        extractable = [
+            e for e in catalog.entries
+            if not e.is_junk and quarantine_bucket(e) is None
+        ]
+        quarantine_entries = [
+            e for e in catalog.entries if quarantine_bucket(e) is not None
+        ]
+        path_by_id = {e.path_id: e.path for e in extractable}
         junk_paths = [e.path for e in catalog.entries if e.is_junk]
         plan = plan_builder.build(
             target_dir=str(target_path),
             groupings=groupings,
             path_by_id=path_by_id,
             junk_paths=junk_paths,
+            quarantine=quarantine_entries,
         )
         log_path_str = str(olog.path) if olog.path else None
         plan = Plan(
@@ -164,6 +173,7 @@ def organize(
                     backend=backend,
                     logger=olog,
                     outcomes=result.outcomes,
+                    plan=plan,
                 )
             except Exception as e:  # noqa: BLE001
                 # Don't fail the whole organize run if routing fails — log
