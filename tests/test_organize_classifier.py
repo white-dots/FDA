@@ -1502,3 +1502,74 @@ class TestStructuralSectionsRegressions:
             f"expected ≥2 categories from 2 distinct shapes; got "
             f"{[c.category_name for c in taxonomy.categories]}"
         )
+
+
+class TestQuarantineFiltering:
+    """Classifier never sees entries that the reader put into quarantine."""
+
+    def _entry(self, idx, *, extract_status="ok", summary_failed=False, is_junk=False):
+        from fda.organize.models import CatalogEntry
+        return CatalogEntry(
+            path_id=f"f{idx:03d}",
+            path=f"/tmp/x/{idx}.txt",
+            ext=".txt",
+            size_bytes=10,
+            summary="" if extract_status != "ok" else "doc summary",
+            type_label="" if extract_status != "ok" else "doc",
+            is_junk=is_junk,
+            summary_failed=summary_failed,
+            extract_status=extract_status,
+        )
+
+    def test_empty_extractable_subset_returns_empty_groupings_without_calling_backend(
+        self, tmp_path
+    ):
+        """All-quarantine catalog → no skill load, no LLM call."""
+        from unittest.mock import MagicMock
+
+        from fda.organize import classifier
+        from fda.organize._logger import OrganizeLogger
+        from fda.organize.models import Catalog
+
+        backend = MagicMock()
+        catalog = Catalog(
+            target=str(tmp_path),
+            entries=(
+                self._entry(0, extract_status="no_extractor"),
+                self._entry(1, extract_status="failed"),
+            ),
+            git_repos_skipped=(),
+        )
+        log = OrganizeLogger(log_path=tmp_path / "c.log", target_basename="ws")
+        groupings = classifier.classify(catalog, "", backend=backend, logger=log)
+        assert groupings.items == ()
+        assert groupings.overall_reason == ""
+        assert backend.complete.call_count == 0
+
+    def test_failed_summary_threshold_uses_extractable_denominator(self, tmp_path):
+        """Threshold over extractable subset, not over all non-junk entries.
+
+        Catalog: 1 extractable+summary_failed + 3 quarantine. The threshold
+        is 25%; over `real` (4) the rate is 25% (≤ threshold, OK), but over
+        the extractable subset (1) the rate is 100% — must raise.
+        """
+        from unittest.mock import MagicMock
+
+        from fda.organize import classifier
+        from fda.organize._logger import OrganizeLogger
+        from fda.organize.models import Catalog
+
+        backend = MagicMock()
+        catalog = Catalog(
+            target=str(tmp_path),
+            entries=(
+                self._entry(0, extract_status="ok", summary_failed=True),
+                self._entry(1, extract_status="no_extractor"),
+                self._entry(2, extract_status="no_extractor"),
+                self._entry(3, extract_status="no_extractor"),
+            ),
+            git_repos_skipped=(),
+        )
+        log = OrganizeLogger(log_path=tmp_path / "c.log", target_basename="ws")
+        with pytest.raises(classifier.ClassifierUnreliableInputError):
+            classifier.classify(catalog, "", backend=backend, logger=log)

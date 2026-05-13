@@ -585,33 +585,40 @@ def classify(
     backend,
     logger: OrganizeLogger,
 ) -> Groupings:
+    from fda.organize.models import quarantine_bucket
+
     real = [e for e in catalog.entries if not e.is_junk]
-    if not real:
+    extractable = [e for e in real if quarantine_bucket(e) is None]
+
+    if not extractable:
+        # All non-junk files were unextractable — nothing for the LLM to
+        # classify. Skip skill loading and the LLM call entirely.
         logger.log("CLASSIFIER_START", catalog_size=0)
         logger.log("CLASSIFIER_DONE", elapsed_ms=0)
         return Groupings(items=(), overall_reason="")
 
-    failed = [e for e in real if e.summary_failed]
-    if real and len(failed) / len(real) > READER_FAILED_SUMMARY_THRESHOLD:
+    failed = [e for e in extractable if e.summary_failed]
+    if len(failed) / len(extractable) > READER_FAILED_SUMMARY_THRESHOLD:
         logger.log(
             "CLASSIFIER_UNRELIABLE",
-            failed_pct=int(100 * len(failed) / len(real)),
+            failed_pct=int(100 * len(failed) / len(extractable)),
         )
         raise ClassifierUnreliableInputError(
-            f"{len(failed)} of {len(real)} catalog entries have failed summaries"
+            f"{len(failed)} of {len(extractable)} extractable catalog entries "
+            "have failed summaries"
         )
 
     proposer_skill = _skills.load_skill(_PROPOSER_SKILL_DIR)
     assigner_skill = _skills.load_skill(_ASSIGNER_SKILL_DIR)
 
-    sample = _sample_for_taxonomy(real, catalog.target)
+    sample = _sample_for_taxonomy(extractable, catalog.target)
     logger.log(
-        "CLASSIFIER_START", catalog_size=len(real),
+        "CLASSIFIER_START", catalog_size=len(extractable),
     )
     logger.log(
         "TAXONOMY_SAMPLE_DONE",
         size=len(sample),
-        strategy="full" if len(real) <= TAXONOMY_SAMPLE_FULL_THRESHOLD else "stratified",
+        strategy="full" if len(extractable) <= TAXONOMY_SAMPLE_FULL_THRESHOLD else "stratified",
     )
 
     t0 = time.monotonic()
@@ -619,18 +626,18 @@ def classify(
         sample, instructions, backend=backend, logger=logger, skill=proposer_skill,
     )
     assignments = _run_stage_b(
-        real, taxonomy, instructions,
+        extractable, taxonomy, instructions,
         backend=backend, logger=logger, skill=assigner_skill,
     )
 
     fallback_name = taxonomy.fallback_category.category_name
     fb_count = sum(1 for v in assignments.values() if v == fallback_name)
 
-    if MAX_TAXONOMY_REFINEMENTS > 0 and real:
-        rate = fb_count / len(real)
+    if MAX_TAXONOMY_REFINEMENTS > 0 and extractable:
+        rate = fb_count / len(extractable)
         if (rate > MAX_FALLBACK_RATE) and (fb_count >= MIN_FALLBACK_REFINE_COUNT):
             logger.log("CLASSIFIER_REFINE", fallback_count=fb_count, rate=int(rate * 100))
-            exemplars = [e for e in real if assignments.get(e.path_id) == fallback_name]
+            exemplars = [e for e in extractable if assignments.get(e.path_id) == fallback_name]
             if len(exemplars) > TAXONOMY_SAMPLE_FALLBACK_BUDGET:
                 exemplars = exemplars[:TAXONOMY_SAMPLE_FALLBACK_BUDGET]
             taxonomy_v2 = _propose_taxonomy(
@@ -639,7 +646,7 @@ def classify(
                 extra_exemplars=exemplars,
             )
             assignments = _run_stage_b(
-                real, taxonomy_v2, instructions,
+                extractable, taxonomy_v2, instructions,
                 backend=backend, logger=logger, skill=assigner_skill,
             )
             taxonomy = taxonomy_v2
@@ -648,7 +655,7 @@ def classify(
             # against the *current* taxonomy.
             fallback_name = taxonomy.fallback_category.category_name
             fb_count = sum(1 for v in assignments.values() if v == fallback_name)
-            rate = fb_count / len(real)
+            rate = fb_count / len(extractable)
             if rate > MAX_FALLBACK_RATE:
                 logger.log("CLASSIFIER_FALLBACK_HIGH", rate=int(rate * 100))
 
