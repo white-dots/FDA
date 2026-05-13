@@ -383,6 +383,48 @@ class TestLock:
         with acquire_lock(lock_path):
             pass
 
+    def test_lock_busy_across_processes(self, tmp_path):
+        """The lock primitive must surface contention BETWEEN PROCESSES,
+        not just within one process. Spawn a subprocess that grabs the
+        lock and holds it, then assert the parent's acquire_lock raises
+        LockBusy. This is the real-world failure mode.
+        """
+        import subprocess
+        import sys
+        import textwrap
+        import time
+
+        lock_path = tmp_path / "m.db.lock"
+        holder_script = textwrap.dedent(f"""
+            import sys, time, fcntl
+            from pathlib import Path
+            sys.path.insert(0, {str(Path(__file__).parent.parent)!r})
+            from fda.metadata.store import acquire_lock
+            with acquire_lock({str(lock_path)!r}):
+                print("HELD", flush=True)
+                time.sleep(2.0)
+        """)
+        proc = subprocess.Popen(
+            [sys.executable, "-c", holder_script],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            # Wait for the subprocess to print HELD (lock acquired).
+            line = proc.stdout.readline().strip()
+            assert line == "HELD", f"holder failed: {line!r}; stderr: {proc.stderr.read()}"
+
+            from fda.metadata.store import acquire_lock, LockBusy
+            with pytest.raises(LockBusy):
+                with acquire_lock(lock_path):
+                    pass  # never reached
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+
 
 class TestPrune:
     def test_prune_removes_paths_under_target_not_seen_this_run(self, tmp_path):
