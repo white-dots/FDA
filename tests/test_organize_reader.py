@@ -239,18 +239,130 @@ class TestNoDenylistShortCircuit:
         assert "exe-text" in first.kwargs.get("messages")[0]["content"]
 
 
-class TestNoExtractorStub:
-    def test_unknown_extension_sends_stub(self, workspace, fake_backend, logger):
+class TestQuarantineShortCircuit:
+    """Reader does NOT call backend.complete for unextractable files.
+
+    `_extractors.extract` returning a non-"ok" status diverts the file
+    into a quarantine CatalogEntry with empty summary/type_label and
+    quarantine_note carrying the extractor's note.
+    """
+
+    def test_no_extractor_skips_backend_call(self, workspace, fake_backend, logger):
         from fda.organize import reader
 
         (workspace / "a.zzz").write_bytes(b"\x00")
         catalog = reader.read(workspace, backend=fake_backend, logger=logger)
         e = catalog.entries[0]
         assert e.extract_status == "no_extractor"
-        # Backend was called and given a stub describing the file.
-        first = fake_backend.complete.call_args_list[0]
-        msg = first.kwargs.get("messages")[0]["content"]
-        assert "no_extractor" in msg or "binary" in msg or "stub" in msg
+        assert e.summary == ""
+        assert e.type_label == ""
+        assert e.is_junk is False
+        assert e.summary_failed is False
+        assert e.quarantine_note == ""
+        # Backend never called for the quarantined file
+        assert fake_backend.complete.call_count == 0
+
+    def test_failed_extraction_skips_backend_call_and_keeps_note(
+        self, workspace, fake_backend, logger, monkeypatch
+    ):
+        from fda.organize import _extractors, reader
+        from fda.organize.models import ExtractionResult
+
+        (workspace / "scan.pdf").write_bytes(b"%PDF-1.4 fake")
+
+        def fake_pdf(_path):
+            return ExtractionResult(
+                text=None, status="failed",
+                note="pdftotext produced no text (image-only PDF?)",
+            )
+
+        monkeypatch.setitem(_extractors.EXTRACTORS, ".pdf", fake_pdf)
+        catalog = reader.read(workspace, backend=fake_backend, logger=logger)
+        e = catalog.entries[0]
+        assert e.extract_status == "failed"
+        assert e.summary == ""
+        assert e.type_label == ""
+        assert e.summary_failed is False
+        assert e.quarantine_note == "pdftotext produced no text (image-only PDF?)"
+        assert fake_backend.complete.call_count == 0
+
+    def test_tool_missing_skips_backend_call(
+        self, workspace, fake_backend, logger, monkeypatch
+    ):
+        from fda.organize import _extractors, reader
+        from fda.organize.models import ExtractionResult
+
+        (workspace / "scan.pdf").write_bytes(b"%PDF-1.4 fake")
+
+        def fake_pdf(_path):
+            return ExtractionResult(text=None, status="tool_missing", note="pdftotext")
+
+        monkeypatch.setitem(_extractors.EXTRACTORS, ".pdf", fake_pdf)
+        catalog = reader.read(workspace, backend=fake_backend, logger=logger)
+        e = catalog.entries[0]
+        assert e.extract_status == "tool_missing"
+        assert e.summary == ""
+        assert e.quarantine_note == "pdftotext"
+        assert fake_backend.complete.call_count == 0
+
+    def test_ok_extraction_still_routes_through_backend(
+        self, workspace, fake_backend, logger
+    ):
+        """Regression: status='ok' must still call the LLM summary path."""
+        from fda.organize import reader
+
+        (workspace / "a.txt").write_text("hello")
+        catalog = reader.read(workspace, backend=fake_backend, logger=logger)
+        e = catalog.entries[0]
+        assert e.extract_status == "ok"
+        assert e.summary == "x"
+        assert e.quarantine_note == ""
+        assert fake_backend.complete.call_count == 1
+
+    def test_junk_extractor_state_does_not_become_quarantine(
+        self, workspace, fake_backend, logger
+    ):
+        """Junk files keep their is_junk=True/type_label='junk' identity,
+        even though their extract_status is 'no_extractor'."""
+        from fda.organize import reader
+        from fda.organize.models import quarantine_bucket
+
+        (workspace / ".DS_Store").write_bytes(b"\x00")
+        catalog = reader.read(workspace, backend=fake_backend, logger=logger)
+        e = next(c for c in catalog.entries if c.path.endswith(".DS_Store"))
+        assert e.is_junk is True
+        assert e.type_label == "junk"
+        assert quarantine_bucket(e) is None
+
+
+class TestReaderQuarantineLogEvent:
+    def test_reader_quarantine_event_emitted(self, workspace, fake_backend, tmp_path):
+        from fda.organize import reader
+        from fda.organize._logger import OrganizeLogger
+
+        log = OrganizeLogger(log_path=tmp_path / "r.log", target_basename="ws")
+        (workspace / "a.zzz").write_bytes(b"\x00")
+        reader.read(workspace, backend=fake_backend, logger=log)
+        log_text = (tmp_path / "r.log").read_text(encoding="utf-8")
+        assert "READER_QUARANTINE" in log_text
+        assert "no_extractor" in log_text
+
+    def test_reader_end_excludes_quarantine_from_ok_count(
+        self, workspace, fake_backend, tmp_path
+    ):
+        from fda.organize import reader
+        from fda.organize._logger import OrganizeLogger
+
+        log = OrganizeLogger(log_path=tmp_path / "r.log", target_basename="ws")
+        (workspace / "a.txt").write_text("hi")     # ok
+        (workspace / "b.zzz").write_bytes(b"\x00")  # no_extractor
+        reader.read(workspace, backend=fake_backend, logger=log)
+        log_text = (tmp_path / "r.log").read_text(encoding="utf-8")
+        assert "READER_END" in log_text
+        # OrganizeLogger.log writes fields as `key=value` (see _logger.py:102),
+        # not JSON. The ok count excludes the quarantine entry.
+        assert "ok=1" in log_text
+        assert "quarantine=1" in log_text
 
 
 class TestSkillLoaderUnit:

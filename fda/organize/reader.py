@@ -22,7 +22,7 @@ from typing import Iterable
 
 from fda.organize import _extractors, _fs, _skills
 from fda.organize._logger import OrganizeLogger
-from fda.organize.models import Catalog, CatalogEntry, ExtractionResult
+from fda.organize.models import Catalog, CatalogEntry, ExtractionResult, quarantine_bucket
 
 logger = logging.getLogger(__name__)
 
@@ -73,30 +73,35 @@ def _walk(target: Path) -> tuple[list[Path], list[str]]:
     return files, skipped
 
 
+def _quarantine_entry(path: Path, size: int, extraction: ExtractionResult) -> CatalogEntry:
+    return CatalogEntry(
+        path_id="",  # filled in by caller after global sort
+        path=str(path),
+        ext=path.suffix.lower(),
+        size_bytes=size,
+        summary="",
+        type_label="",
+        is_junk=False,
+        summary_failed=False,
+        extract_status=extraction.status,
+        verbatim_head="",
+        sections=(),
+        quarantine_note=extraction.note or "",
+    )
+
+
 def _build_user_message(path: Path, ext_text: ExtractionResult, size_bytes: int) -> str:
-    if ext_text.status == "ok" and ext_text.text is not None:
-        text = ext_text.text
-        if len(text.encode("utf-8")) > READER_TEXT_CAP_BYTES:
-            # Truncate by bytes, then redecode safely.
-            encoded = text.encode("utf-8")[:READER_TEXT_CAP_BYTES]
-            text = encoded.decode("utf-8", errors="replace")
-            text = _TRUNCATE_MARKER + text
-        body = text
-    elif ext_text.status == "no_extractor":
-        body = (
-            f"(stub: no_extractor; classify by filename/extension/size — "
-            f"binary or unsupported format, size={size_bytes} bytes)"
-        )
-    elif ext_text.status == "tool_missing":
-        body = f"(stub: tool_missing — {ext_text.note}; size={size_bytes} bytes)"
-    else:
-        body = f"(stub: extraction failed — {ext_text.note}; size={size_bytes} bytes)"
+    text = ext_text.text or ""
+    if len(text.encode("utf-8")) > READER_TEXT_CAP_BYTES:
+        encoded = text.encode("utf-8")[:READER_TEXT_CAP_BYTES]
+        text = encoded.decode("utf-8", errors="replace")
+        text = _TRUNCATE_MARKER + text
     return (
         f"PATH: {path}\n"
         f"EXT: {path.suffix.lower()}\n"
         f"SIZE_BYTES: {size_bytes}\n"
         f"---\n"
-        f"{body}\n"
+        f"{text}\n"
     )
 
 
@@ -109,11 +114,14 @@ def _summarize_one(
 ) -> tuple[CatalogEntry, str, str]:
     """Returns (entry, log_event_kind, detail).
 
-    log_event_kind is 'done', 'timeout', or 'fail'.
-    detail carries a human-readable description for failure logs.
+    log_event_kind is 'done', 'timeout', 'fail', or 'quarantine'.
+    'quarantine' is emitted when the extractor returned a non-'ok' status;
+    no LLM call is made and detail carries the extractor's note (or '').
     """
     size = path.stat().st_size
     extraction = _extractors.extract(path)
+    if extraction.status != "ok":
+        return _quarantine_entry(path, size, extraction), "quarantine", extraction.note or ""
     head = _verbatim_head(extraction)
     user = _build_user_message(path, extraction, size)
     try:
@@ -289,6 +297,13 @@ def read(
                     extract_status=entry.extract_status,
                     elapsed_ms=elapsed_ms,
                 )
+            elif kind == "quarantine":
+                logger.log(
+                    "READER_QUARANTINE",
+                    path=str(p),
+                    extract_status=entry.extract_status,
+                    note=detail,
+                )
             else:
                 if kind == "deadline":
                     logger.log("READER_DEADLINE", path=str(p), remaining=0)
@@ -316,12 +331,20 @@ def read(
             extract_status=e.extract_status,
             verbatim_head=e.verbatim_head,
             sections=e.sections,
+            quarantine_note=e.quarantine_note,
         )
         for idx, e in enumerate(ordered)
     )
-    ok = sum(1 for e in finalized if not e.summary_failed and not e.is_junk)
+    quarantine_count = sum(1 for e in finalized if quarantine_bucket(e) is not None)
+    ok = sum(
+        1 for e in finalized
+        if not e.summary_failed and not e.is_junk and quarantine_bucket(e) is None
+    )
     failed = sum(1 for e in finalized if e.summary_failed)
-    logger.log("READER_END", ok=ok, failed=failed, total=len(finalized))
+    logger.log(
+        "READER_END",
+        ok=ok, failed=failed, quarantine=quarantine_count, total=len(finalized),
+    )
     return Catalog(
         target=str(target),
         entries=finalized,
