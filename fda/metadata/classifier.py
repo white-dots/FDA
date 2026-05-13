@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass, field
 from typing import Any
 
 from pydantic import ValidationError
@@ -110,3 +111,86 @@ def apply_fail_closed_override(
         })
         return replaced, True
     return record, False
+
+
+@dataclass
+class BisectResult:
+    """Aggregated outcome of one classify_with_retry_and_bisect call.
+
+    records_by_path_id: successful classifications keyed by path_id.
+    failed_path_ids: files whose single-file probe failed twice — these
+        get fail-closed rows downstream (extract_status='failed',
+        confidentiality='restricted', confidence=0.0).
+    batches_retried: count of top-level retries (each batch's second
+        attempt counts once regardless of bisect depth).
+    batches_total: count of distinct batches attempted, including
+        bisect sub-batches. Useful for cost accounting.
+    """
+    records_by_path_id: dict[str, Classification] = field(default_factory=dict)
+    failed_path_ids: list[str] = field(default_factory=list)
+    batches_retried: int = 0
+    batches_total: int = 0
+
+
+def classify_with_retry_and_bisect(
+    *,
+    files: list[dict[str, Any]],
+    backend,
+    skill,
+    business_context: str,
+) -> BisectResult:
+    """Classify `files` with: first-attempt → retry-whole-batch → bisect.
+
+    Algorithm per spec § Retry + bisect policy:
+    1. Attempt the batch.
+    2. On ClassifierResponseError, retry once.
+    3. On second failure, split in half and recurse.
+    4. On single-file double-failure, mark the file failed and return.
+
+    Returns a BisectResult with successful records keyed by path_id and
+    a list of path_ids that failed both attempts at single-file
+    granularity.
+    """
+    result = BisectResult()
+    _bisect(files=files, backend=backend, skill=skill,
+            business_context=business_context, out=result)
+    return result
+
+
+def _bisect(*, files, backend, skill, business_context, out: BisectResult) -> None:
+    """Recursive worker for classify_with_retry_and_bisect."""
+    out.batches_total += 1
+    # Attempt 1
+    try:
+        records = classify_batch(
+            files=files, backend=backend, skill=skill,
+            business_context=business_context,
+        )
+        for f, r in zip(files, records):
+            out.records_by_path_id[f["path_id"]] = r
+        return
+    except ClassifierResponseError as e:
+        logger.warning("metadata classifier attempt 1 failed (n=%d): %s",
+                       len(files), e)
+    # Attempt 2 (whole-batch retry)
+    out.batches_retried += 1
+    try:
+        records = classify_batch(
+            files=files, backend=backend, skill=skill,
+            business_context=business_context,
+        )
+        for f, r in zip(files, records):
+            out.records_by_path_id[f["path_id"]] = r
+        return
+    except ClassifierResponseError as e:
+        logger.warning("metadata classifier attempt 2 failed (n=%d): %s",
+                       len(files), e)
+    # Both attempts failed.
+    if len(files) == 1:
+        out.failed_path_ids.append(files[0]["path_id"])
+        return
+    mid = len(files) // 2
+    _bisect(files=files[:mid], backend=backend, skill=skill,
+            business_context=business_context, out=out)
+    _bisect(files=files[mid:], backend=backend, skill=skill,
+            business_context=business_context, out=out)
