@@ -15,7 +15,8 @@ DEPARTMENTS: tuple[str, ...] = (
 )
 
 DOCUMENT_TYPES: tuple[str, ...] = (
-    "invoice", "contract", "report", "proposal", "memo",
+    "invoice", "purchase_order", "shipping_order",
+    "contract", "report", "proposal", "memo",
     "policy", "presentation", "spreadsheet", "image", "data",
     "archive", "correspondence", "unknown",
 )
@@ -39,6 +40,8 @@ _DEPARTMENT_KO: dict[str, str] = {
 
 _DOCUMENT_TYPE_KO: dict[str, str] = {
     "invoice": "청구서",
+    "purchase_order": "발주서",
+    "shipping_order": "출하지시서",
     "contract": "계약서",
     "report": "보고서",
     "proposal": "제안서",

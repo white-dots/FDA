@@ -23,7 +23,8 @@ Department = Literal[
     "legal", "operations", "marketing", "executive", "unknown",
 ]
 DocumentType = Literal[
-    "invoice", "contract", "report", "proposal", "memo",
+    "invoice", "purchase_order", "shipping_order",
+    "contract", "report", "proposal", "memo",
     "policy", "presentation", "spreadsheet", "image", "data",
     "archive", "correspondence", "unknown",
 ]

@@ -21,7 +21,8 @@ class TestVocab:
 
     def test_document_type_codes(self):
         from fda.metadata.vocab import DOCUMENT_TYPES
-        assert {"invoice", "contract", "report", "proposal", "memo",
+        assert {"invoice", "purchase_order", "shipping_order",
+                "contract", "report", "proposal", "memo",
                 "policy", "presentation", "spreadsheet", "image", "data",
                 "archive", "correspondence", "unknown"}.issubset(set(DOCUMENT_TYPES))
 

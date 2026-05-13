@@ -13,7 +13,7 @@ Output schema (per record, all fields REQUIRED, NO unknown keys):
 ```
 {
   "department": "<one of: sales|finance|hr|production|rd|legal|operations|marketing|executive|unknown>",
-  "document_type": "<one of: invoice|contract|report|proposal|memo|policy|presentation|spreadsheet|image|data|archive|correspondence|unknown>",
+  "document_type": "<one of: invoice|purchase_order|shipping_order|contract|report|proposal|memo|policy|presentation|spreadsheet|image|data|archive|correspondence|unknown>",
   "confidentiality": "<one of: public|internal|confidential|restricted>",
   "summary": "<one short paragraph (~2 sentences) in the file's source language>",
   "keywords": {"ko": ["..."], "en": ["..."]},
