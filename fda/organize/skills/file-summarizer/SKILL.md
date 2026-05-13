@@ -25,6 +25,7 @@ Rules:
 - Output ONLY the JSON object. No prose, no markdown fences.
 - `type_label` is a short tag like `invoice`, `meeting-notes`, `python-source`, `image`, `archive`. Lowercase-with-dashes.
 - `summary` is one sentence. Do not exceed 200 characters. Do not include the file path.
+- Write `summary` in the document's source language. If the extracted text is Korean, write the summary in Korean. If English, write it in English. `type_label` stays English lowercase-with-dashes regardless of content language. If no text is available (extraction failed, no extractor, opaque binary), write the summary in English.
 - You DO NOT decide whether the file is junk. Junk handling happens elsewhere.
 - If the file is impossible to classify (corrupt, empty, opaque), set `type_label` to `unknown` and write a one-sentence summary saying so.
 
@@ -50,5 +51,5 @@ Type-label grounding rules — important:
 
 Examples:
 - `{"type_label": "invoice", "summary": "Vendor invoice for May services with line items and totals."}`
-- `{"type_label": "python-source", "summary": "Python module defining a small CLI for log file rotation."}`
+- `{"type_label": "visit-report", "summary": "거래처 방문 결과를 기록한 영업팀 보고서로, 일자·담당자·논의 내용이 포함되어 있다."}`
 - `{"type_label": "unknown", "summary": "Binary file of unknown format; classify by filename or extension."}`
