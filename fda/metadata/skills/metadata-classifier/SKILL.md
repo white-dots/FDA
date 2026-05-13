@@ -27,8 +27,12 @@ Output rules:
 - One element per input file, same order.
 - Use ONLY the codes listed above. If unsure, use `unknown` for
   department/document_type. NEVER invent codes.
-- `summary` is in the file's source language (Korean files → Korean
-  summary; English files → English summary). Do NOT translate.
+- `summary` is in the file's source language. Read the `verbatim_head`
+  to determine the language; use `language_hint` (`ko` / `en` /
+  `unknown`) as a fallback when the head is short or ambiguous. Korean
+  content → Korean summary; English content → English summary. Do NOT
+  translate. When `language_hint` is `unknown` and the head is too
+  short to decide, write the summary in English.
 - `keywords.ko` and `keywords.en` are each 0–8 short strings (≤ 4
   words each). Provide both lists; a purely English file gets `"ko":
   []` and vice versa. When a file has both languages, populate both.
