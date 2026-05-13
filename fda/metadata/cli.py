@@ -41,6 +41,11 @@ def handle_metadata(args: argparse.Namespace) -> int:
     except LockBusy as e:
         print(f"⚠ {e}", file=sys.stderr)
         return 1
+    except RuntimeError as e:
+        # FTS5 probe + similar load-bearing errors raise RuntimeError with
+        # an actionable message; print it bare instead of prefixed.
+        print(f"error: {e}", file=sys.stderr)
+        return 1
     except Exception as e:
         logger.exception("fda metadata crashed")
         print(f"error: {type(e).__name__}: {e}", file=sys.stderr)
@@ -68,17 +73,22 @@ def handle_search(args: argparse.Namespace) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 1
     try:
-        hits = search(
-            conn,
-            query=" ".join(args.query) if args.query else "",
-            department=args.department,
-            document_type=args.document_type,
-            confidentiality=args.confidentiality,
-            language=args.language,
-            since=args.since,
-            fail_closed_only=args.fail_closed_only,
-            limit=args.limit,
-        )
+        try:
+            hits = search(
+                conn,
+                query=" ".join(args.query) if args.query else "",
+                department=args.department,
+                document_type=args.document_type,
+                confidentiality=args.confidentiality,
+                language=args.language,
+                since=args.since,
+                fail_closed_only=args.fail_closed_only,
+                limit=args.limit,
+            )
+        except Exception as e:
+            print(f"error: search failed: {type(e).__name__}: {e}",
+                  file=sys.stderr)
+            return 1
     finally:
         conn.close()
     if args.json:

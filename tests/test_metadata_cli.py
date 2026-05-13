@@ -6,12 +6,14 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
 
 WORKTREE = Path(__file__).resolve().parent.parent
-PYTHON = str(WORKTREE / ".venv" / "bin" / "python")
+_VENV_PYTHON = WORKTREE / ".venv" / "bin" / "python"
+PYTHON = str(_VENV_PYTHON) if _VENV_PYTHON.exists() else sys.executable
 
 
 def _run_cli(*args, env=None, cwd=None):
@@ -49,6 +51,42 @@ class TestStandaloneMetadataExit:
         nonexistent = tmp_path / "does_not_exist"
         cp = _run_cli("metadata", str(nonexistent))
         assert cp.returncode == 1
+
+    def test_runtime_error_message_is_bare(self, tmp_path, monkeypatch):
+        """Regression: a RuntimeError from inside metadata_run (e.g. the
+        FTS5 probe) should print a bare error message, not prefixed with
+        the exception class name. Matches handle_search's behavior.
+        """
+        # Force metadata_run to raise RuntimeError via PYTHONPATH-injected
+        # stub module that pretends FTS5 is unavailable. Easier: just
+        # call the handler directly with a monkeypatched metadata_run.
+        import argparse
+        from fda.metadata import cli as cli_mod
+        target_dir = tmp_path / "tree"; target_dir.mkdir()
+        args = argparse.Namespace(path=str(target_dir))
+        # Capture stderr.
+        import io
+        buf_err = io.StringIO()
+        monkeypatch.setattr("sys.stderr", buf_err)
+        # Patch metadata_run to raise RuntimeError.
+        def boom(*a, **kw):
+            raise RuntimeError(
+                "FDA metadata layer requires SQLite ≥ 3.34 with FTS5 + trigram"
+            )
+        monkeypatch.setattr("fda.metadata.run", boom)
+        # Also patch reader.read to avoid the real reader running.
+        monkeypatch.setattr("fda.organize.reader.read",
+                            lambda *a, **kw: MagicMock())
+        # Provide a fake backend so get_claude_backend doesn't error.
+        monkeypatch.setattr("fda.claude_backend.get_claude_backend",
+                            lambda: MagicMock())
+        rc = cli_mod.handle_metadata(args)
+        assert rc == 1
+        err = buf_err.getvalue()
+        # Should NOT contain "RuntimeError:" prefix.
+        assert "RuntimeError" not in err, f"unexpected prefix in: {err!r}"
+        # SHOULD contain the bare message.
+        assert "FTS5" in err
 
 
 class TestSearchKoreanDefault:
