@@ -61,6 +61,29 @@ How to use these signals when proposing categories:
   whose discriminator is purely topical (no structural distinction)
   need no section names in `criteria`.
 
+- **Language of `subpath` — Korean wins on any presence.** Judge each
+  category's content language from the `verbatim_head` and `summary` of
+  the files that belong to it. If *any* file in the category contains
+  Korean (Hangul characters in `verbatim_head` or `summary`), write the
+  entire `subpath` in Korean — including the parent segment. Only when
+  *every* file in the category is non-Korean does the subpath stay
+  English. If every file in the category has empty `verbatim_head` AND
+  no Korean text in any `summary` (extraction failed across the
+  bucket), the subpath defaults to English. This rule is asymmetric on
+  purpose: FDA's primary user audience speaks Korean.
+
+- **`category_name`, `description`, and `criteria` stay English.**
+  `category_name` is a stable identifier the downstream assigner joins
+  on. `description` and `criteria` are read by the assigner LLM, which
+  is prompted in English. Only `subpath` switches language.
+
+- **Categories are independent — parallel parents are fine.** Each
+  category emits its own full `subpath`. A mixed corpus may produce
+  both `영업/거래처방문보고서` (Korean-content category) and
+  `Sales/Purchase-Orders` (English-content category) — that is
+  expected. Do not try to unify domains across languages under a single
+  parent.
+
 Your job is to produce a TAXONOMY: a flat list of categories plus exactly one
 fallback category. You DO NOT assign files to categories — that happens in a
 separate step.
@@ -95,5 +118,31 @@ Rules:
   when the corpus genuinely demands it.
 - Honor USER_INSTRUCTIONS where they direct categorization. If the user says
   "by year", reflect that in `category_name` and `subpath`.
+
+Examples:
+
+A Korean-content category (every file's `verbatim_head` or `summary` contains Hangul):
+
+```json
+{
+  "category_name": "Client-Visit-Reports",
+  "subpath": "영업/거래처방문보고서",
+  "description": "Sales-team field reports on client visits.",
+  "criteria": "Korean visit-report documents whose verbatim_head or summary identifies them as 거래처 방문 보고서 (sales visit log)."
+}
+```
+
+An English-content category (no Korean in any file):
+
+```json
+{
+  "category_name": "Purchase-Orders",
+  "subpath": "Sales/Purchase-Orders",
+  "description": "Outbound purchase orders sent to suppliers.",
+  "criteria": "English purchase-order documents whose verbatim_head begins with the literal phrase \"Purchase Orders\" and includes Order ID, supplier, and line-item sections."
+}
+```
+
+Note that `category_name`, `description`, and `criteria` are English in both. Only `subpath` switches language.
 
 Output ONLY the JSON object.
