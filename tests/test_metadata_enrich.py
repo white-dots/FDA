@@ -58,11 +58,27 @@ class TestLanguage:
 
 
 class TestMtime:
-    def test_returns_iso_8601_utc(self, tmp_path):
+    def test_returns_iso_8601_utc_with_microseconds(self, tmp_path):
         from fda.metadata.enrich import mtime_iso
         p = tmp_path / "a.txt"; p.write_text("x")
         s = mtime_iso(p)
-        # Format: "2026-05-13T..." ending with "Z"
+        # Format example: "2026-05-13T08:30:00.123456Z" — always 6 frac digits.
         assert s.endswith("Z")
         assert "T" in s
         assert s[:4].isdigit()
+        # The "." before microseconds + 6 digits + "Z" = 8 chars at the tail.
+        # i.e. last 8 chars are ".dddddd" + "Z" → ".123456Z" shape.
+        assert s[-8] == "."
+        assert s[-7:-1].isdigit()
+
+    def test_format_is_constant_for_microsecond_aligned_mtime(self, tmp_path):
+        """Even when st_mtime happens to be an integer second, the output
+        must include microseconds (.000000). Otherwise lexicographic sort
+        breaks between mixed-format strings."""
+        import os
+        from fda.metadata.enrich import mtime_iso
+        p = tmp_path / "exact.txt"; p.write_text("x")
+        # Force mtime to an exact integer second.
+        os.utime(p, (1_700_000_000, 1_700_000_000))
+        s = mtime_iso(p)
+        assert s.endswith(".000000Z"), f"expected .000000Z suffix, got {s!r}"

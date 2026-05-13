@@ -52,7 +52,13 @@ def language_of(text: str) -> str:
 
 
 def mtime_iso(path: Path | str) -> str:
-    """File mtime as ISO-8601 UTC ending in Z (seconds resolution)."""
+    """File mtime as ISO-8601 UTC ending in Z, with microsecond resolution.
+
+    Uses `timespec="microseconds"` so the string format is constant — every
+    output has exactly 6 fractional digits. This matters for lexicographic
+    sorting (the DB stores mtime as a string; SQLite ORDER BY uses string
+    comparison) and for detecting same-second file changes.
+    """
     ts = Path(path).stat().st_mtime
-    dt = datetime.fromtimestamp(ts, tz=timezone.utc).replace(microsecond=0)
-    return dt.isoformat().replace("+00:00", "Z")
+    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+    return dt.isoformat(timespec="microseconds").replace("+00:00", "Z")
