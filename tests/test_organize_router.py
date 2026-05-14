@@ -713,3 +713,31 @@ class TestQuarantineRouting:
             target_path=target, backend=backend, logger=log, plan=plan,
         )
         assert report.quarantine == ()
+
+
+def test_router_routing_report_files_pinned_are_relative_paths(tmp_path):
+    """RoutingReport.files_pinned holds paths relative to target_root, sorted."""
+    from unittest.mock import MagicMock
+    from fda.organize import router
+    from fda.organize.models import Catalog, Groupings, Plan
+
+    target = tmp_path
+    catalog = Catalog(
+        target=str(target),
+        entries=(),
+        git_repos_skipped=(),
+        files_pinned=(
+            str(target / "manifest.csv"),
+            str(target / "README.md"),
+        ),
+    )
+    plan = Plan(
+        target=str(target), instructions="", operations=(),
+        grouping_summary="",
+    )
+    report = router.route(
+        catalog=catalog, groupings=Groupings(items=(), overall_reason=""),
+        target_path=target, backend=MagicMock(), logger=_Logger(),
+        plan=plan,
+    )
+    assert report.files_pinned == ("README.md", "manifest.csv")

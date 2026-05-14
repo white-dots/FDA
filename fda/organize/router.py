@@ -456,6 +456,10 @@ def route(
         target_root=str(target_path),
         categories=tuple(routed),
         quarantine=quarantine_groups,
+        files_pinned=tuple(sorted(
+            str(Path(p).relative_to(target_path))
+            for p in catalog.files_pinned
+        )),
     )
     _write_json_report(report, target_path / "routing-report.json")
     _write_md_report(report, target_path / "routing-report.md")
