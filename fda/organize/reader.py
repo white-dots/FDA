@@ -253,7 +253,13 @@ def read(
     real = [p for p in real if p not in pinned_set]
     pinned = tuple(sorted(str(p) for p in pinned_set))
 
-    logger.log("READER_START", files=len(files), real=len(real), junk=len(junks))
+    for p_abs in pinned:
+        logger.log("READER_PINNED", path=p_abs)
+    logger.log(
+        "READER_START",
+        files=len(files), real=len(real), junk=len(junks),
+        pinned=len(pinned),
+    )
 
     entries_by_path: dict[str, CatalogEntry] = {}
     for j in junks:
@@ -355,7 +361,8 @@ def read(
     failed = sum(1 for e in finalized if e.summary_failed)
     logger.log(
         "READER_END",
-        ok=ok, failed=failed, quarantine=quarantine_count, total=len(finalized),
+        ok=ok, failed=failed, quarantine=quarantine_count,
+        total=len(finalized), pinned=len(pinned),
     )
     return Catalog(
         target=str(target),

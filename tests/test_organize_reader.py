@@ -1158,3 +1158,37 @@ class TestFdaIgnorePinning:
         catalog = reader.read(workspace, backend=fake_backend, logger=logger)
         readme_paths = [p for p in catalog.files_pinned if p.endswith("README.md")]
         assert len(readme_paths) == 1
+
+
+class TestFdaIgnoreLogging:
+    def test_emits_pinned_event_per_pinned_file(self, workspace, fake_backend, logger):
+        from fda.organize import reader
+        (workspace / "manifest.csv").write_text("x")
+        (workspace / "README.md").write_text("x")
+        (workspace / "a.txt").write_text("a")
+        reader.read(workspace, backend=fake_backend, logger=logger)
+        logger.close()
+        log_text = Path(logger.path).read_text(encoding="utf-8")
+        manifest_lines = [
+            ln for ln in log_text.splitlines()
+            if "READER_PINNED" in ln and "manifest.csv" in ln
+        ]
+        readme_lines = [
+            ln for ln in log_text.splitlines()
+            if "READER_PINNED" in ln and "README.md" in ln
+        ]
+        assert len(manifest_lines) == 1
+        assert len(readme_lines) == 1
+
+    def test_reader_start_and_end_carry_pinned_count(self, workspace, fake_backend, logger):
+        from fda.organize import reader
+        (workspace / "manifest.csv").write_text("x")
+        (workspace / "README.md").write_text("x")
+        (workspace / "a.txt").write_text("a")
+        reader.read(workspace, backend=fake_backend, logger=logger)
+        logger.close()
+        log_text = Path(logger.path).read_text(encoding="utf-8")
+        start_line = next(ln for ln in log_text.splitlines() if "READER_START" in ln)
+        end_line = next(ln for ln in log_text.splitlines() if "READER_END" in ln)
+        assert "pinned=2" in start_line
+        assert "pinned=2" in end_line
