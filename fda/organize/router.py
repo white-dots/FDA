@@ -516,6 +516,7 @@ def _report_to_dict(report: RoutingReport) -> dict[str, Any]:
             }
             for g in report.quarantine
         ],
+        "pinned": list(report.files_pinned),
     }
 
 

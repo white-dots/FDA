@@ -772,3 +772,34 @@ def test_router_omits_고정됨_section_when_none(tmp_path):
     _write_md_report(report, md_path)
     body = md_path.read_text(encoding="utf-8")
     assert "## 고정됨" not in body
+
+
+def test_router_json_pinned_key_always_present_when_empty(tmp_path):
+    import json
+    from fda.organize.router import _write_json_report
+    from fda.organize.models import RoutingReport
+
+    p = tmp_path / "routing-report.json"
+    report = RoutingReport(
+        version="1.0", generated_at="t", target_root=str(tmp_path),
+        categories=(),
+    )
+    _write_json_report(report, p)
+    data = json.loads(p.read_text(encoding="utf-8"))
+    assert data["pinned"] == []
+
+
+def test_router_json_pinned_key_when_populated(tmp_path):
+    import json
+    from fda.organize.router import _write_json_report
+    from fda.organize.models import RoutingReport
+
+    p = tmp_path / "routing-report.json"
+    report = RoutingReport(
+        version="1.0", generated_at="t", target_root=str(tmp_path),
+        categories=(),
+        files_pinned=("manifest.csv", "README.md"),
+    )
+    _write_json_report(report, p)
+    data = json.loads(p.read_text(encoding="utf-8"))
+    assert data["pinned"] == ["manifest.csv", "README.md"]
