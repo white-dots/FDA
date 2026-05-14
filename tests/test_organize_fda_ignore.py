@@ -62,3 +62,49 @@ def test_load_patterns_empty_or_comments_only_returns_defaults(tmp_path):
     )
     result = load_patterns(tmp_path)
     assert result == tuple(sorted(BUILTIN_DEFAULTS))
+
+
+def test_load_patterns_falls_back_to_defaults_on_decode_error(tmp_path, caplog):
+    from fda.organize._fda_ignore import BUILTIN_DEFAULTS, load_patterns
+    # Bytes that are not valid UTF-8 (0xff start byte).
+    (tmp_path / ".fda-ignore").write_bytes(b"\xff\xfe\xfd")
+    with caplog.at_level("WARNING"):
+        result = load_patterns(tmp_path)
+    assert result == tuple(sorted(BUILTIN_DEFAULTS))
+    assert any(".fda-ignore unreadable" in r.message for r in caplog.records)
+
+
+def test_load_patterns_falls_back_to_defaults_on_unreadable_file(
+    tmp_path, caplog, monkeypatch,
+):
+    from pathlib import Path
+    from fda.organize._fda_ignore import BUILTIN_DEFAULTS, load_patterns
+    (tmp_path / ".fda-ignore").write_text("manifest.csv\n")
+    real_read_text = Path.read_text
+
+    def fake_read_text(self, *args, **kwargs):
+        if self.name == ".fda-ignore":
+            raise PermissionError("forced for test")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", fake_read_text)
+    with caplog.at_level("WARNING"):
+        result = load_patterns(tmp_path)
+    assert result == tuple(sorted(BUILTIN_DEFAULTS))
+    assert any(".fda-ignore unreadable" in r.message for r in caplog.records)
+
+
+def test_load_patterns_when_fda_ignore_is_directory(tmp_path):
+    from fda.organize._fda_ignore import BUILTIN_DEFAULTS, load_patterns
+    (tmp_path / ".fda-ignore").mkdir()
+    result = load_patterns(tmp_path)
+    assert result == tuple(sorted(BUILTIN_DEFAULTS))
+
+
+def test_load_patterns_follows_symlink_to_regular_file(tmp_path):
+    from fda.organize._fda_ignore import BUILTIN_DEFAULTS, load_patterns
+    real = tmp_path / "real.txt"
+    real.write_text("inventory.csv\n")
+    (tmp_path / ".fda-ignore").symlink_to(real)
+    result = load_patterns(tmp_path)
+    assert result == tuple(sorted(BUILTIN_DEFAULTS)) + ("inventory.csv",)
