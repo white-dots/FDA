@@ -1192,3 +1192,68 @@ class TestFdaIgnoreLogging:
         end_line = next(ln for ln in log_text.splitlines() if "READER_END" in ln)
         assert "pinned=2" in start_line
         assert "pinned=2" in end_line
+
+
+class TestFdaIgnoreEdgeCases:
+    def test_junk_filename_in_ignore_is_still_deleted(
+        self, workspace, fake_backend, logger,
+    ):
+        from fda.organize import reader
+        (workspace / ".fda-ignore").write_text(".DS_Store\n")
+        (workspace / ".DS_Store").write_bytes(b"\x00")
+        (workspace / "a.txt").write_text("a")
+        catalog = reader.read(workspace, backend=fake_backend, logger=logger)
+        # .DS_Store is a junk entry, not pinned.
+        ds_pinned = any(p.endswith(".DS_Store") for p in catalog.files_pinned)
+        assert not ds_pinned
+        ds_entry = next(
+            (e for e in catalog.entries if e.path.endswith(".DS_Store")), None,
+        )
+        assert ds_entry is not None and ds_entry.is_junk
+
+    def test_fda_ignore_is_directory_falls_back_to_defaults(
+        self, workspace, fake_backend, logger,
+    ):
+        from fda.organize import reader
+        (workspace / ".fda-ignore").mkdir()
+        (workspace / "manifest.csv").write_text("id\n1\n")
+        (workspace / "a.txt").write_text("a")
+        catalog = reader.read(workspace, backend=fake_backend, logger=logger)
+        # Default pinning of manifest.csv still applies.
+        pinned_names = {Path(p).name for p in catalog.files_pinned}
+        assert "manifest.csv" in pinned_names
+
+    def test_fda_ignore_is_symlink_is_followed(
+        self, workspace, fake_backend, logger,
+    ):
+        from fda.organize import reader
+        real = workspace / "real_ignore.txt"
+        real.write_text("inventory.csv\n")
+        (workspace / ".fda-ignore").symlink_to(real)
+        (workspace / "inventory.csv").write_text("sku\n1\n")
+        catalog = reader.read(workspace, backend=fake_backend, logger=logger)
+        pinned_names = {Path(p).name for p in catalog.files_pinned}
+        assert "inventory.csv" in pinned_names
+
+    def test_symlinked_root_file_not_pinned(
+        self, workspace, fake_backend, logger,
+    ):
+        from fda.organize import reader
+        outside = workspace.parent / "outside.csv"
+        outside.write_text("x")
+        (workspace / "manifest.csv").symlink_to(outside)
+        (workspace / "a.txt").write_text("a")
+        catalog = reader.read(workspace, backend=fake_backend, logger=logger)
+        # _walk skips symlinks → manifest.csv never enters files list.
+        assert all(not p.endswith("manifest.csv") for p in catalog.files_pinned)
+
+    def test_git_repo_target_yields_empty_pinned(
+        self, workspace, fake_backend, logger,
+    ):
+        from fda.organize import reader
+        (workspace / ".git").mkdir()
+        (workspace / "manifest.csv").write_text("id\n1\n")
+        catalog = reader.read(workspace, backend=fake_backend, logger=logger)
+        # _walk early-returns on .git presence → no files, no pinning.
+        assert catalog.files_pinned == ()
+        assert catalog.entries == ()
