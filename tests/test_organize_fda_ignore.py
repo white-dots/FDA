@@ -21,3 +21,10 @@ def test_builtin_defaults_contains_expected_names():
 def test_builtin_defaults_is_frozenset():
     from fda.organize._fda_ignore import BUILTIN_DEFAULTS
     assert isinstance(BUILTIN_DEFAULTS, frozenset)
+
+
+def test_load_patterns_returns_defaults_when_no_file(tmp_path):
+    from fda.organize._fda_ignore import BUILTIN_DEFAULTS, load_patterns
+    result = load_patterns(tmp_path)
+    # Defaults first (sorted), then user (empty).
+    assert result == tuple(sorted(BUILTIN_DEFAULTS))
