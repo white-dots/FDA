@@ -613,4 +613,11 @@ def _write_md_report(report: RoutingReport, path: Path) -> None:
                 )
             lines.append("")
 
+    if report.files_pinned:
+        lines.append(f"## 고정됨 — .fda-ignore ({len(report.files_pinned)})")
+        lines.append("")
+        for rel in report.files_pinned:
+            lines.append(f"- `{rel}`")
+        lines.append("")
+
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")

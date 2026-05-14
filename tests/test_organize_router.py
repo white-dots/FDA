@@ -741,3 +741,34 @@ def test_router_routing_report_files_pinned_are_relative_paths(tmp_path):
         plan=plan,
     )
     assert report.files_pinned == ("README.md", "manifest.csv")
+
+
+def test_router_emits_고정됨_section_when_pinned(tmp_path):
+    from fda.organize.router import _write_md_report
+    from fda.organize.models import RoutingReport
+
+    md_path = tmp_path / "routing-report.md"
+    report = RoutingReport(
+        version="1.0", generated_at="t", target_root=str(tmp_path),
+        categories=(),
+        files_pinned=("README.md", "manifest.csv"),
+    )
+    _write_md_report(report, md_path)
+    body = md_path.read_text(encoding="utf-8")
+    assert "## 고정됨 — .fda-ignore (2)" in body
+    assert "- `README.md`" in body
+    assert "- `manifest.csv`" in body
+
+
+def test_router_omits_고정됨_section_when_none(tmp_path):
+    from fda.organize.router import _write_md_report
+    from fda.organize.models import RoutingReport
+
+    md_path = tmp_path / "routing-report.md"
+    report = RoutingReport(
+        version="1.0", generated_at="t", target_root=str(tmp_path),
+        categories=(),
+    )
+    _write_md_report(report, md_path)
+    body = md_path.read_text(encoding="utf-8")
+    assert "## 고정됨" not in body
