@@ -334,3 +334,60 @@ def test_translate_catalog_for_stage5_forwards_files_pinned():
         "/tmp/x/manifest.csv", "/tmp/x/README.md",
     )
     assert translated.git_repos_skipped == ("/tmp/x/.git",)
+
+
+def test_organize_leaves_manifest_at_root(workspace, tmp_path):
+    """manifest.csv at the root survives organize() untouched."""
+    (workspace / "manifest.csv").write_text("id,name\n1,a\n")
+    backend = _scripted_backend(workspace)
+    result = organize(
+        str(workspace), instructions="", backend=backend,
+        allowed_roots=[tmp_path],
+        route=False, metadata=False,
+    )
+    assert (workspace / "manifest.csv").is_file()
+    assert (workspace / "manifest.csv").read_text() == "id,name\n1,a\n"
+
+
+def test_organize_no_ghost_folders_when_pinned(workspace, tmp_path):
+    """A pinned root file does not anchor a ghost subfolder.
+
+    Setup: place an organizable file in a nested folder (`inbox/`) that the
+    organize pipeline should drain. After the run, the source folder must be
+    gone (verifier rmdir'd it) AND root pinned files must still be there.
+    """
+    (workspace / "manifest.csv").write_text("id\n1\n")
+    (workspace / "README.md").write_text("# x\n")
+    inbox = workspace / "inbox"
+    inbox.mkdir()
+    (inbox / "inner.txt").write_text("inner")  # this file should be organized away
+    backend = _scripted_backend(workspace)
+    result = organize(
+        str(workspace), instructions="", backend=backend,
+        allowed_roots=[tmp_path],
+        route=False, metadata=False,
+    )
+    # Verifier cleaned the emptied inbox folder (it appears in leftover_empty_dirs
+    # because that field tracks dirs the verifier successfully rmdir'd).
+    assert str(inbox) in result.leftover_empty_dirs
+    # Emptied source folder is gone.
+    assert not inbox.exists()
+    # Pinned files still at root.
+    assert (workspace / "manifest.csv").is_file()
+    assert (workspace / "README.md").is_file()
+
+
+def test_pinned_takes_precedence_over_quarantine(workspace, tmp_path):
+    """A pinned filename with an unextractable extension is pinned, not quarantined."""
+    (workspace / ".fda-ignore").write_text("inventory.xyz\n")
+    (workspace / "inventory.xyz").write_bytes(b"\x00\x01\x02")  # unextractable ext
+    backend = _scripted_backend(workspace)
+    result = organize(
+        str(workspace), instructions="", backend=backend,
+        allowed_roots=[tmp_path],
+        route=False, metadata=False,
+    )
+    # File is still at root, was never moved into a quarantine bucket.
+    assert (workspace / "inventory.xyz").is_file()
+    assert not (workspace / "_NoExtractor").exists()
+    assert not (workspace / "_ExtractionFailed").exists()
