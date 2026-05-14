@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Iterable
 
-from fda.organize import _extractors, _fs, _skills
+from fda.organize import _extractors, _fda_ignore, _fs, _skills
 from fda.organize._logger import OrganizeLogger
 from fda.organize.models import Catalog, CatalogEntry, ExtractionResult, quarantine_bucket
 
@@ -241,6 +241,18 @@ def read(
     junks = [p for p in files if _fs.is_junk_file(p)]
     real = [p for p in files if not _fs.is_junk_file(p)]
 
+    # Root-only pin via .fda-ignore.
+    # Order: junks first → junk in .fda-ignore still DELETEd.
+    # Pinning before extraction → pinned files skip the extractor *and*
+    # quarantine entirely.
+    patterns = _fda_ignore.load_patterns(target)
+    pinned_set = {
+        p for p in real
+        if p.parent == target and _fda_ignore.is_pinned(p.name, patterns)
+    }
+    real = [p for p in real if p not in pinned_set]
+    pinned = tuple(sorted(str(p) for p in pinned_set))
+
     logger.log("READER_START", files=len(files), real=len(real), junk=len(junks))
 
     entries_by_path: dict[str, CatalogEntry] = {}
@@ -349,4 +361,5 @@ def read(
         target=str(target),
         entries=finalized,
         git_repos_skipped=tuple(skipped),
+        files_pinned=pinned,
     )

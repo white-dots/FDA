@@ -1086,3 +1086,75 @@ class TestKoreanSectionsThroughReader:
         e = next(c for c in catalog.entries if c.path.endswith("korean_doc.txt"))
         assert e.extract_status == "ok"
         assert e.sections == ("발주서", "회사 정보", "주의사항")
+
+
+class TestFdaIgnorePinning:
+    def test_pins_default_filenames_at_root(self, workspace, fake_backend, logger):
+        from fda.organize import reader
+        (workspace / "manifest.csv").write_text("id\n1\n")
+        (workspace / "README.md").write_text("# project\n")
+        (workspace / "a.txt").write_text("a")
+        catalog = reader.read(workspace, backend=fake_backend, logger=logger)
+        pinned_names = {Path(p).name for p in catalog.files_pinned}
+        assert pinned_names == {"manifest.csv", "README.md"}
+        entry_names = {Path(e.path).name for e in catalog.entries}
+        assert "manifest.csv" not in entry_names
+        assert "README.md" not in entry_names
+        assert "a.txt" in entry_names
+
+    def test_pins_user_patterns_at_root(self, workspace, fake_backend, logger):
+        from fda.organize import reader
+        (workspace / ".fda-ignore").write_text("inventory.csv\n")
+        (workspace / "inventory.csv").write_text("sku\n1\n")
+        (workspace / "a.txt").write_text("a")
+        catalog = reader.read(workspace, backend=fake_backend, logger=logger)
+        pinned_names = {Path(p).name for p in catalog.files_pinned}
+        # inventory.csv (user), plus .fda-ignore itself (default).
+        assert pinned_names == {"inventory.csv", ".fda-ignore"}
+
+    def test_does_not_pin_same_name_in_subfolder(self, workspace, fake_backend, logger):
+        from fda.organize import reader
+        sub = workspace / "sub"
+        sub.mkdir()
+        (sub / "manifest.csv").write_text("id\n1\n")
+        (workspace / "a.txt").write_text("a")
+        catalog = reader.read(workspace, backend=fake_backend, logger=logger)
+        assert catalog.files_pinned == ()
+        entry_names = {Path(e.path).name for e in catalog.entries}
+        assert "manifest.csv" in entry_names
+
+    def test_pinned_files_skip_extractor_and_summary(self, workspace, fake_backend, logger):
+        from fda.organize import reader
+        (workspace / "manifest.csv").write_text("id\n1\n")
+        (workspace / "a.txt").write_text("a")
+        reader.read(workspace, backend=fake_backend, logger=logger)
+        # Backend was called for a.txt only — never for manifest.csv.
+        called_paths = [
+            c.kwargs["messages"][0]["content"]
+            for c in fake_backend.complete.call_args_list
+        ]
+        assert all("manifest.csv" not in body for body in called_paths)
+        assert any("a.txt" in body for body in called_paths)
+
+    def test_catalog_files_pinned_is_sorted(self, workspace, fake_backend, logger):
+        from fda.organize import reader
+        (workspace / "manifest.csv").write_text("x")
+        (workspace / "README.md").write_text("x")
+        (workspace / "LICENSE").write_text("x")
+        (workspace / "a.txt").write_text("a")
+        catalog = reader.read(workspace, backend=fake_backend, logger=logger)
+        assert list(catalog.files_pinned) == sorted(catalog.files_pinned)
+
+    def test_duplicate_patterns_pin_file_once(
+        self, workspace, fake_backend, logger,
+    ):
+        """Two patterns matching one file → file appears in files_pinned exactly once."""
+        from fda.organize import reader
+        # README.md is pinned by both the literal default `README.md` AND the
+        # wildcard default `README.*`. Set semantics in the partition guard
+        # against double-counting.
+        (workspace / "README.md").write_text("# x\n")
+        (workspace / "a.txt").write_text("a")
+        catalog = reader.read(workspace, backend=fake_backend, logger=logger)
+        readme_paths = [p for p in catalog.files_pinned if p.endswith("README.md")]
+        assert len(readme_paths) == 1
