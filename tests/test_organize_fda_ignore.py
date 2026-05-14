@@ -108,3 +108,22 @@ def test_load_patterns_follows_symlink_to_regular_file(tmp_path):
     (tmp_path / ".fda-ignore").symlink_to(real)
     result = load_patterns(tmp_path)
     assert result == tuple(sorted(BUILTIN_DEFAULTS)) + ("inventory.csv",)
+
+
+def test_is_pinned_matches_exact_filename():
+    from fda.organize._fda_ignore import is_pinned
+    assert is_pinned("manifest.csv", ("manifest.csv", "README.md"))
+
+
+def test_is_pinned_matches_wildcard():
+    from fda.organize._fda_ignore import is_pinned
+    patterns = ("README.*",)
+    assert is_pinned("README.md", patterns)
+    assert is_pinned("README.txt", patterns)
+    assert is_pinned("README.rst", patterns)
+
+
+def test_is_pinned_no_match():
+    from fda.organize._fda_ignore import is_pinned
+    assert not is_pinned("data.csv", ("manifest.csv",))
+    assert not is_pinned("readme.md", ("README.md",))  # case-sensitive on POSIX

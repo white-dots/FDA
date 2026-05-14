@@ -41,3 +41,11 @@ def load_patterns(target: Path) -> tuple[str, ...]:
         except (OSError, UnicodeDecodeError) as e:
             logger.warning(".fda-ignore unreadable at %s: %s", ignore_file, e)
     return tuple(sorted(BUILTIN_DEFAULTS)) + tuple(user)
+
+
+def is_pinned(filename: str, patterns: tuple[str, ...]) -> bool:
+    """True iff `filename` matches any of `patterns` via fnmatch.fnmatch.
+
+    Caller is responsible for restricting to root-depth files.
+    """
+    return any(fnmatch.fnmatch(filename, pat) for pat in patterns)
