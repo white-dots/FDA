@@ -318,3 +318,19 @@ class TestQuarantineEndToEnd:
         assert (workspace / "_NoExtractor" / "xls" / "b.xls").exists()
         md = (workspace / "routing-report.md").read_text(encoding="utf-8")
         assert "건너뜀: 2 (추출기 없음 2, 추출 실패 0)" in md
+
+
+def test_translate_catalog_for_stage5_forwards_files_pinned():
+    from fda.organize import _translate_catalog_for_stage5
+    from fda.organize.models import Catalog
+    catalog = Catalog(
+        target="/tmp/x",
+        entries=(),
+        git_repos_skipped=("/tmp/x/.git",),
+        files_pinned=("/tmp/x/manifest.csv", "/tmp/x/README.md"),
+    )
+    translated = _translate_catalog_for_stage5(catalog, outcomes=())
+    assert translated.files_pinned == (
+        "/tmp/x/manifest.csv", "/tmp/x/README.md",
+    )
+    assert translated.git_repos_skipped == ("/tmp/x/.git",)

@@ -54,6 +54,7 @@ def _translate_catalog_for_stage5(catalog, outcomes):
         target=catalog.target,
         entries=translated_entries,
         git_repos_skipped=catalog.git_repos_skipped,
+        files_pinned=catalog.files_pinned,
     )
 
 
