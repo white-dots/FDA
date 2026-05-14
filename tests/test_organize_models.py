@@ -378,3 +378,37 @@ class TestQuarantineDataclasses:
             extract_status="ok",
         )
         assert e.quarantine_note == ""
+
+
+def test_catalog_files_pinned_defaults_to_empty_tuple():
+    from fda.organize.models import Catalog
+    c = Catalog(target="/tmp/x", entries=(), git_repos_skipped=())
+    assert c.files_pinned == ()
+
+
+def test_catalog_files_pinned_can_be_set():
+    from fda.organize.models import Catalog
+    c = Catalog(
+        target="/tmp/x", entries=(), git_repos_skipped=(),
+        files_pinned=("/tmp/x/README.md", "/tmp/x/manifest.csv"),
+    )
+    assert c.files_pinned == ("/tmp/x/README.md", "/tmp/x/manifest.csv")
+
+
+def test_routing_report_files_pinned_defaults_to_empty_tuple():
+    from fda.organize.models import RoutingReport
+    r = RoutingReport(
+        version="1.0", generated_at="t", target_root="/tmp/x",
+        categories=(),
+    )
+    assert r.files_pinned == ()
+
+
+def test_routing_report_files_pinned_can_be_set():
+    from fda.organize.models import RoutingReport
+    r = RoutingReport(
+        version="1.0", generated_at="t", target_root="/tmp/x",
+        categories=(),
+        files_pinned=("README.md", "manifest.csv"),
+    )
+    assert r.files_pinned == ("README.md", "manifest.csv")

@@ -94,6 +94,7 @@ class Catalog:
     target: str
     entries: tuple[CatalogEntry, ...]
     git_repos_skipped: tuple[str, ...]
+    files_pinned: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -205,3 +206,4 @@ class RoutingReport:
     target_root: str
     categories: tuple[RoutedCategory, ...]
     quarantine: tuple[QuarantineGroup, ...] = ()
+    files_pinned: tuple[str, ...] = ()
