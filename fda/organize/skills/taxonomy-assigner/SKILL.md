@@ -7,7 +7,16 @@ model: claude-sonnet-4-6
 You assign each file to exactly one category from a FIXED TAXONOMY.
 
 Input you'll receive (in the user message):
-- USER_INSTRUCTIONS (may be empty — context only)
+- USER_INSTRUCTIONS (may be empty — per-run, transient context)
+- BUSINESS_CONTEXT (may be empty — persistent guidance from
+  `~/.fda/business_context.md`). Use it as standing policy when
+  disambiguating files. The **Document Type Clarifications** and
+  **Internal Codes** sections are most relevant: they tell you what
+  company-specific terms mean (e.g. "보고서 = quarterly summary,"
+  "PR-#### = production-run record"). Treat BUSINESS_CONTEXT as a
+  tie-breaker when filename/`verbatim_head`/`sections` evidence is
+  ambiguous between two taxonomy categories. USER_INSTRUCTIONS still
+  wins on direct conflict.
 - TAXONOMY (JSON): the categories defined in a prior step, including a
   `fallback_category`. Each category has `category_name`, `subpath`,
   `description`, `criteria`.
