@@ -1573,3 +1573,96 @@ class TestQuarantineFiltering:
         log = OrganizeLogger(log_path=tmp_path / "c.log", target_basename="ws")
         with pytest.raises(classifier.ClassifierUnreliableInputError):
             classifier.classify(catalog, "", backend=backend, logger=log)
+
+
+class TestBusinessContextChannel:
+    """`business_context` flows from classify() into both Stage A and
+    Stage B prompts as a top-level `BUSINESS_CONTEXT` JSON key,
+    distinct from `USER_INSTRUCTIONS`."""
+
+    def test_business_context_appears_in_stage_a_payload(self, logger):
+        from fda.organize import classifier
+
+        backend = MagicMock()
+        backend.complete.side_effect = [
+            _taxonomy_payload(["Texts"]),
+            _assignment_payload([("f000", "Texts")]),
+        ]
+        cat = _catalog([_entry(0)])
+        bc_text = "## Folder Granularity\nTreat all orders as one bucket."
+        classifier.classify(
+            cat, "sort by type",
+            backend=backend, logger=logger,
+            business_context=bc_text,
+        )
+        stage_a_msg = backend.complete.call_args_list[0].kwargs[
+            "messages"
+        ][0]["content"]
+        parsed = json.loads(stage_a_msg)
+        assert parsed["BUSINESS_CONTEXT"] == bc_text
+        assert parsed["USER_INSTRUCTIONS"] == "sort by type"
+
+    def test_business_context_appears_in_stage_b_payload(self, logger):
+        from fda.organize import classifier
+
+        backend = MagicMock()
+        backend.complete.side_effect = [
+            _taxonomy_payload(["Texts"]),
+            _assignment_payload([("f000", "Texts")]),
+        ]
+        cat = _catalog([_entry(0)])
+        bc_text = "## Document Type Clarifications\n보고서 = quarterly only."
+        classifier.classify(
+            cat, "",
+            backend=backend, logger=logger,
+            business_context=bc_text,
+        )
+        stage_b_msg = backend.complete.call_args_list[1].kwargs[
+            "messages"
+        ][0]["content"]
+        parsed = json.loads(stage_b_msg)
+        assert parsed["BUSINESS_CONTEXT"] == bc_text
+
+    def test_default_empty_business_context(self, logger):
+        """Omitting the kwarg → empty string in payload → identical
+        behavior to today for callers that don't pass it."""
+        from fda.organize import classifier
+
+        backend = MagicMock()
+        backend.complete.side_effect = [
+            _taxonomy_payload(["Texts"]),
+            _assignment_payload([("f000", "Texts")]),
+        ]
+        cat = _catalog([_entry(0)])
+        classifier.classify(
+            cat, "sort", backend=backend, logger=logger,
+        )
+        stage_a_msg = backend.complete.call_args_list[0].kwargs[
+            "messages"
+        ][0]["content"]
+        parsed = json.loads(stage_a_msg)
+        assert parsed["BUSINESS_CONTEXT"] == ""
+        assert parsed["USER_INSTRUCTIONS"] == "sort"
+
+    def test_business_context_distinct_from_instructions(self, logger):
+        """The two channels live at distinct JSON keys; one is not a
+        substring of the other."""
+        from fda.organize import classifier
+
+        backend = MagicMock()
+        backend.complete.side_effect = [
+            _taxonomy_payload(["Texts"]),
+            _assignment_payload([("f000", "Texts")]),
+        ]
+        cat = _catalog([_entry(0)])
+        classifier.classify(
+            cat, "INSTRUCTIONS-MARKER",
+            backend=backend, logger=logger,
+            business_context="CONTEXT-MARKER",
+        )
+        stage_a_msg = backend.complete.call_args_list[0].kwargs[
+            "messages"
+        ][0]["content"]
+        parsed = json.loads(stage_a_msg)
+        assert parsed["BUSINESS_CONTEXT"] == "CONTEXT-MARKER"
+        assert parsed["USER_INSTRUCTIONS"] == "INSTRUCTIONS-MARKER"

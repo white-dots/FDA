@@ -222,10 +222,14 @@ def _sample_for_taxonomy(
 # ---- Stage A -----------------------------------------------------------
 
 def _build_proposer_prompt(
-    sample: list[CatalogEntry], instructions: str, extra_exemplars: list[CatalogEntry] | None = None
+    sample: list[CatalogEntry],
+    instructions: str,
+    business_context: str = "",
+    extra_exemplars: list[CatalogEntry] | None = None,
 ) -> str:
     payload = {
         "USER_INSTRUCTIONS": instructions,
+        "BUSINESS_CONTEXT": business_context,
         "CATALOG": [_entry_dict(e) for e in sample],
     }
     if extra_exemplars:
@@ -290,8 +294,13 @@ def _propose_taxonomy(
     logger: OrganizeLogger,
     skill: _skills.SkillConfig,
     extra_exemplars: list[CatalogEntry] | None = None,
+    business_context: str = "",
 ) -> Taxonomy:
-    payload = _build_proposer_prompt(sample, instructions, extra_exemplars)
+    payload = _build_proposer_prompt(
+        sample, instructions,
+        business_context=business_context,
+        extra_exemplars=extra_exemplars,
+    )
     if _est_tokens(payload) > CLASSIFIER_INPUT_TOKEN_BUDGET:
         logger.log("CLASSIFIER_OVERFLOW", stage="A", est_tokens=_est_tokens(payload))
         raise ClassifierOverflowError(
@@ -354,10 +363,14 @@ def _batch_entries(entries: list[CatalogEntry]) -> list[list[CatalogEntry]]:
 
 
 def _build_assigner_prompt(
-    batch: list[CatalogEntry], taxonomy: Taxonomy, instructions: str,
+    batch: list[CatalogEntry],
+    taxonomy: Taxonomy,
+    instructions: str,
+    business_context: str = "",
 ) -> str:
     payload = {
         "USER_INSTRUCTIONS": instructions,
+        "BUSINESS_CONTEXT": business_context,
         "TAXONOMY": {
             "categories": [
                 {"category_name": c.category_name, "subpath": c.subpath,
@@ -416,6 +429,7 @@ def _run_stage_b(
     backend,
     logger: OrganizeLogger,
     skill: _skills.SkillConfig,
+    business_context: str = "",
 ) -> dict[str, str]:
     raw_batches = _batch_entries(entries)
     # _batch_entries budgets entry tokens only; here we enforce the per-call
@@ -427,7 +441,7 @@ def _run_stage_b(
         b = stack.pop()
         if not b:
             continue
-        est = _est_tokens(_build_assigner_prompt(b, taxonomy, instructions))
+        est = _est_tokens(_build_assigner_prompt(b, taxonomy, instructions, business_context=business_context))
         if est <= MAX_ASSIGNER_INPUT_TOKENS or len(b) == 1:
             batches.append(b)
             continue
@@ -448,7 +462,7 @@ def _run_stage_b(
     def run_one(idx: int, batch: list[CatalogEntry]) -> None:
         sem.acquire()
         try:
-            payload = _build_assigner_prompt(batch, taxonomy, instructions)
+            payload = _build_assigner_prompt(batch, taxonomy, instructions, business_context=business_context)
             ids = {e.path_id for e in batch}
             t0 = time.monotonic()
             logger.log(
@@ -584,6 +598,7 @@ def classify(
     *,
     backend,
     logger: OrganizeLogger,
+    business_context: str = "",
 ) -> Groupings:
     from fda.organize.models import quarantine_bucket
 
@@ -624,10 +639,12 @@ def classify(
     t0 = time.monotonic()
     taxonomy = _propose_taxonomy(
         sample, instructions, backend=backend, logger=logger, skill=proposer_skill,
+        business_context=business_context,
     )
     assignments = _run_stage_b(
         extractable, taxonomy, instructions,
         backend=backend, logger=logger, skill=assigner_skill,
+        business_context=business_context,
     )
 
     fallback_name = taxonomy.fallback_category.category_name
@@ -644,10 +661,12 @@ def classify(
                 sample, instructions,
                 backend=backend, logger=logger, skill=proposer_skill,
                 extra_exemplars=exemplars,
+                business_context=business_context,
             )
             assignments = _run_stage_b(
                 extractable, taxonomy_v2, instructions,
                 backend=backend, logger=logger, skill=assigner_skill,
+                business_context=business_context,
             )
             taxonomy = taxonomy_v2
             # The v2 taxonomy may have a different fallback category name
