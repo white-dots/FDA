@@ -136,9 +136,25 @@ def organize(
         # via progress_callback right after opening the file, so we don't
         # repeat it here.
 
+        # Persistent organize-time preferences: ~/.fda/business_context.md.
+        # Reuse the metadata-layer loader (50KB-capped, UTF-8 safe).
+        # Missing file → empty string → classifier behaves exactly as
+        # today. We do not log the sha here; the metadata stage tracks
+        # its own load separately.
+        from fda.metadata import fda_home
+        from fda.metadata.context import load_business_context
+        bc = load_business_context(fda_home() / "business_context.md")
+        if bc.info_message and progress_callback:
+            try:
+                progress_callback(bc.info_message)
+            except Exception:
+                logger.debug("progress_callback raised", exc_info=True)
+
         catalog = reader.read(target_path, backend=backend, logger=olog)
         groupings = classifier.classify(
-            catalog, instructions, backend=backend, logger=olog,
+            catalog, instructions,
+            backend=backend, logger=olog,
+            business_context=bc.text,
         )
         from fda.organize.models import quarantine_bucket
         # Partition catalog. Classifier-aligned id map covers only files the
