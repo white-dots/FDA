@@ -33,7 +33,15 @@ This run also resolves two still-open backlog items
   (`all_extraction_failed` in `fda/organize/router.py:_short_circuit`). The
   corpus deliberately includes a realistic junk pile that produces at least
   one all-unreadable bucket, so `s3` must fire — or it is genuinely broken
-  and we drop to two destinations. Either way the verdict is definitive.
+  and we drop to two destinations.
+
+  **Precondition for the verdict:** the router stage swallows its own
+  failures (`fda/organize/__init__.py` logs `router stage failed` and
+  continues). "S3 did not fire" is only a valid #5 finding if the run
+  *actually routed*: `routing-report.json` must exist and be readable, and
+  the organize log must contain **no** `router stage failed` line. If either
+  check fails the run is inconclusive for #5 — rerun, do not record a
+  verdict.
 
 ## Background that shaped this design
 
@@ -93,11 +101,20 @@ Persistent source folder: `doc_agent_test_data/05_mock_s3bait_junk/`.
 
 A realistic messy-folder junk mix: `.log`, `.mp4` (tiny valid stub), `.zip`,
 `.sql` / `.bak` (DB-dump-like), `.tar.gz`, password-locked `.pdf`,
-zero-byte files, `.DS_Store`. Purpose: guarantee at least one
-**same-extension all-unreadable** bucket so the deterministic `s3`
-short-circuit fires (resolving #5), while also exercising the quarantine
-layer (`_NoExtractor/<ext>/`, `_ExtractionFailed/<ext>/`) across multiple
-extensions.
+zero-byte files, `.DS_Store`.
+
+The `s3` short-circuit does **not** depend on file extension. It fires when
+a router category is the catch-all `Misc` **or** when every file in that
+category failed text extraction (`signals.all_extraction_failed`,
+`fda/organize/router.py:_short_circuit`). The quarantine layer groups
+unextractable files by extension into `_NoExtractor/<ext>/` and
+`_ExtractionFailed/<ext>/` buckets; any such bucket whose files all failed
+extraction is, by construction, an `all_extraction_failed` category — so it
+trips the `s3` short-circuit. The junk pile only needs **enough genuinely
+unreadable files of one extension to form one such bucket** to resolve #5.
+The broader extension *variety* is a separate, user-chosen goal: exercising
+the quarantine layer across multiple extensions. It is not what triggers
+`s3`.
 
 ### Stream 2 — real files (~140)
 
@@ -130,6 +147,14 @@ extensions.
 
 ## Exact commands (pinned, not hand-wavy)
 
+This block shows the **post-implementation** invocation. Step 1
+(`build_korean_test_sources.py`) and step 6's `--fda-home` flag, the
+"S3 fired? yes/no" line, the `metadata.db` Korean-search check and the
+Korean-label scan are **deliverables of this work**, not current behavior;
+today `scripts/evaluate_fda_fixture.py` accepts only `fixture` /
+`--no-write`. `randomize_fda_fixture.py` and `diag_organize.py` are reused
+unchanged.
+
 ```bash
 cd /Users/hogyeongkim/Desktop/Projects/FDA/FDA
 DATA=/Users/hogyeongkim/Desktop/Projects/doc_agent_test_data
@@ -148,7 +173,19 @@ unzip -o ~/Downloads/MYBOX.zip -d "$DATA/06_real_korean"
 cp ~/Downloads/"조직도 및 연락처_라이온켐텍.xlsx" \
    ~/Downloads/"lion chemtech sas concept kr.docx" "$DATA/06_real_korean/"
 
+# 2b. VERIFY real source counts before pooling. randomize_fda_fixture.py
+#     silently caps an over-quota source (take = min(quota, available)) and
+#     back-fills the shortfall from un-quota'd sources — so a too-high
+#     real_korean quota would quietly swap real Korean for napierone noise
+#     and fake the Korean-coverage result. Set each --quota from the number
+#     printed here; never assume it.
+for s in 04_mock_korean 05_mock_s3bait_junk 06_real_korean hwp_samples; do
+  printf '%-22s %s files\n' "$s" \
+    "$(find "$DATA/$s" -type f ! -name .DS_Store ! -name ground_truth.csv | wc -l | tr -d ' ')"
+done
+
 # 3. Pool into one shuffled, hash-renamed fixture + manifest.
+#    Each --quota below MUST be <= the count printed by step 2b.
 .venv/bin/python scripts/randomize_fda_fixture.py \
   --source mock_korean="$DATA/04_mock_korean" \
   --source junk="$DATA/05_mock_s3bait_junk" \
@@ -166,7 +203,15 @@ cp ~/Downloads/"조직도 및 연락처_라이온켐텍.xlsx" \
 cp docs/superpowers/specs/2026-05-16-business-context.draft.ko.md \
    "$HOME_TMP/business_context.md"   # after user edits the draft
 
-# 5. One sandboxed pipeline run (real ~/.fda untouched).
+# 5. PREFLIGHT then one sandboxed pipeline run. diag_organize.py does NOT
+#    set or validate FDA_HOME itself; without the env prefix organize()
+#    reads the REAL ~/.fda/business_context.md and writes the real
+#    metadata.db. Abort unless the sandbox is in force.
+case "$HOME_TMP" in
+  /tmp/fda-test-home-*|/private/tmp/fda-test-home-*) : ;;
+  *) echo "ABORT: HOME_TMP not a sandbox dir: $HOME_TMP" >&2; exit 1 ;;
+esac
+[ -f "$HOME_TMP/business_context.md" ] || { echo "ABORT: no sandbox business_context.md" >&2; exit 1; }
 FDA_HOME="$HOME_TMP" .venv/bin/python scripts/diag_organize.py "$FIX" --apply
 
 # 6. Grade by looking.
@@ -215,6 +260,10 @@ it is consulted by a human, not joined by the evaluator.
   and reusable**; only the `/private/tmp` fixture is disposable.
 - `FDA_HOME` points at a throwaway `mktemp -d` dir. `business_context.md`
   and `metadata.db` live there. The real `~/.fda` is never read or written.
+  Because `diag_organize.py` neither sets nor validates `FDA_HOME`, the
+  step-5 preflight (sandbox-path check + sandbox `business_context.md`
+  presence) is mandatory — running without it silently falls back to the
+  real `~/.fda`.
 - `reportlab` is installed into `.venv` only — **not** added to
   `pyproject.toml` (it is test-fixture tooling, not product code).
 - Git repositories are never modified by the organize tools (existing
@@ -246,9 +295,12 @@ it is consulted by a human, not joined by the evaluator.
   single-face `.ttf` is usable — never tofu/garbled PDFs. Vendoring
   `NanumGothic.ttf` makes the test reproducible off this machine and is the
   preferred default.
-- **`s3` still does not fire** even with a guaranteed all-unreadable bucket.
-  That is not a test failure — it is the definitive #5 finding (branch is
-  dead → simplify the router to two destinations in follow-up work).
+- **`s3` still does not fire** even with a guaranteed all-unreadable bucket
+  — *and* the verdict precondition holds (`routing-report.json` present, no
+  `router stage failed` in the log). Only then is it the definitive #5
+  finding (branch is dead → simplify the router to two destinations in
+  follow-up work). If the precondition fails, the run is inconclusive, not a
+  verdict.
 
 ## Out of scope
 
