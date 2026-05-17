@@ -844,3 +844,49 @@ def test_router_json_pinned_key_when_populated(tmp_path):
     _write_json_report(report, p)
     data = json.loads(p.read_text(encoding="utf-8"))
     assert data["pinned"] == ["manifest.csv", "README.md"]
+
+
+class TestRouteStorageBlobIntegration:
+    def test_storage_blob_grouping_routes_to_s3_high_confidence(
+        self, tmp_path
+    ):
+        from fda.organize.router import route
+        entries = [
+            _entry(0, ext=".mp4",
+                   path=str(tmp_path / "미디어_Media/clip.mp4")),
+            _entry(1, ext=".zip",
+                   path=str(tmp_path / "압축파일_Archives/a.zip")),
+        ]
+        catalog = _catalog(entries, target=str(tmp_path))
+        groupings = _groupings([
+            _grouping("StorageBlobMedia", ["f000"], subpath="미디어_Media"),
+            _grouping("StorageBlobArchive", ["f001"],
+                      subpath="압축파일_Archives"),
+        ])
+        backend = MagicMock()
+        report = route(
+            catalog=catalog, groupings=groupings, target_path=tmp_path,
+            backend=backend, logger=_Logger(),
+        )
+        backend.complete.assert_not_called()
+        assert {c.name for c in report.categories} == {
+            "StorageBlobMedia", "StorageBlobArchive",
+        }
+        for c in report.categories:
+            assert c.destination == "s3", c.name
+            assert c.low_confidence is False, c.name
+
+    def test_misc_short_circuit_stays_low_confidence(self, tmp_path):
+        # Regression guard: the confidence flip is scoped to storage-blob
+        # ids only — Misc must still be low_confidence=True.
+        from fda.organize.router import route
+        entries = [_entry(0, path=str(tmp_path / "Misc/a.pdf"),
+                          subpath="Misc")]
+        catalog = _catalog(entries, target=str(tmp_path))
+        groupings = _groupings([_grouping("Misc", ["f000"], subpath="Misc")])
+        report = route(
+            catalog=catalog, groupings=groupings, target_path=tmp_path,
+            backend=MagicMock(), logger=_Logger(),
+        )
+        assert report.categories[0].destination == "s3"
+        assert report.categories[0].low_confidence is True

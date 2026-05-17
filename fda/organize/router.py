@@ -379,7 +379,7 @@ def route(
                 subpath=g.subpath,
                 destination=short,
                 reason=_short_circuit_reason(g.category, signals),
-                low_confidence=True,
+                low_confidence=g.category not in STORAGE_BLOB_CATEGORY_NAMES,
                 signals=signals,
                 misfits=(),
             ))
