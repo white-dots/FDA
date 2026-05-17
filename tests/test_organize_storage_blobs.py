@@ -130,3 +130,18 @@ class TestBuildGroupings:
             g.reason == "미디어/압축/백업 — 저장소(S3) 대상 파일 유형"
             for g in groups
         )
+
+
+class TestSubpathSanitizationSafetyNet:
+    def test_korean_subpaths_survive_plan_builder_sanitization(self, tmp_path):
+        from fda.organize.plan_builder import (
+            _sanitize_subpath, _resolve_destination_dir,
+        )
+        from fda.organize.storage_blobs import STORAGE_BLOB_BUCKETS
+        for _, subpath, _ in STORAGE_BLOB_BUCKETS:
+            # Subpath is unchanged by sanitization (single clean component).
+            assert _sanitize_subpath(subpath) == subpath
+            # Resolves to exactly <target>/<subpath>, under target.
+            resolved = _resolve_destination_dir(tmp_path, subpath)
+            assert resolved == (tmp_path / subpath).resolve()
+            assert resolved.is_relative_to(tmp_path.resolve())
