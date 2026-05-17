@@ -111,6 +111,47 @@ class TestShortCircuit:
         assert _short_circuit("Reports/Sales", sig) is None
 
 
+class TestShortCircuitStorageBlob:
+    def test_storage_blob_category_short_circuits_to_s3(self):
+        from fda.organize.router import _aggregate_signals, _short_circuit
+        sig = _aggregate_signals([_entry(0, ext=".mp4")])
+        for cat in (
+            "StorageBlobMedia", "StorageBlobArchive", "StorageBlobBackup",
+        ):
+            assert _short_circuit(cat, sig) == "s3", cat
+
+    def test_storage_blob_reason_is_distinct_and_nonempty(self):
+        from fda.organize.router import (
+            _aggregate_signals, _short_circuit_reason,
+        )
+        sig = _aggregate_signals([_entry(0, ext=".mp4")])
+        reason = _short_circuit_reason("StorageBlobMedia", sig)
+        assert reason  # non-empty
+        # Not the Misc reason and not the all-extraction-failed reason.
+        assert "Catch-all" not in reason
+        assert "Text extraction failed" not in reason
+
+    def test_misc_and_extraction_failed_unchanged(self):
+        from fda.organize.router import (
+            _aggregate_signals, _short_circuit, _short_circuit_reason,
+        )
+        # Misc still short-circuits with its own reason.
+        sig_misc = _aggregate_signals([_entry(0, ext=".pdf")])
+        assert _short_circuit("Misc", sig_misc) == "s3"
+        assert "Catch-all" in _short_circuit_reason("Misc", sig_misc)
+        # all_extraction_failed still short-circuits with its own reason.
+        sig_failed = _aggregate_signals(
+            [_entry(0, failed=True), _entry(1, failed=True)]
+        )
+        assert _short_circuit("Finance/Invoices", sig_failed) == "s3"
+        assert "Text extraction failed" in _short_circuit_reason(
+            "Finance/Invoices", sig_failed
+        )
+        # A normal category still does not short-circuit.
+        sig_ok = _aggregate_signals([_entry(0, ext=".pdf")])
+        assert _short_circuit("Finance/Invoices", sig_ok) is None
+
+
 class _Logger:
     """Drop-in replacement for OrganizeLogger that records events."""
     def __init__(self):

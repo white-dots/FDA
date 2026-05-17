@@ -35,6 +35,7 @@ from fda.organize.models import (
     RoutingReport,
     RoutingSignals,
 )
+from fda.organize.storage_blobs import STORAGE_BLOB_CATEGORY_NAMES
 
 logger = logging.getLogger(__name__)
 
@@ -84,9 +85,11 @@ def _short_circuit(category_name: str, signals: RoutingSignals) -> str | None:
     """Return 's3' when the category trips a hard-coded edge case, else None.
 
     The router applies these defaults *before* calling Claude. A short-circuit
-    return value is the destination; categories tagged this way also get
-    `low_confidence: true` in the report.
+    return value is the destination. Branch order MUST match
+    _short_circuit_reason exactly.
     """
+    if category_name in STORAGE_BLOB_CATEGORY_NAMES:
+        return "s3"
     if category_name in _MISC_CATEGORY_NAMES:
         return "s3"
     if signals.all_extraction_failed:
@@ -95,6 +98,9 @@ def _short_circuit(category_name: str, signals: RoutingSignals) -> str | None:
 
 
 def _short_circuit_reason(category_name: str, signals: RoutingSignals) -> str:
+    if category_name in STORAGE_BLOB_CATEGORY_NAMES:
+        return ("저장소 전용 파일 유형(미디어/압축/백업) — "
+                "규칙에 따라 S3로 라우팅.")
     if category_name in _MISC_CATEGORY_NAMES:
         return "Catch-all category — defaulted to S3 without consulting Claude."
     if signals.all_extraction_failed:
