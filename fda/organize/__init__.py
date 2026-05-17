@@ -14,7 +14,8 @@ from pathlib import Path
 from typing import Callable
 
 from fda.organize import (
-    _fs, classifier, executor, plan_builder, reader, router, verifier,
+    _fs, classifier, executor, plan_builder, reader, router,
+    storage_blobs, verifier,
 )
 from fda.organize._logger import OrganizeLogger
 from fda.organize.models import (
@@ -156,20 +157,50 @@ def organize(
             backend=backend, logger=olog,
             business_context=bc.text,
         )
-        from fda.organize.models import quarantine_bucket
-        # Partition catalog. Classifier-aligned id map covers only files the
-        # classifier actually saw (non-junk, extractable). Junk goes through
-        # the DELETE path; quarantine goes through the MOVE path to a
-        # dedicated bucket; both are surfaced separately from path_by_id.
+        from fda.organize.models import Groupings, quarantine_bucket
+        # Partition catalog into four independent streams:
+        #   - extractable: non-junk, readable → classifier (LLM) groups
+        #   - storage blobs: non-junk, unreadable, KNOWN blob type →
+        #       synthetic real groups (no LLM), routed to S3
+        #   - quarantine: non-junk, unreadable, NOT a blob type →
+        #       _NoExtractor/_ExtractionFailed, no cloud dest (honesty)
+        #   - junk: DELETE path
+        # Storage blobs have a quarantine_bucket today; they are removed
+        # from quarantine_entries here so they are not moved twice.
         extractable = [
             e for e in catalog.entries
             if not e.is_junk and quarantine_bucket(e) is None
         ]
-        quarantine_entries = [
-            e for e in catalog.entries if quarantine_bucket(e) is not None
+        storage_blob_entries = [
+            e for e in catalog.entries
+            if not e.is_junk
+            and storage_blobs.storage_blob_bucket(e) is not None
         ]
-        path_by_id = {e.path_id: e.path for e in extractable}
+        quarantine_entries = [
+            e for e in catalog.entries
+            if quarantine_bucket(e) is not None
+            and storage_blobs.storage_blob_bucket(e) is None
+        ]
+        # path_by_id MUST include storage-blob entries — plan_builder
+        # raises PlanBuilderError("unknown path_id") for a Grouping whose
+        # file_ids are absent from it (plan_builder.py:179-180).
+        path_by_id = {
+            e.path_id: e.path
+            for e in extractable + storage_blob_entries
+        }
         junk_paths = [e.path for e in catalog.entries if e.is_junk]
+        # Merge synthetic storage-blob groups AFTER the classifier groups.
+        # plan_builder sorts its own ops, so on-disk results are
+        # order-independent; router + the report follow groupings.items
+        # order directly, so appending last keeps content categories
+        # first then blobs (stable, deterministic). Empty input →
+        # build_groupings returns [] → Groupings is value-identical to
+        # today (zero behavior change on blob-free corpora).
+        sb_groupings = storage_blobs.build_groupings(storage_blob_entries)
+        groupings = Groupings(
+            items=groupings.items + tuple(sb_groupings),
+            overall_reason=groupings.overall_reason,
+        )
         plan = plan_builder.build(
             target_dir=str(target_path),
             groupings=groupings,

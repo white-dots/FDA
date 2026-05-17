@@ -391,3 +391,108 @@ def test_pinned_takes_precedence_over_quarantine(workspace, tmp_path):
     assert (workspace / "inventory.xyz").is_file()
     assert not (workspace / "_NoExtractor").exists()
     assert not (workspace / "_ExtractionFailed").exists()
+
+
+class TestOrganizeStorageBlobs:
+    def _scripted_backend(self):
+        """Summarizer + Stage A/B for the one .txt; router for any
+        LLM-routed category. Storage blobs never reach the summarizer
+        (reader quarantines unreadable files before the LLM call) and
+        short-circuit in the router, so the backend is never asked about
+        them."""
+        backend = MagicMock()
+        summary = json.dumps(
+            {"type_label": "text", "summary": "plain text"}
+        )
+        taxonomy = json.dumps({
+            "categories": [{
+                "category_name": "Texts", "subpath": "Texts",
+                "description": "plain text files",
+                "criteria": "text-shaped",
+            }],
+            "fallback_category": {
+                "category_name": "Misc", "subpath": "Misc",
+                "description": "fallback",
+                "criteria": "could not categorize",
+            },
+        })
+
+        def fake_complete(*, messages, **_):
+            body = messages[0]["content"]
+            if "PATH:" in body:
+                return summary
+            try:
+                parsed = json.loads(body)
+            except json.JSONDecodeError:
+                return ""
+            if "category" in parsed and "signals" in parsed:
+                return json.dumps({
+                    "destination": "sharepoint",
+                    "reason": "text content",
+                    "misfits": [],
+                })
+            if "BATCH" in parsed:
+                return json.dumps({
+                    "assignments": [
+                        {"path_id": e["path_id"],
+                         "category_name": "Texts"}
+                        for e in parsed["BATCH"]
+                    ],
+                })
+            if "CATALOG" in parsed:
+                return taxonomy
+            return ""
+
+        backend.complete.side_effect = fake_complete
+        return backend
+
+    def test_blobs_get_real_folders_and_s3_nonblob_quarantines(
+        self, tmp_path
+    ):
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        (ws / "note.txt").write_text("hello world")
+        # Storage blobs: bytes so they are not zero-byte; reader has no
+        # extractor → extract_status="no_extractor".
+        (ws / "clip.mp4").write_bytes(b"\x00\x01fake mp4 payload" * 8)
+        (ws / "data.zip").write_bytes(b"PK\x03\x04fake zip payload" * 8)
+        # Non-blob unreadable: stays in quarantine (honesty boundary).
+        (ws / "weird.xyz").write_bytes(b"unknown binary blob" * 8)
+
+        organize(
+            str(ws), instructions="",
+            backend=self._scripted_backend(),
+            allowed_roots=[ws.parent],
+            metadata=False,
+        )
+
+        # Real, named folders — not the quarantine pile.
+        assert (ws / "미디어_Media" / "clip.mp4").exists()
+        assert (ws / "압축파일_Archives" / "data.zip").exists()
+        # Normal file still sorted by the classifier.
+        assert (ws / "Texts" / "note.txt").exists()
+        # Non-blob unreadable still quarantined.
+        assert (ws / "_NoExtractor" / "xyz" / "weird.xyz").exists()
+        # Blobs are NOT in quarantine.
+        assert not (ws / "_NoExtractor" / "mp4").exists()
+        assert not (ws / "_NoExtractor" / "zip").exists()
+
+        report = json.loads(
+            (ws / "routing-report.json").read_text()
+        )
+        by_name = {c["name"]: c for c in report["categories"]}
+        for name, subpath in (
+            ("StorageBlobMedia", "미디어_Media"),
+            ("StorageBlobArchive", "압축파일_Archives"),
+        ):
+            assert name in by_name, report["categories"]
+            assert by_name[name]["destination"] == "s3"
+            assert by_name[name]["low_confidence"] is False
+            assert by_name[name]["subpath"] == subpath
+        # The empty backup bucket produced no category.
+        assert "StorageBlobBackup" not in by_name
+        # Non-blob unreadable reported under quarantine, no cloud dest.
+        q_exts = {(g["bucket"], g["ext"]) for g in report["quarantine"]}
+        assert ("_NoExtractor", "xyz") in q_exts
+        assert ("_NoExtractor", "mp4") not in q_exts
+        assert ("_NoExtractor", "zip") not in q_exts
