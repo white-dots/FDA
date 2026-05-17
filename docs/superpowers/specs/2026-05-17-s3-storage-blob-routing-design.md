@@ -16,16 +16,23 @@ the S3 branch almost never fires. Root cause:
 
 - The files that conceptually belong in S3 are *storage blobs* — video,
   images, audio, archives, database backups/dumps.
-- FDA has no text extractor for any of these. The reader therefore tags
-  them as unreadable (`extract_status == "no_extractor"`) and they are
-  diverted into the **quarantine** stream (`_NoExtractor/<ext>/`) *before*
-  the classifier and router run — see
-  `fda/organize/__init__.py:159-179` (partition) and
+- FDA has no text extractor for any of these. The reader tags them as
+  unreadable (`extract_status == "no_extractor"`). The classifier is
+  called with the full catalog but internally restricts itself to
+  *extractable* entries — `real = [e for e in catalog.entries if not
+  e.is_junk]; extractable = [e for e in real if quarantine_bucket(e) is
+  None]` (`fda/organize/classifier.py:605-606`) — so it never produces a
+  grouping for an unreadable file. The orchestrator partition then sends
+  those files down the quarantine MOVE path: see
+  `fda/organize/__init__.py:159-179` (partition, *after* the
+  `classifier.classify(...)` call at `__init__.py:153-158`) and
   `fda/organize/plan_builder.py:248-296` (quarantine MOVEs).
-- The router only assigns a cloud destination to **classifier groupings**
-  (`fda/organize/router.py:360-446`). Quarantine groups are reported
-  separately with *no* cloud destination
-  (`router.py:291-331`, `_build_quarantine_groups`).
+- `route()` will route any `Groupings` it is handed (it iterates
+  `groupings.items`, `fda/organize/router.py:360`), but the current
+  caller passes only the classifier's groupings
+  (`fda/organize/__init__.py:260-268`). Quarantine groups are passed via
+  the separate `plan`/`_build_quarantine_groups` path
+  (`router.py:291-331`) and reported with *no* cloud destination.
 
 Net effect: every file that *should* go to S3 is removed from the routing
 path one stage before the router can see it. S3 is starved by design.
@@ -131,7 +138,26 @@ storage-blob taxonomy + grouping)**
   `file_ids=tuple(sorted path_ids)`, and a fixed reason string
   (e.g. `"미디어/압축/백업 — 저장소(S3) 대상 파일 유형"`). Deterministic
   ordering (bucket order from the spec tuple; path_ids sorted) so plans
-  are reproducible. Depends only on `fda.organize.models`.
+  are reproducible.
+
+**Import constraint (hard requirement):** `storage_blobs.py` may import
+**only** from `fda.organize.models` (which has no intra-package imports,
+`fda/organize/models.py:11-14`). It must never import from
+`fda.organize.__init__`, `router`, or `classifier` — `__init__.py:16-18`
+already imports `router`, and `router` will import `storage_blobs`, so any
+back-import from `storage_blobs` would create a cycle.
+
+**Public surface (YAGNI guard):** the module exposes exactly four names —
+the bucket spec tuple, `STORAGE_BLOB_CATEGORY_NAMES`,
+`storage_blob_bucket`, `build_groupings`. Nothing else (no config hooks,
+no exported helpers).
+
+**Load-bearing invariant:** because the classifier already excludes
+quarantine entries (`classifier.py:605-606`), storage-blob `path_id`s
+never appear in classifier groupings. The merged synthetic groupings are
+therefore disjoint from classifier output, so plan_builder's
+"path_id appears in two groupings" check (`plan_builder.py:181-186`)
+cannot trip from this change.
 
 **`fda/organize/__init__.py` (modified: wire in the fourth stream)**
 
@@ -147,12 +173,23 @@ Change the partition block (`__init__.py:159-179`). After
    the quarantine MOVE path so they are not duplicated.)
 3. Build `sb_groupings = storage_blobs.build_groupings(storage_blob_entries)`.
 4. Merge into the classifier output (both `Grouping` and `Groupings` are
-   frozen — construct a new `Groupings`):
+   frozen — construct a new `Groupings`), appending storage-blob groups
+   **after** the classifier groups:
    `groupings = Groupings(items=groupings.items + tuple(sb_groupings),
    overall_reason=groupings.overall_reason)`.
-5. Extend `path_by_id` to include storage-blob entries so
-   `plan_builder.build` can resolve their MOVE sources:
+   Order rationale: plan_builder sorts its own operations internally
+   (`plan_builder.py:222-226, 298-308`), so on-disk results are
+   order-independent; but `router.route()` and the routing report follow
+   `groupings.items` order directly (`router.py:360, 453-458`). Appending
+   last makes the report list content categories first, then the
+   storage-blob groups — stable and deterministic.
+5. **Hard requirement — extend `path_by_id`** to include storage-blob
+   entries so `plan_builder.build` can resolve their MOVE sources:
    `path_by_id = {e.path_id: e.path for e in extractable + storage_blob_entries}`.
+   This is not optional: a `Grouping` whose `file_ids` are absent from
+   `path_by_id` makes `plan_builder.build` raise `PlanBuilderError`
+   ("unknown path_id", `plan_builder.py:179-180`) and the whole organize
+   run fails.
 
 `junk_paths` is unchanged. `plan_builder.build(...)` signature is
 unchanged — the new groups flow through the existing groupings MOVE path
@@ -162,18 +199,31 @@ unchanged — the new groups flow through the existing groupings MOVE path
 **`fda/organize/router.py` (modified: one deterministic S3 rule)**
 
 - Import `STORAGE_BLOB_CATEGORY_NAMES` from `fda.organize.storage_blobs`.
-- `_short_circuit` (`router.py:83-94`): add, before the existing checks,
-  `if category_name in STORAGE_BLOB_CATEGORY_NAMES: return "s3"`.
-- `_short_circuit_reason` (`router.py:97-103`): matching branch returning a
-  fixed Korean reason, e.g. `"저장소 전용 파일 유형(미디어/압축/백업) —
-  규칙에 따라 S3로 라우팅."`.
+- `_short_circuit` (`router.py:83-94`): add the storage-blob check **as
+  the first branch**, before the `Misc` and `all_extraction_failed`
+  checks: `if category_name in STORAGE_BLOB_CATEGORY_NAMES: return "s3"`.
+- `_short_circuit_reason` (`router.py:97-103`): add the matching branch in
+  **the same first position**. The two functions must stay in lockstep —
+  same branch order — or a category could short-circuit on one rule but
+  report another rule's reason. (In practice a storage-blob group cannot
+  also be `all_extraction_failed`: that signal is
+  `all(e.summary_failed)`, `router.py:61-63`, and quarantine-origin
+  entries have `summary_failed=False`, `reader.py:85`. The lockstep
+  ordering is required regardless, as defensive correctness.) The reason
+  string is cosmetic — it appears only in logs and the routing report,
+  not in any decision logic — so its exact Korean wording (e.g.
+  `"저장소 전용 파일 유형(미디어/압축/백업) — 규칙에 따라 S3로 라우팅."`) is
+  for consistency, not a correctness requirement.
 - Confidence: the short-circuit branch in `route()` currently hard-codes
   `low_confidence=True` (`router.py:371-379`). Storage-blob routing is a
   firm deterministic rule, not a guess, so it must be
   `low_confidence=False`. Change that branch to compute
-  `low_confidence = g.category not in STORAGE_BLOB_CATEGORY_NAMES`
-  (Misc / all-extraction-failed remain low-confidence as today; only
-  storage-blob groups become high-confidence).
+  `low_confidence = g.category not in STORAGE_BLOB_CATEGORY_NAMES`. This
+  flips **only** the three storage-blob categories to high-confidence;
+  `Misc` and `all_extraction_failed` short-circuits stay
+  `low_confidence=True` exactly as today. Do **not** generalize this to
+  "all S3 short-circuits are high-confidence" — the scoping is on the
+  category id, not on the destination.
 
 No change to `_aggregate_signals`, `_build_quarantine_groups`, the routing
 report schema (`models.py:202-209`), or the MD/JSON writers — storage-blob
@@ -237,7 +287,13 @@ Unit-testable per unit (a sign the boundaries are right):
 - `organize()` end-to-end (tmp dir, mocked backend): a `.mp4` + a `.zip`
   land in `미디어_Media/` / `압축파일_Archives/`; a corrupt non-blob file
   still lands in quarantine; `routing-report.json` shows those two groups
-  with `destination: "s3"`.
+  with `destination: "s3"` and `low_confidence: false`.
+- Korean-named subpath passes plan_builder's sanitization unchanged:
+  assert the synthetic subpaths (`미디어_Media`, `압축파일_Archives`,
+  `백업_Backups`) survive `_sanitize_subpath` / `_resolve_destination_dir`
+  (`plan_builder.py:58-84`) and resolve under target (no `..`, no illegal
+  chars, non-empty components) — i.e. the produced MOVE destinations are
+  exactly `<target>/<subpath>/<basename>`.
 
 Full suite must pass: `.venv/bin/python -m pytest tests/ -x -q
 --tb=short`.
