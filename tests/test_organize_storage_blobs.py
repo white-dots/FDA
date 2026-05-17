@@ -80,3 +80,53 @@ class TestCategoryNames:
         assert STORAGE_BLOB_CATEGORY_NAMES == frozenset({
             "StorageBlobMedia", "StorageBlobArchive", "StorageBlobBackup",
         })
+
+
+class TestBuildGroupings:
+    def test_empty_input_returns_empty_list(self):
+        from fda.organize.storage_blobs import build_groupings
+        assert build_groupings([]) == []
+
+    def test_mixed_entries_one_group_per_nonempty_bucket(self):
+        from fda.organize.storage_blobs import build_groupings
+        entries = [
+            _entry(2, ext=".mp4"),
+            _entry(0, ext=".zip"),
+            _entry(1, ext=".png"),
+            _entry(3, ext=".xyz"),        # non-blob → skipped
+            _entry(4, ext=".zip", is_junk=True),  # junk → skipped
+        ]
+        groups = build_groupings(entries)
+        # StorageBlobBackup has no files → no group for it.
+        assert [(g.category, g.subpath) for g in groups] == [
+            ("StorageBlobMedia", "미디어_Media"),
+            ("StorageBlobArchive", "압축파일_Archives"),
+        ]
+        media, archive = groups
+        # file_ids sorted; only f001 (.png) + f002 (.mp4) are media.
+        assert media.file_ids == ("f001", "f002")
+        assert archive.file_ids == ("f000",)
+        assert media.reason == "미디어/압축/백업 — 저장소(S3) 대상 파일 유형"
+        assert archive.reason == "미디어/압축/백업 — 저장소(S3) 대상 파일 유형"
+
+    def test_bucket_order_is_deterministic_regardless_of_input_order(self):
+        from fda.organize.storage_blobs import build_groupings
+        # Backup entry first, media last: output order must still follow
+        # STORAGE_BLOB_BUCKETS (media, archive, backup).
+        entries = [
+            _entry(0, ext=".sql"),
+            _entry(1, ext=".tar"),
+            _entry(2, ext=".jpg"),
+        ]
+        groups = build_groupings(entries)
+        # Lock category AND subpath for all three buckets (incl. backup).
+        assert [(g.category, g.subpath) for g in groups] == [
+            ("StorageBlobMedia", "미디어_Media"),
+            ("StorageBlobArchive", "압축파일_Archives"),
+            ("StorageBlobBackup", "백업_Backups"),
+        ]
+        # Spec §4: EVERY emitted Grouping carries the fixed reason string.
+        assert all(
+            g.reason == "미디어/압축/백업 — 저장소(S3) 대상 파일 유형"
+            for g in groups
+        )
