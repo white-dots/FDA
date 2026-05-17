@@ -19,6 +19,7 @@ dependencies = [
 
 [project.scripts]
 fda = "fda.cli:main"
+fda-mcp = "fda.mcp_server:main"
 
 [tool.setuptools.packages.find]
 include = ["fda*"]
@@ -42,6 +43,9 @@ discord = [
 slack = [
     "slack-bolt>=1.14.0",
 ]
+mcp = [
+    "mcp>=1.0.0",
+]
 comms = [
     "python-telegram-bot>=22.0",
     "discord.py[voice]>=2.0",
@@ -59,6 +63,7 @@ all = [
     "openai>=1.0",
     "flask>=2.3.0",
     "slack-bolt>=1.14.0",
+    "mcp>=1.0.0",
 ]
 
 [tool.pytest.ini_options]
