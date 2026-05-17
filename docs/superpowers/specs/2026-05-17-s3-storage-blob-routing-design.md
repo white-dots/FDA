@@ -249,10 +249,18 @@ groups are ordinary `RoutedCategory` rows with `destination="s3"`.
 
 ## 6. Error handling / edge cases
 
-- **Storage-blob file also flagged junk** (e.g. 0-byte `.zip`): junk wins.
-  `quarantine_bucket` returns `None` for junk (`models.py:179-180`), so
-  `storage_blob_bucket` returns `None`; the file follows the existing
-  DELETE path. Unchanged.
+- **Storage-blob file also flagged junk**: junk wins, defensively.
+  Junk is detected by exact filename only (`is_junk_file` → name in
+  `{.DS_Store, Thumbs.db, desktop.ini}`, `_fs.py:69-70`,
+  `reader.py:241`); size is **not** a junk signal, so a 0-byte `.zip`
+  is *not* junk — it is `no_extractor` and routes to S3 as
+  `StorageBlobArchive` (deterministic and honest: it genuinely is a
+  `.zip`). Because no storage-blob extension can equal a junk filename,
+  this case cannot arise in practice today. The guard is still correct
+  for defense in depth: `quarantine_bucket` returns `None` for junk
+  (`models.py:179-180`), so `storage_blob_bucket` returns `None` and a
+  file would follow the DELETE path if junk detection ever changed.
+  Unchanged.
 - **Unreadable but not a storage type** (corrupt `.docx` →
   `extract_status="failed"`; unknown `.xyz` → `"no_extractor"`):
   `entry.ext` not in any bucket set → `storage_blob_bucket` returns

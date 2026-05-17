@@ -457,7 +457,12 @@ class TestOrganizeStorageBlobs:
         (ws / "clip.mp4").write_bytes(b"\x00\x01fake mp4 payload" * 8)
         (ws / "data.zip").write_bytes(b"PK\x03\x04fake zip payload" * 8)
         # Non-blob unreadable: stays in quarantine (honesty boundary).
+        #  - .xyz: no registered extractor → extract_status="no_extractor".
+        #  - .docx: extractor exists but parsing fails → "failed". §2
+        #    honesty boundary: an unreadable file that is NOT a known
+        #    storage-blob type must stay in quarantine, never auto-S3.
         (ws / "weird.xyz").write_bytes(b"unknown binary blob" * 8)
+        (ws / "broken.docx").write_bytes(b"not a real docx file" * 8)
 
         organize(
             str(ws), instructions="",
@@ -476,6 +481,11 @@ class TestOrganizeStorageBlobs:
         # Blobs are NOT in quarantine.
         assert not (ws / "_NoExtractor" / "mp4").exists()
         assert not (ws / "_NoExtractor" / "zip").exists()
+        # Corrupt non-blob doc quarantined, NOT in any S3 blob folder.
+        assert (ws / "_ExtractionFailed" / "docx" / "broken.docx").exists()
+        assert not (ws / "미디어_Media" / "broken.docx").exists()
+        assert not (ws / "압축파일_Archives" / "broken.docx").exists()
+        assert not (ws / "백업_Backups" / "broken.docx").exists()
 
         report = json.loads(
             (ws / "routing-report.json").read_text()
@@ -494,5 +504,10 @@ class TestOrganizeStorageBlobs:
         # Non-blob unreadable reported under quarantine, no cloud dest.
         q_exts = {(g["bucket"], g["ext"]) for g in report["quarantine"]}
         assert ("_NoExtractor", "xyz") in q_exts
+        assert ("_ExtractionFailed", "docx") in q_exts
         assert ("_NoExtractor", "mp4") not in q_exts
         assert ("_NoExtractor", "zip") not in q_exts
+        # Neither non-blob unreadable became a routed (S3) category.
+        assert "broken.docx" not in {
+            c["subpath"] for c in report["categories"]
+        }
