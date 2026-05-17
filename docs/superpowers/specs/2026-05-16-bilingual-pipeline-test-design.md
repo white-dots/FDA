@@ -2,7 +2,10 @@
 
 Date: 2026-05-16
 Branch: dev_branch
-Status: design approved (brainstorm), pending Codex + user spec review
+Status: revised 2026-05-17 for the shipped storage-blob → S3 feature
+(`docs/superpowers/specs/2026-05-17-s3-storage-blob-routing-design.md`);
+#5 reframed from "is the s3 branch dead?" to "storage-blob → S3 +
+honesty boundary". Pending fresh Codex + user spec review.
 
 ## Purpose
 
@@ -14,7 +17,8 @@ corpus, and produce evidence for four things:
 2. **Cloud router works** — all three destinations
    (SharePoint / S3 / RDBMS) actually fire.
 3. **Metadata layer is built** — the sandbox `metadata.db` has classified
-   rows and a Korean search query returns hits.
+   rows, the run's success rate (seen / classified / failed) is reported,
+   and a Korean search query returns hits.
 4. **Korean handling succeeds** — Korean folder names, Korean `reason` text
    in `routing-report.md`, and the Korean `business_context.md` rules are
    honored.
@@ -27,21 +31,38 @@ This run also resolves two still-open backlog items
   sane. Verdict is made by **eyeballing a bucket-size histogram** on a
   ~300-file run (the runbook's own evaluation method), not by an automated
   cohesion score.
-- **#5 — is the `s3` router branch dead?** It has never fired in prior tests.
-  The router sends a category to `s3` deterministically when the category is
-  the catch-all `Misc` **or** when every file in it failed text extraction
-  (`all_extraction_failed` in `fda/organize/router.py:_short_circuit`). The
-  corpus deliberately includes a realistic junk pile that produces at least
-  one all-unreadable bucket, so `s3` must fire — or it is genuinely broken
-  and we drop to two destinations.
+- **#5 — storage-blob → S3, and the honesty boundary holds.** Deterministic
+  S3 routing for known storage-blob types (video/image/audio, archives,
+  DB backups) shipped 2026-05-17 on `dev_branch` and is unit-tested (the
+  full suite — 809 tests — passes). This run is the real-corpus
+  *confirmation* — not a discovery of whether the branch is dead. Two
+  things must hold in `routing-report.json`:
+  - **(a) Blobs reach S3, deterministically.** The junk stream's
+    storage-blob files (`.mp4`, `.zip`, `.tar.gz` → ext `.gz`, `.sql`,
+    `.bak`) appear as `StorageBlobMedia` / `StorageBlobArchive` /
+    `StorageBlobBackup` categories with `destination: "s3"` **and
+    `low_confidence: false`** (the deterministic, no-LLM signal — distinct
+    from the `Misc → s3` path, which is *low*-confidence, may also appear,
+    and is fine).
+  - **(b) The honesty boundary holds.** Non-blob unreadables in the same
+    pile — a password-locked `.pdf`, an unknown-extension binary, and a
+    zero-byte file *of a no-extractor type* (e.g. `.bin`; note a zero-byte
+    `.txt` extracts as empty-but-OK and is **not** quarantined, so it is
+    not a valid counter-example) — must stay in the quarantine section
+    (`_NoExtractor` / `_ExtractionFailed`) with no cloud destination.
+    Evidence: those quarantine buckets are present in
+    `routing-report.json`. (We do **not** assert "no other category
+    reached s3" — the LLM router and the pre-existing
+    `all_extraction_failed` short-circuit may legitimately send normal
+    categories to s3; that is not a honesty violation.) The feature must
+    be precise, not S3-greedy.
 
-  **Precondition for the verdict:** the router stage swallows its own
-  failures (`fda/organize/__init__.py` logs `router stage failed` and
-  continues). "S3 did not fire" is only a valid #5 finding if the run
-  *actually routed*: `routing-report.json` must exist and be readable, and
-  the organize log must contain **no** `router stage failed` line. If either
-  check fails the run is inconclusive for #5 — rerun, do not record a
-  verdict.
+  **Precondition for the verdict (unchanged):** the router stage swallows
+  its own failures (`fda/organize/__init__.py` logs `router stage failed`
+  and continues). A #5 verdict is valid only if the run *actually routed*:
+  `routing-report.json` must exist and be readable, and the organize log
+  must contain **no** `router stage failed` line. If either check fails the
+  run is inconclusive for #5 — rerun, do not record a verdict.
 
 ## Background that shaped this design
 
@@ -99,22 +120,28 @@ Persistent, reusable source folder: `doc_agent_test_data/04_mock_korean/`.
 
 Persistent source folder: `doc_agent_test_data/05_mock_s3bait_junk/`.
 
-A realistic messy-folder junk mix: `.log`, `.mp4` (tiny valid stub), `.zip`,
-`.sql` / `.bak` (DB-dump-like), `.tar.gz`, password-locked `.pdf`,
-zero-byte files, `.DS_Store`.
+A realistic messy-folder junk mix in two roles:
+- **S3 drivers** — storage-blob types: `.mp4`, `.zip`, `.tar.gz`,
+  `.sql`/`.bak`.
+- **Honesty counter-examples** — genuinely unreadable but NOT storage-blob
+  types: password-locked `.pdf` (→ `_ExtractionFailed/pdf`), an
+  unknown-extension binary `.xyz` (→ `_NoExtractor/xyz`), and a zero-byte
+  `.bin` (→ `_NoExtractor/bin`; **not** `.txt` — empty `.txt` extracts OK
+  and is not quarantined). Plus plain noise: `.log` (readable),
+  `.DS_Store` (junk).
 
-The `s3` short-circuit does **not** depend on file extension. It fires when
-a router category is the catch-all `Misc` **or** when every file in that
-category failed text extraction (`signals.all_extraction_failed`,
-`fda/organize/router.py:_short_circuit`). The quarantine layer groups
-unextractable files by extension into `_NoExtractor/<ext>/` and
-`_ExtractionFailed/<ext>/` buckets; any such bucket whose files all failed
-extraction is, by construction, an `all_extraction_failed` category — so it
-trips the `s3` short-circuit. The junk pile only needs **enough genuinely
-unreadable files of one extension to form one such bucket** to resolve #5.
-The broader extension *variety* is a separate, user-chosen goal: exercising
-the quarantine layer across multiple extensions. It is not what triggers
-`s3`.
+The `s3` route now fires **per file, deterministically, by storage-blob
+extension**. `fda/organize/storage_blobs.py` recognizes the known
+storage-blob types; the pipeline carves them out of quarantine into three
+real folders (`미디어_Media`, `압축파일_Archives`, `백업_Backups`) and
+`router._short_circuit` sends those three category ids to `s3` at **high
+confidence, with no LLM call**. So the junk pile resolves #5(a) by
+containing at least one file of each of the three blob families. The
+remaining unreadable files (password-locked `.pdf`, zero-byte,
+unknown-extension) are **not** a storage-blob type; they are the #5(b)
+honesty counter-examples and must stay quarantined with no cloud
+destination. (`Misc → s3` at *low* confidence is a separate, pre-existing
+path; it is not what this stream exercises.)
 
 ### Stream 2 — real files (~140)
 
@@ -142,15 +169,16 @@ the quarantine layer across multiple extensions. It is not what triggers
 | `scripts/randomize_fda_fixture.py` | existing, reused | Pools all sources (`--source NAME=PATH` ×N, `--quota NAME=N`) → `/private/tmp/fda-test-sets/randomized-bilingual-2026-05-16-001/` + `manifest.csv`. No code change. |
 | `docs/superpowers/specs/2026-05-16-business-context.draft.ko.md` | new draft | Korean folder-granularity + doc-type rules. User edits it, then it is copied to `$FDA_HOME/business_context.md` (inside the throwaway sandbox) before the run. |
 | `scripts/diag_organize.py` | existing, reused | The run harness: `<fixture> --apply` runs the full pipeline (route + metadata on by default) with the standard Korean organize instructions. No code change. |
-| `scripts/evaluate_fda_fixture.py` | extend | Add: bucket-size histogram; explicit `S3 fired? yes/no`; `metadata.db` row count + Korean-search-returns-hits check (via a new `--fda-home` arg); Korean-label presence check on bucket subpaths / `routing-report.md`. Existing per-source landing and router-destination counts are kept. |
-| eyeball-notes file | new, post-run | Filled after the run; records the written verdict on #4 and #5. |
+| `scripts/evaluate_fda_fixture.py` | extend | Add: a consolidated `## Summary` scoreboard printed first; bucket-size histogram (blob folders flagged as expected); the #5 storage-blob→S3 + honesty-boundary check (`StorageBlob*` at `s3` with `low_confidence:false`; expected non-blob quarantine buckets `pdf`/`xyz`/`bin` present); `metadata.db` classified-row count + run success rate (seen/classified/failed/status from the `runs` audit row) + Korean-search-returns-hits check (via a new `--fda-home` arg); Korean-label presence check on bucket subpaths / `routing-report.md`. Existing per-source landing and router-destination counts are kept. |
+| eyeball-notes file | new, post-run | The assistant fills this after the operator pastes the scorecard: a plain written summary plus the #4/#5 verdicts (operator does not hand-fill). |
 
 ## Exact commands (pinned, not hand-wavy)
 
 This block shows the **post-implementation** invocation. Step 1
 (`build_korean_test_sources.py`) and step 6's `--fda-home` flag, the
-"S3 fired? yes/no" line, the `metadata.db` Korean-search check and the
-Korean-label scan are **deliverables of this work**, not current behavior;
+#5 storage-blob→S3 + honesty check, the `metadata.db` Korean-search check
+and the Korean-label scan are **deliverables of this work**, not current
+behavior;
 today `scripts/evaluate_fda_fixture.py` accepts only `fixture` /
 `--no-write`. `randomize_fda_fixture.py` and `diag_organize.py` are reused
 unchanged.
@@ -227,23 +255,49 @@ all sources ─► randomize_fda_fixture.py ─► $FIX/ (hash-named, folder_N) 
 $FIX ─► diag_organize.py --apply (FDA_HOME=$HOME_TMP) ─► organized tree
                                                        + $FIX/routing-report.{json,md}
                                                        + $HOME_TMP/metadata.db
-manifest.csv + routing-report.json + metadata.db ─► evaluate_fda_fixture.py ─► scorecard
-scorecard + manual eyeball ─► written verdict on #4 and #5
+manifest.csv + routing-report.json + metadata.db ─► evaluate_fda_fixture.py ─► scorecard (Summary scoreboard first)
+operator pastes scorecard ─► assistant writes plain summary + #4/#5 verdicts ─► eyeball-notes
 ```
 
 ## Grading (by looking — no automated cohesion scorer)
 
 `evaluate_fda_fixture.py` prints a plain scorecard. The #4 over-fragmentation
 judgement is made by a human reading the histogram, matching the runbook's
-own method. The scorecard adds, on top of today's output:
+own method. The scorecard **opens with a consolidated `## Summary`
+scoreboard** — one headline line per area (organized / routed-to-cloud /
+metadata) with the key numbers and a yes/no — so success is visible at a
+glance; the detailed sections below it remain. After the operator runs the
+pipeline and pastes the scorecard back, **the assistant writes a plain
+summary and the #4/#5 verdicts** (the operator does not hand-fill them).
+The scorecard adds, on top of today's output:
 
 - **Bucket-size histogram** — number of FDA-created folders and the file
-  count of each, sorted (the #4 signal).
-- **`S3 fired? yes/no`** — explicit one-liner derived from the router
-  destination counts (the #5 verdict at a glance), alongside the existing
-  per-destination counts.
-- **Metadata check** — open `$FDA_HOME/metadata.db`, report classified-row
-  count, and run one Korean FTS query (e.g. `계약`) that must return ≥1 hit.
+  count of each, sorted (the #4 signal). Up to three of these will be the
+  expected coarse storage-blob folders (`미디어_Media`,
+  `압축파일_Archives`, `백업_Backups`); **exclude them when judging
+  over-fragmentation** — they are S3 destinations by design, not the
+  classifier splitting a content type too finely.
+- **#5 — storage-blob → S3 + honesty** — two derived lines from
+  `routing-report.json`, alongside the existing per-destination counts:
+  **(a)** the `StorageBlob*` categories present at `s3` and whether each is
+  `low_confidence:false` (PASS needs ≥1); **(b)** whether the expected
+  non-blob-unreadable quarantine buckets are present —
+  `_ExtractionFailed/pdf`, `_NoExtractor/xyz`, `_NoExtractor/bin` — which
+  proves those files stayed quarantined rather than being pulled into a
+  routed/S3 path. (b) does **not** scan which categories reached `s3`,
+  because the LLM router and the `all_extraction_failed` short-circuit can
+  legitimately route normal categories there.
+- **Metadata check** — open `$FDA_HOME/metadata.db`: report the
+  classified-document row count, the run's **seen / classified / failed**
+  counts and derived status (`ok` if failed=0 and classified=seen, else
+  `partial`) read from the metadata engine's own `runs` audit row, and run
+  one Korean FTS query (e.g. `계약`) that must return ≥1 hit. Together these
+  answer "was the metadata layer built, how much of it succeeded, and is it
+  searchable" (not classification *accuracy* — that stays out of scope per
+  the grade-by-eye decision).
+- **Summary scoreboard** — a `## Summary` block printed first: organized
+  (folder count, verifier discrepancies), routed (per-destination counts +
+  #5(a)/(b) yes/no), metadata (classified/seen/failed + searchable yes/no).
 - **Korean-label presence** — scan bucket subpaths and `routing-report.md`
   for Hangul; report yes/no.
 
@@ -295,11 +349,19 @@ it is consulted by a human, not joined by the evaluator.
   single-face `.ttf` is usable — never tofu/garbled PDFs. Vendoring
   `NanumGothic.ttf` makes the test reproducible off this machine and is the
   preferred default.
-- **`s3` still does not fire** even with a guaranteed all-unreadable bucket
-  — *and* the verdict precondition holds (`routing-report.json` present, no
-  `router stage failed` in the log). Only then is it the definitive #5
-  finding (branch is dead → simplify the router to two destinations in
-  follow-up work). If the precondition fails, the run is inconclusive, not a
+- **Storage-blob → S3 regresses on a realistic corpus.** The feature is
+  unit-tested per file, but a pipeline-integration break (an extension
+  slips through, a blob is mis-quarantined, the merged groupings get
+  dropped) would not be caught by those unit tests — this run is the safety
+  net. Surfaced by #5(a) failing while the verdict precondition holds.
+- **S3-greedy regression.** A non-blob unreadable wrongly gets pulled out
+  of quarantine (the feature became too aggressive). Surfaced by #5(b): an
+  expected quarantine bucket (`_ExtractionFailed/pdf`, `_NoExtractor/xyz`,
+  `_NoExtractor/bin`) is missing from `routing-report.json` — the file
+  didn't stay put.
+- **Inconclusive run.** The router swallows its own failures, so if
+  `routing-report.json` is missing/unreadable or the log shows
+  `router stage failed`, the run cannot answer #5 — rerun, do not record a
   verdict.
 
 ## Out of scope
@@ -307,6 +369,8 @@ it is consulted by a human, not joined by the evaluator.
 - Generating `.hwpx` (cut — redundant given real `.hwp`).
 - Any automated cluster-cohesion / togetherness scoring (cut — #4 graded by
   eye per the approved decision).
-- Fixing #4 or #5 in this pass — this run produces *evidence*; fixes are
-  separate work driven by the verdict.
+- Fixing #4 in this pass — this run produces *evidence*; an over-
+  fragmentation fix is separate work driven by the verdict. The #5
+  storage-blob → S3 feature already shipped (2026-05-17); this run only
+  *confirms* it end-to-end and checks the honesty boundary.
 - Changes to `randomize_fda_fixture.py` or `diag_organize.py` (reused as-is).

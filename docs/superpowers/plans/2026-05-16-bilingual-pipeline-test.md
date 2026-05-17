@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build the tooling for one sandboxed FDA organize run on a ~300-file bilingual corpus that produces evidence for the 4 test goals and resolves backlog #4 (over-fragmentation) and #5 (is the `s3` router branch dead).
+**Goal:** Build the tooling for one sandboxed FDA organize run on a ~300-file bilingual corpus that produces evidence for the 4 test goals, grades backlog #4 (over-fragmentation) by eye, and confirms #5 (storage-blob → S3 fires deterministically AND the honesty boundary holds — the feature shipped 2026-05-17, this run is the real-corpus confirmation).
 
 **Architecture:** A new generator script writes two persistent, reusable source folders under `doc_agent_test_data/` (Korean business docs + realistic junk) with a ground-truth CSV; the existing `randomize_fda_fixture.py` pools all sources into one hash-renamed fixture; the existing `diag_organize.py` runs the pipeline under a sandboxed `FDA_HOME`; an extended `evaluate_fda_fixture.py` prints a plain scorecard graded by eye. This plan builds the tooling and artifacts only — it does NOT execute the expensive ~300-file pipeline run (operator-driven, real Claude backend).
 
@@ -18,7 +18,7 @@
 |---|---|
 | `scripts/build_korean_test_sources.py` (create) | Deterministic generator: Korean docs (`.docx/.pdf/.txt`), `ground_truth.csv`, realistic junk; PDF font resolution + faithful self-verify. |
 | `tests/test_build_korean_test_sources.py` (create) | Unit + smoke tests for the generator's pure logic and self-verify hard-fail. |
-| `scripts/evaluate_fda_fixture.py` (modify) | Add `--fda-home`, bucket-size histogram, "S3 fired?" line + router precondition, `metadata.db` Korean-search check, Hangul-label scan. |
+| `scripts/evaluate_fda_fixture.py` (modify) | Add `--fda-home`, bucket-size histogram (blob folders flagged expected), #5 storage-blob→S3 + honesty-boundary check + router precondition, `metadata.db` Korean-search check, Hangul-label scan. |
 | `tests/test_evaluate_fda_fixture.py` (modify) | Tests for each new evaluator helper. |
 | `docs/superpowers/specs/2026-05-16-business-context.draft.ko.md` (create) | Korean `business_context.md` draft (folder-granularity + doc-type rules); user edits before the run. |
 | `docs/superpowers/plans/2026-05-16-bilingual-pipeline-test-eyeball-notes.md` (create) | Post-run verdict skeleton for #4 and #5. |
@@ -413,7 +413,7 @@ git commit -m "feat(test-gen): Korean PDF writer with font resolution + FDA-fait
 - Modify: `scripts/build_korean_test_sources.py`
 - Test: `tests/test_build_korean_test_sources.py`
 
-Must guarantee at least one cluster of genuinely-unextractable files **of the same extension** so the quarantine layer forms an `all_extraction_failed` bucket (drives `s3` per spec). Password-locked PDFs are the reliable choice.
+S3 firing is now per-file deterministic by storage-blob extension (shipped 2026-05-17; `fda/organize/storage_blobs.py`). The junk pile must contain at least one file of each of the three storage-blob families so all three folders (`미디어_Media`/`압축파일_Archives`/`백업_Backups`) appear and route to `s3`: media (`.mp4`), archive (`.zip`, `.tar.gz` → ext `.gz`), backup (`.sql`, `.bak`). A few of each — the old "guaranteed same-ext unextractable cluster" requirement is obsolete (a single blob file already trips s3). The password-locked `.pdf`s, zero-byte `.bin` files (NOT `.txt` — an empty `.txt` extracts ok and would not quarantine), and one unknown-extension `.xyz` binary are the **honesty counter-examples**: genuinely unreadable but NOT storage-blob types, so they must stay quarantined with no cloud destination (spec #5(b)).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -421,18 +421,52 @@ Must guarantee at least one cluster of genuinely-unextractable files **of the sa
 # append to tests/test_build_korean_test_sources.py
 
 
-def test_junk_includes_unextractable_pdf_cluster(gen, tmp_path):
+def test_junk_drives_s3_via_storage_blobs_and_keeps_honesty_counterexamples(
+    gen, tmp_path,
+):
+    from fda.organize._extractors import extract
+    from fda.organize.models import CatalogEntry
+    from fda.organize.storage_blobs import storage_blob_bucket
+
     out = tmp_path / "junk"
     made = gen.build_junk(out, rng=__import__("random").Random("seed"))
-    locked = sorted(out.glob("*.pdf"))
-    assert len(locked) >= 5, "need a same-ext unextractable cluster for s3"
-    from fda.organize._extractors import extract
+    by_name = {p.name: p for p in made}
 
-    r = extract(locked[0])
-    assert getattr(r, "status", "") != "ok", "locked PDF must be unextractable"
-    names = {p.name for p in made}
-    assert ".DS_Store" in names
-    assert any(p.stat().st_size == 0 for p in made), "need a zero-byte file"
+    def _bucket_for(path):
+        # Faithful: use the SAME storage_blob_bucket the pipeline uses, with
+        # the extract_status the reader would assign.
+        st = getattr(extract(path), "status", "no_extractor")
+        e = CatalogEntry(
+            path_id="f0", path=str(path), ext=path.suffix.lower(),
+            size_bytes=path.stat().st_size, summary="", type_label="",
+            is_junk=False, summary_failed=False, extract_status=st,
+        )
+        return storage_blob_bucket(e)
+
+    # (a) Each storage-blob family is present and maps to its S3 bucket.
+    media = [p for p in made if p.suffix == ".mp4"]
+    archive = [p for p in made if p.suffix in (".zip", ".gz")]
+    backup = [p for p in made if p.suffix in (".sql", ".bak")]
+    assert media and archive and backup, "need all 3 blob families for #5(a)"
+    assert _bucket_for(media[0])[0] == "StorageBlobMedia"
+    assert _bucket_for(archive[0])[0] == "StorageBlobArchive"
+    assert _bucket_for(backup[0])[0] == "StorageBlobBackup"
+
+    # (b) Honesty counter-examples: unreadable but NOT a storage-blob type.
+    locked = sorted(out.glob("locked_*.pdf"))
+    assert len(locked) >= 5, "need password-locked PDFs as honesty counter-examples"
+    assert getattr(extract(locked[0]), "status", "") != "ok"
+    assert _bucket_for(locked[0]) is None, "password PDF must NOT be a blob"
+    unknown = [p for p in made if p.suffix == ".xyz"]
+    assert unknown and _bucket_for(unknown[0]) is None
+    # Zero-byte counter-example must be a NO-EXTRACTOR type (.bin), not
+    # .txt: an empty .txt extracts ok and would not quarantine.
+    zero = [p for p in made if p.stat().st_size == 0]
+    assert zero, "need a zero-byte file"
+    assert all(p.suffix == ".bin" for p in zero), "zero-byte must be .bin"
+    assert getattr(extract(zero[0]), "status", "") != "ok"
+    assert _bucket_for(zero[0]) is None, "zero-byte .bin must NOT be a blob"
+    assert ".DS_Store" in by_name
     assert any(p.suffix == ".log" for p in made)
 ```
 
@@ -448,7 +482,8 @@ Insert into `scripts/build_korean_test_sources.py` above `def main`:
 ```python
 def _locked_pdf_bytes() -> bytes:
     """A minimal encrypted (password-protected) PDF: pdftotext cannot
-    extract text from it, so it lands in the quarantine all-failed bucket."""
+    extract text from it. `.pdf` is NOT a storage-blob type, so this is a
+    #5(b) honesty counter-example — it must stay quarantined, never S3."""
     from reportlab.pdfgen import canvas
     import io
 
@@ -467,40 +502,29 @@ def _locked_pdf_bytes() -> bytes:
 def build_junk(out: Path, *, rng: random.Random) -> list[Path]:
     """Write a realistic junk pile; return the created paths.
 
-    Guarantees >=6 same-extension password-locked PDFs (the deterministic
-    s3 driver) plus multi-extension quarantine coverage.
+    S3 drivers (#5a): a few files of each storage-blob family so all three
+    folders (미디어_Media / 압축파일_Archives / 백업_Backups) appear and
+    route to s3 deterministically. Honesty counter-examples (#5b): the
+    password-locked PDFs, zero-byte `.bin` files (a no-extractor type — an
+    empty `.txt` would extract ok and NOT quarantine), and an
+    unknown-extension `.xyz` binary are genuinely unreadable but NOT
+    storage-blob types — they must stay quarantined with no cloud
+    destination.
     """
     out.mkdir(parents=True, exist_ok=True)
     made: list[Path] = []
 
-    for i in range(6):  # same-ext unextractable cluster -> s3
-        p = out / f"locked_{i:02d}.pdf"
-        p.write_bytes(_locked_pdf_bytes())
+    # --- S3 drivers: storage-blob families (#5a) -----------------------
+    for i in range(3):  # media -> StorageBlobMedia
+        p = out / f"clip_{i:02d}.mp4"
+        p.write_bytes(b"\x00\x00\x00\x18ftypmp42" + rng.randbytes(64))
         made.append(p)
-
-    for i in range(3):
-        p = out / f"app_{i}.log"
-        p.write_text(f"[INFO] line {i}\n" * 50, encoding="utf-8")
+    for i in range(3):  # archive -> StorageBlobArchive
+        p = out / f"backup_{i:02d}.zip"
+        with zipfile.ZipFile(p, "w") as zf:
+            zf.writestr("inner.txt", f"x{i}")
         made.append(p)
-
-    mp4 = out / "clip.mp4"
-    mp4.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 64)
-    made.append(mp4)
-
-    sql = out / "db_dump.sql"
-    sql.write_text("-- dump\nINSERT INTO t VALUES (1);\n", encoding="utf-8")
-    made.append(sql)
-
-    bak = out / "old.bak"
-    bak.write_bytes(rng.randbytes(256))
-    made.append(bak)
-
-    z = out / "backup.zip"
-    with zipfile.ZipFile(z, "w") as zf:
-        zf.writestr("inner.txt", "x")
-    made.append(z)
-
-    tgz = out / "release.tar.gz"
+    tgz = out / "release.tar.gz"  # archive (Path.suffix == ".gz")
     with tarfile.open(tgz, "w:gz") as tf:
         info = tarfile.TarInfo("inner.txt")
         data = b"x"
@@ -509,12 +533,35 @@ def build_junk(out: Path, *, rng: random.Random) -> list[Path]:
 
         tf.addfile(info, _io.BytesIO(data))
     made.append(tgz)
-
-    for i in range(2):
-        p = out / f"empty_{i}.txt"
-        p.write_bytes(b"")
+    for i in range(2):  # backup -> StorageBlobBackup
+        p = out / f"db_dump_{i:02d}.sql"
+        p.write_text(
+            f"-- dump {i}\nINSERT INTO t VALUES ({i});\n", encoding="utf-8"
+        )
+        made.append(p)
+    for i in range(2):  # backup -> StorageBlobBackup
+        p = out / f"old_{i:02d}.bak"
+        p.write_bytes(rng.randbytes(256))
         made.append(p)
 
+    # --- Honesty counter-examples: unreadable but NOT blobs (#5b) -------
+    for i in range(6):  # password-locked PDFs
+        p = out / f"locked_{i:02d}.pdf"
+        p.write_bytes(_locked_pdf_bytes())
+        made.append(p)
+    unknown = out / "mystery.xyz"  # unknown extension, no extractor
+    unknown.write_bytes(rng.randbytes(128))
+    made.append(unknown)
+    for i in range(2):  # zero-byte, NO-EXTRACTOR type. NOT .txt: an empty
+        p = out / f"empty_{i}.bin"  # .txt extracts as ok and would NOT
+        p.write_bytes(b"")          # quarantine -> false honesty signal.
+        made.append(p)
+
+    # --- Plain noise (readable / OS junk) ------------------------------
+    for i in range(3):
+        p = out / f"app_{i}.log"
+        p.write_text(f"[INFO] line {i}\n" * 50, encoding="utf-8")
+        made.append(p)
     ds = out / ".DS_Store"
     ds.write_bytes(b"\x00\x00\x00\x01Bud1")
     made.append(ds)
@@ -531,7 +578,7 @@ Expected: PASS.
 
 ```bash
 git add scripts/build_korean_test_sources.py tests/test_build_korean_test_sources.py
-git commit -m "feat(test-gen): realistic junk / s3-bait with guaranteed unextractable cluster"
+git commit -m "feat(test-gen): junk pile drives s3 via storage blobs + honesty counter-examples"
 ```
 
 ---
@@ -718,71 +765,157 @@ git commit -m "feat(eval): bucket-size histogram helper (#4 signal)"
 
 ---
 
-## Task 6: evaluator — "S3 fired?" + router precondition
+## Task 6: evaluator — #5 storage-blob → S3 + honesty boundary
 
 **Files:**
 - Modify: `scripts/evaluate_fda_fixture.py`
 - Test: `tests/test_evaluate_fda_fixture.py`
 
-Per spec: "S3 did not fire" is only a #5 verdict if routing actually ran (`routing-report.json` present & readable).
+Two helpers, read from `routing-report.json` only (no per-file manifest
+join — keeps this an eyeball check, not an assertion harness):
+`blob_s3_check` (#5a: a `StorageBlob*` category reached `s3` at
+`low_confidence:false`) and `s3_honesty_ok` (#5b: the expected
+non-blob-unreadable quarantine buckets — by extension `pdf`, `xyz`, `bin`
+— are present, proving those files stayed quarantined). **#5(b)
+deliberately does NOT scan which categories reached `s3`**: the router
+has three s3 short-circuits (`StorageBlob*`, `Misc`,
+`signals.all_extraction_failed`, `fda/organize/router.py`) AND the LLM
+router may pick `s3` for a normal readable category — all legitimate, so
+a "no other category at s3" rule would raise false honesty alarms.
+`None` routing_data ⇒ INCONCLUSIVE per the spec precondition (the router
+swallows its own failures). `routing-report.json` schema (from
+`router._report_to_dict`): top-level `categories[]` (each `name`,
+`destination`, `low_confidence`, …) and `quarantine[]` (each `bucket`,
+`ext`, `entries`; `ext` is dot-stripped, e.g. `"pdf"`).
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing tests**
 
 ```python
 # append to tests/test_evaluate_fda_fixture.py
 
 
-def test_s3_verdict(evaluator):
-    fired = {"categories": [{"destination": "s3", "signals": {}}]}
-    none = {"categories": [{"destination": "sharepoint", "signals": {}}]}
-    assert evaluator.s3_verdict(fired) == "yes"
-    assert evaluator.s3_verdict(none) == "no"
-    assert evaluator.s3_verdict(None) == "INCONCLUSIVE (no routing-report.json)"
+def test_blob_s3_check(evaluator):
+    fired = {"categories": [
+        {"name": "StorageBlobMedia", "destination": "s3",
+         "low_confidence": False},
+        {"name": "영업", "destination": "sharepoint",
+         "low_confidence": False},
+    ]}
+    only_misc = {"categories": [
+        {"name": "Misc", "destination": "s3", "low_confidence": True},
+    ]}
+    assert evaluator.blob_s3_check(fired)["verdict"] == "yes"
+    assert evaluator.blob_s3_check(only_misc)["verdict"] == "no"
+    assert evaluator.blob_s3_check(None)["verdict"].startswith(
+        "INCONCLUSIVE"
+    )
+
+
+def test_s3_honesty_ok(evaluator):
+    good = {"quarantine": [
+        {"bucket": "_ExtractionFailed", "ext": "pdf", "entries": [{}]},
+        {"bucket": "_NoExtractor", "ext": "xyz", "entries": [{}]},
+        {"bucket": "_NoExtractor", "ext": "bin", "entries": [{}]},
+    ]}
+    missing_bin = {"quarantine": [
+        {"bucket": "_ExtractionFailed", "ext": "pdf", "entries": [{}]},
+        {"bucket": "_NoExtractor", "ext": "xyz", "entries": [{}]},
+    ]}
+    assert evaluator.s3_honesty_ok(good)["verdict"] == "yes"
+    r = evaluator.s3_honesty_ok(missing_bin)
+    assert r["verdict"] == "no"
+    assert r["missing"] == ["bin"]
+    assert evaluator.s3_honesty_ok(None)["verdict"].startswith(
+        "INCONCLUSIVE"
+    )
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [ ] **Step 2: Run tests to verify they fail**
 
-Run: `.venv/bin/python -m pytest tests/test_evaluate_fda_fixture.py -q -k s3_verdict`
-Expected: FAIL — `s3_verdict` undefined.
+Run: `.venv/bin/python -m pytest tests/test_evaluate_fda_fixture.py -q -k "blob_s3 or honesty"`
+Expected: FAIL — `blob_s3_check` / `s3_honesty_ok` undefined.
 
-- [ ] **Step 3: Implement the helper**
+- [ ] **Step 3: Implement the helpers**
 
 Add to `scripts/evaluate_fda_fixture.py` (above `def main`):
 
 ```python
-def s3_verdict(routing_data: dict | None) -> str:
-    """yes/no/INCONCLUSIVE. None => routing-report.json missing or
-    unreadable => the run cannot answer #5 (router failures are swallowed
-    by organize(); see spec precondition)."""
+def blob_s3_check(routing_data: dict | None) -> dict:
+    """#5(a): a StorageBlob* category reached s3 at high confidence.
+
+    Returns {"verdict": "yes"|"no"|"INCONCLUSIVE ...",
+             "blob_s3": [(name, low_confidence), ...]}.
+    None => routing-report.json missing/unreadable => the run cannot
+    answer #5 (router failures are swallowed by organize(); spec
+    precondition)."""
     if routing_data is None:
-        return "INCONCLUSIVE (no routing-report.json)"
-    for c in routing_data.get("categories", []) or []:
-        if c.get("destination") == "s3":
-            return "yes"
-    return "no"
+        return {"verdict": "INCONCLUSIVE (no routing-report.json)",
+                "blob_s3": []}
+    blob_s3 = [
+        (c.get("name", ""), bool(c.get("low_confidence")))
+        for c in routing_data.get("categories", []) or []
+        if c.get("destination") == "s3"
+        and str(c.get("name", "")).startswith("StorageBlob")
+    ]
+    ok = any(lc is False for _, lc in blob_s3)
+    return {"verdict": "yes" if ok else "no", "blob_s3": blob_s3}
+
+
+def s3_honesty_ok(
+    routing_data: dict | None,
+    *,
+    expect_ext: tuple[str, ...] = ("pdf", "xyz", "bin"),
+) -> dict:
+    """#5(b): the non-blob unreadables stayed quarantined (not S3-routed).
+
+    Proven by their quarantine buckets being present in the report:
+    password .pdf -> _ExtractionFailed/pdf, mystery.xyz ->
+    _NoExtractor/xyz, zero-byte .bin -> _NoExtractor/bin. Read from the
+    report alone. We do NOT inspect which categories reached s3 — the LLM
+    router and the all_extraction_failed short-circuit can legitimately
+    send normal categories there, so that is not a honesty signal."""
+    if routing_data is None:
+        return {"verdict": "INCONCLUSIVE (no routing-report.json)",
+                "present": [], "missing": list(expect_ext)}
+    q_exts = {
+        str(g.get("ext", "")).lower()
+        for g in routing_data.get("quarantine", []) or []
+    }
+    present = [e for e in expect_ext if e in q_exts]
+    missing = [e for e in expect_ext if e not in q_exts]
+    return {"verdict": "yes" if not missing else "no",
+            "present": present, "missing": missing}
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [ ] **Step 4: Run tests to verify they pass**
 
-Run: `.venv/bin/python -m pytest tests/test_evaluate_fda_fixture.py -q -k s3_verdict`
+Run: `.venv/bin/python -m pytest tests/test_evaluate_fda_fixture.py -q -k "blob_s3 or honesty"`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add scripts/evaluate_fda_fixture.py tests/test_evaluate_fda_fixture.py
-git commit -m "feat(eval): explicit S3-fired verdict with routing precondition (#5)"
+git commit -m "feat(eval): #5 storage-blob->s3 + honesty-boundary checks"
 ```
 
 ---
 
-## Task 7: evaluator — metadata.db Korean-search check
+## Task 7: evaluator — metadata.db count + success rate + Korean search
 
 **Files:**
 - Modify: `scripts/evaluate_fda_fixture.py`
 - Test: `tests/test_evaluate_fda_fixture.py`
 
-`metadata.db` schema: `documents` table; FTS5 `documents_fts(summary, keywords)` with `trigram` tokenizer (`fda/metadata/schema.py:161`). Trigram supports CJK substring `MATCH`.
+`metadata.db` schema (confirmed in `fda/metadata/store.py` / `schema.py`):
+`documents` (one row per successfully classified file); FTS5
+`documents_fts(summary, keywords)` with `trigram` tokenizer — trigram
+supports CJK substring `MATCH`; and a `runs` audit table — the metadata
+engine writes one row per invocation with columns including `started_at`,
+`files_seen`, `files_classified`, `files_failed` (`store.py:101-105`). The
+sandbox `FDA_HOME` holds exactly one organize run, so the most-recent
+`runs` row IS that run; `failed=0 AND classified=seen ⇒ status "ok"` else
+`"partial"`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -791,30 +924,61 @@ git commit -m "feat(eval): explicit S3-fired verdict with routing precondition (
 import sqlite3
 
 
-def test_metadata_check_counts_and_korean_hits(evaluator, tmp_path):
-    db = tmp_path / "metadata.db"
-    conn = sqlite3.connect(db)
+def _seed_metadata_db(path, *, seen, classified, failed):
+    import sqlite3 as _s
+    conn = _s.connect(path)
     conn.execute(
         "CREATE VIRTUAL TABLE documents_fts USING fts5("
         "summary, keywords, tokenize='trigram')"
     )
     conn.execute("CREATE TABLE documents (sha256 TEXT PRIMARY KEY)")
-    conn.execute("INSERT INTO documents VALUES ('a')")
-    conn.execute("INSERT INTO documents VALUES ('b')")
+    conn.execute(
+        "CREATE TABLE runs (run_id TEXT PRIMARY KEY, started_at TEXT, "
+        "finished_at TEXT, files_seen INT, files_classified INT, "
+        "files_failed INT)"
+    )
+    for i in range(classified):
+        conn.execute("INSERT INTO documents VALUES (?)", (f"sha{i}",))
     conn.execute(
         "INSERT INTO documents_fts(summary, keywords) "
         "VALUES ('계약서 라이온켐텍 분기보고서', '계약')"
     )
+    conn.execute(
+        "INSERT INTO runs VALUES ('r1','2026-05-17T00:00Z',"
+        "'2026-05-17T00:01Z',?,?,?)",
+        (seen, classified, failed),
+    )
     conn.commit()
     conn.close()
 
-    res = evaluator.metadata_check(tmp_path, query="계약")
-    assert res["rows"] == 2
+
+def test_metadata_check_counts_korean_hits_and_success_rate(
+    evaluator, tmp_path,
+):
+    ok_home = tmp_path / "ok"
+    ok_home.mkdir()
+    _seed_metadata_db(ok_home / "metadata.db", seen=5, classified=5, failed=0)
+    res = evaluator.metadata_check(ok_home, query="계약")
+    assert res["rows"] == 5
     assert res["korean_hits"] >= 1
+    assert (res["seen"], res["classified"], res["failed"]) == (5, 5, 0)
+    assert res["status"] == "ok"
+    assert not res["error"]
+
+    part_home = tmp_path / "part"
+    part_home.mkdir()
+    _seed_metadata_db(
+        part_home / "metadata.db", seen=10, classified=8, failed=2
+    )
+    part = evaluator.metadata_check(part_home, query="계약")
+    assert (part["seen"], part["classified"], part["failed"]) == (10, 8, 2)
+    assert part["status"] == "partial"
 
     missing = evaluator.metadata_check(tmp_path / "nope", query="계약")
     assert missing["rows"] == 0
     assert missing["korean_hits"] == 0
+    assert missing["seen"] == 0
+    assert missing["status"] == "no metadata.db"
     assert missing["error"]
 ```
 
@@ -829,13 +993,16 @@ Add to `scripts/evaluate_fda_fixture.py` (above `def main`; add `import sqlite3`
 
 ```python
 def metadata_check(fda_home: Path, *, query: str = "계약") -> dict:
-    """Open <fda_home>/metadata.db; return classified-row count and
-    Korean FTS hit count. Never raises — a missing/locked DB is a
+    """Open <fda_home>/metadata.db; report classified-doc count, the run's
+    seen/classified/failed (+ derived status) from the `runs` audit row,
+    and Korean FTS hit count. Never raises — a missing/locked DB is a
     reported finding, not a crash."""
-    out = {"rows": 0, "korean_hits": 0, "error": ""}
+    out = {"rows": 0, "korean_hits": 0, "seen": 0, "classified": 0,
+           "failed": 0, "status": "unknown", "error": ""}
     db = Path(fda_home) / "metadata.db"
     if not db.exists():
         out["error"] = f"metadata.db not found at {db}"
+        out["status"] = "no metadata.db"
         return out
     try:
         conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
@@ -848,6 +1015,22 @@ def metadata_check(fda_home: Path, *, query: str = "계약") -> dict:
                 "WHERE documents_fts MATCH ?",
                 (query,),
             ).fetchone()[0]
+            row = conn.execute(
+                "SELECT files_seen, files_classified, files_failed "
+                "FROM runs ORDER BY started_at DESC LIMIT 1"
+            ).fetchone()
+            if row is None:
+                out["status"] = "no run row"
+            else:
+                out["seen"] = int(row[0] or 0)
+                out["classified"] = int(row[1] or 0)
+                out["failed"] = int(row[2] or 0)
+                out["status"] = (
+                    "ok"
+                    if out["failed"] == 0
+                    and out["classified"] == out["seen"]
+                    else "partial"
+                )
         finally:
             conn.close()
     except Exception as e:  # noqa: BLE001
@@ -864,12 +1047,12 @@ Expected: PASS.
 
 ```bash
 git add scripts/evaluate_fda_fixture.py tests/test_evaluate_fda_fixture.py
-git commit -m "feat(eval): metadata.db row count + Korean FTS check"
+git commit -m "feat(eval): metadata.db row count + run success rate + Korean FTS"
 ```
 
 ---
 
-## Task 8: evaluator — Hangul scan + wire new sections into report/CLI
+## Task 8: evaluator — Hangul scan + Summary scoreboard + wire sections
 
 **Files:**
 - Modify: `scripts/evaluate_fda_fixture.py`
@@ -929,16 +1112,26 @@ Then, in `main()`, immediately before the `output = "\n".join(report) + "\n"` li
             rdata = json.loads(routing_json.read_text(encoding="utf-8"))
         except Exception:  # noqa: BLE001
             rdata = None
+    a = blob_s3_check(rdata)
+    b = s3_honesty_ok(rdata)
     write_lines(
-        report, "## #5 — S3 fired?", "",
-        f"- {s3_verdict(rdata)}", "",
+        report, "## #5 — storage-blob -> S3 + honesty", "",
+        f"- (a) blob->s3 high-confidence: {a['verdict']}"
+        + (f"  [{', '.join(f'{n}:lc={lc}' for n, lc in a['blob_s3'])}]"
+           if a["blob_s3"] else ""),
+        f"- (b) honesty (non-blob unreadables quarantined): {b['verdict']}"
+        f"  present={b['present']}"
+        + (f" missing={b['missing']}" if b.get("missing") else ""),
+        "",
     )
 
-    if args.fda_home:
-        mc = metadata_check(Path(args.fda_home))
+    mc = metadata_check(Path(args.fda_home)) if args.fda_home else None
+    if mc is not None:
         write_lines(
             report, "## Metadata layer", "",
             f"- classified rows: {mc['rows']}",
+            f"- run success: {mc['classified']}/{mc['seen']} classified, "
+            f"{mc['failed']} failed (status: {mc['status']})",
             f"- Korean search '계약' hits: {mc['korean_hits']}",
             (f"- error: {mc['error']}" if mc["error"] else ""),
             "",
@@ -955,6 +1148,35 @@ Then, in `main()`, immediately before the `output = "\n".join(report) + "\n"` li
         f"- routing-report.md contains Hangul: {'yes' if md_ko else 'no'}",
         "",
     )
+
+    # --- Consolidated Summary scoreboard, PREPENDED so the scorecard
+    #     opens with it (spec: "scorecard opens with a ## Summary"). All
+    #     pieces above are already computed; we just aggregate + prepend.
+    dest_counts: dict[str, int] = {}
+    for c in (rdata or {}).get("categories", []) or []:
+        d = c.get("destination", "?")
+        dest_counts[d] = dest_counts.get(d, 0) + 1
+    dest_str = ", ".join(
+        f"{k}={dest_counts[k]}" for k in sorted(dest_counts)
+    ) or "(none)"
+    md_line = (
+        f"{mc['classified']}/{mc['seen']} classified, {mc['failed']} "
+        f"failed (status {mc['status']}), searchable "
+        f"{'yes' if mc['korean_hits'] else 'no'}"
+        if mc is not None else "(no --fda-home; metadata not checked)"
+    )
+    summary = [
+        "## Summary", "",
+        f"- organized: {len(hist)} folders "
+        f"(incl. up to 3 expected blob folders — exclude for #4)",
+        f"- routed to cloud: {dest_str} | #5(a) blob->s3 {a['verdict']} | "
+        f"#5(b) honesty {b['verdict']}",
+        f"- metadata: {md_line}",
+        f"- Korean labels: {ko_buckets}/{len(by_bucket)} buckets, "
+        f"routing-report.md Hangul {'yes' if md_ko else 'no'}",
+        "",
+    ]
+    report[:0] = summary
 ```
 
 - [ ] **Step 4: Run the FULL suite (spec gate)**
@@ -966,7 +1188,7 @@ Expected: PASS, no regressions (the spec requires the full suite green after the
 
 ```bash
 git add scripts/evaluate_fda_fixture.py tests/test_evaluate_fda_fixture.py
-git commit -m "feat(eval): Hangul scan + wire histogram/S3/metadata/Korean into scorecard"
+git commit -m "feat(eval): Hangul scan + Summary scoreboard + wire all sections"
 ```
 
 ---
@@ -1027,11 +1249,21 @@ This plan builds tooling only. The ~300-file pipeline run is operator-driven (re
 - [ ] **Step 1: Write the verdict skeleton**
 
 ```markdown
-# Bilingual pipeline test — eyeball notes (fill after the run)
+# Bilingual pipeline test — eyeball notes
 
 Spec: docs/superpowers/specs/2026-05-16-bilingual-pipeline-test-design.md
 Fixture: /private/tmp/fda-test-sets/randomized-bilingual-2026-05-16-001
 Seed: bilingual-2026-05-16   FDA_HOME: <sandbox dir>
+
+> Filled by the ASSISTANT after the operator runs the pipeline and pastes
+> back the `evaluate_fda_fixture.py` scorecard (which opens with its own
+> `## Summary`). The operator does not hand-fill the verdicts.
+
+## Assistant summary (plain-language, written post-run)
+- organized: ___
+- routed to cloud: ___
+- metadata layer: ___
+- overall: ___
 
 ## Preconditions (must hold before recording any verdict)
 - [ ] routing-report.json present and readable
@@ -1040,16 +1272,21 @@ Seed: bilingual-2026-05-16   FDA_HOME: <sandbox dir>
 
 ## Goal 1 — organization quality (#4)
 - buckets: ___  sizes: ___
+  (exclude 미디어_Media / 압축파일_Archives / 백업_Backups — expected
+   S3 folders by design, NOT over-fragmentation)
 - verifier discrepancies: ___ (must be 0)
 - VERDICT #4 (over-fragmentation): ___
 
-## Goal 2 — router (#5)
+## Goal 2 — router (#5: storage-blob -> S3 + honesty)
 - sharepoint ___ | s3 ___ | rdbms ___
-- S3 fired? ___
-- VERDICT #5 (s3 branch dead?): ___
+- (a) StorageBlob* at s3, low_confidence=false? ___  (list: ___)
+- (b) non-blob unreadables quarantined — buckets pdf/xyz/bin present? ___
+      (missing: ___)
+- VERDICT #5: ___
 
 ## Goal 3 — metadata layer
 - classified rows: ___  | Korean '계약' hits: ___
+- run success: ___/___ classified, ___ failed (status: ___)
 
 ## Goal 4 — Korean handling
 - Hangul bucket names: ___/___  | routing-report.md Hangul: ___
@@ -1072,8 +1309,8 @@ git commit -m "docs(test): eyeball-notes verdict skeleton for #4/#5"
 
 ## Self-Review (completed by plan author)
 
-**Spec coverage:** generator script (Tasks 1-4) ✓; embedded-TTF Korean PDF + font resolution + reject .ttc + loud failure (Task 2) ✓; FDA-faithful self-verify (Task 2) ✓; no `.hwpx` (out of scope, honored) ✓; realistic junk + guaranteed same-ext unextractable cluster for s3 (Task 3) ✓; ground_truth.csv human-reference only, no automated cohesion scorer (Task 4, not consumed by evaluator) ✓; reportlab into `.venv` only (Task 0) ✓; evaluator `--fda-home` + histogram + S3-fired + routing precondition + metadata Korean search + Hangul scan (Tasks 5-8) ✓; Korean business_context draft (Task 9) ✓; run command + eyeball skeleton, run NOT auto-executed (Task 10) ✓; full suite gate after evaluator change (Tasks 8 & 10) ✓; generator self-verify hard-fail smoke test (Task 2 Step 1) ✓.
+**Spec coverage:** generator script (Tasks 1-4) ✓; embedded-TTF Korean PDF + font resolution + reject .ttc + loud failure (Task 2) ✓; FDA-faithful self-verify (Task 2) ✓; no `.hwpx` (out of scope, honored) ✓; realistic junk where storage-blob families (`.mp4`/`.zip`/`.tar.gz`/`.sql`/`.bak`) drive s3 and password-PDF/zero-byte/unknown-ext are #5(b) honesty counter-examples, verified via FDA's own `storage_blob_bucket` (Task 3) ✓; ground_truth.csv human-reference only, no automated cohesion scorer (Task 4, not consumed by evaluator) ✓; reportlab into `.venv` only (Task 0) ✓; evaluator `--fda-home` + histogram (blob folders flagged expected) + #5 blob→s3 + honesty-boundary + routing precondition + metadata classified-rows/success-rate(seen/classified/failed/status from `runs`)/Korean search + Hangul scan + consolidated `## Summary` scoreboard prepended first (Tasks 5-8) ✓; Korean business_context draft (Task 9) ✓; run command + eyeball skeleton (assistant-written summary + #5 two-part verdict + metadata success line, #4 excludes blob folders), run NOT auto-executed (Task 10) ✓; full suite gate after evaluator change (Tasks 8 & 10) ✓; generator self-verify hard-fail smoke test (Task 2 Step 1) ✓.
 
 **Placeholder scan:** no TBD/TODO; every code step shows complete code.
 
-**Type consistency:** `korean_body`, `write_txt`, `write_docx`, `resolve_korean_font`, `write_pdf`, `assert_pdf_korean_ok`, `build_junk`, `run`, `main` consistent across Tasks 1-4; `bucket_histogram`, `s3_verdict`, `metadata_check`, `has_hangul` consistent across Tasks 5-8 and referenced with the same signatures when wired in Task 8.
+**Type consistency:** `korean_body`, `write_txt`, `write_docx`, `resolve_korean_font`, `write_pdf`, `assert_pdf_korean_ok`, `build_junk`, `run`, `main` consistent across Tasks 1-4; `bucket_histogram`, `blob_s3_check`, `s3_honesty_ok`, `metadata_check`, `has_hangul` consistent across Tasks 5-8 and referenced with the same signatures when wired in Task 8 (`blob_s3_check`/`s3_honesty_ok` return dicts; Task 8 reads `['verdict']`, `['blob_s3']` from `blob_s3_check`, `['present']`/`['missing']` from `s3_honesty_ok`, and `['rows','korean_hits','seen','classified','failed','status','error']` from `metadata_check`; the Summary block aggregates these already-computed values and is prepended via `report[:0] = summary`).
