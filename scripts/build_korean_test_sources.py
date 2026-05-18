@@ -270,8 +270,70 @@ def build_junk(out: Path, *, rng: random.Random) -> list[Path]:
     return made
 
 
-def main() -> int:  # assembled in Task 4
-    raise SystemExit("CLI assembled in Task 4")
+_FORMATS = ("docx", "pdf", "txt")
+
+
+def run(*, korean_out: Path, junk_out: Path, seed: str,
+        korean_font: str | None, korean_count: int = 120) -> int:
+    korean_out = Path(korean_out)
+    junk_out = Path(junk_out)
+    korean_out.mkdir(parents=True, exist_ok=True)
+    rng = random.Random(seed)
+
+    font_path = None
+    keys = list(_DOC_TYPES)
+    gt_rows: list[dict[str, str]] = []
+    for i in range(korean_count):
+        dt = keys[i % len(keys)]
+        fmt = _FORMATS[i % len(_FORMATS)]
+        body = korean_body(dt, i)
+        stem = f"{_DOC_TYPES[dt]}_{i:04d}"
+        path = korean_out / f"{stem}.{fmt}"
+        if fmt == "txt":
+            write_txt(path, body)
+        elif fmt == "docx":
+            write_docx(path, body)
+        else:
+            if font_path is None:
+                font_path = resolve_korean_font(korean_font)
+            write_pdf(path, body, font_path=font_path)
+            assert_pdf_korean_ok(path, must_contain=_DOC_TYPES[dt][:2])
+        gt_rows.append({
+            "abs_path": str(path.resolve()),
+            "doc_type": dt,
+            "doc_type_ko": _DOC_TYPES[dt],
+            "fmt": fmt,
+            "business_purpose": _DOC_TYPES[dt],
+        })
+
+    with (korean_out / "ground_truth.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as f:
+        w = csv.DictWriter(f, fieldnames=[
+            "abs_path", "doc_type", "doc_type_ko", "fmt", "business_purpose"
+        ])
+        w.writeheader()
+        w.writerows(gt_rows)
+
+    build_junk(junk_out, rng=rng)
+    print(f"korean: {korean_count} -> {korean_out}")
+    print(f"junk:           -> {junk_out}")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--korean-out", required=True)
+    ap.add_argument("--junk-out", required=True)
+    ap.add_argument("--seed", default="bilingual-2026-05-16")
+    ap.add_argument("--korean-font", default=None)
+    ap.add_argument("--korean-count", type=int, default=120)
+    a = ap.parse_args()
+    return run(
+        korean_out=Path(a.korean_out), junk_out=Path(a.junk_out),
+        seed=a.seed, korean_font=a.korean_font,
+        korean_count=a.korean_count,
+    )
 
 
 if __name__ == "__main__":

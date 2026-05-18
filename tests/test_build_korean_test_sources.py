@@ -134,3 +134,32 @@ def test_junk_drives_s3_via_storage_blobs_and_keeps_honesty_counterexamples(
     assert _bucket_for(zero[0]) is None, "zero-byte .bin must NOT be a blob"
     assert ".DS_Store" in by_name
     assert any(p.suffix == ".log" for p in made)
+
+
+# append to tests/test_build_korean_test_sources.py
+import csv as _csv
+
+
+def test_main_is_deterministic_and_writes_ground_truth(gen, tmp_path):
+    if not APPLE_GOTHIC.exists():
+        pytest.skip("no Korean font available")
+    k1, j1 = tmp_path / "k1", tmp_path / "j1"
+    rc = gen.run(korean_out=k1, junk_out=j1, seed="s", korean_font=None,
+                 korean_count=24)
+    assert rc == 0
+    gt = k1 / "ground_truth.csv"
+    assert gt.exists()
+    rows = list(_csv.DictReader(gt.open(encoding="utf-8")))
+    assert len(rows) == 24
+    assert set(rows[0]) == {
+        "abs_path", "doc_type", "doc_type_ko", "fmt", "business_purpose"
+    }
+    types = {r["doc_type"] for r in rows}
+    assert types == set(DOC_TYPES)  # all six covered
+    names1 = sorted(p.name for p in k1.rglob("*") if p.is_file())
+
+    k2, j2 = tmp_path / "k2", tmp_path / "j2"
+    gen.run(korean_out=k2, junk_out=j2, seed="s", korean_font=None,
+            korean_count=24)
+    names2 = sorted(p.name for p in k2.rglob("*") if p.is_file())
+    assert names1 == names2  # deterministic in seed
