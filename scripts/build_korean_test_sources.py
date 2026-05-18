@@ -181,6 +181,95 @@ def assert_pdf_korean_ok(path: Path, *, must_contain: str) -> None:
         )
 
 
+def _locked_pdf_bytes() -> bytes:
+    """A minimal encrypted (password-protected) PDF: pdftotext cannot
+    extract text from it. `.pdf` is NOT a storage-blob type, so this is a
+    #5(b) honesty counter-example — it must stay quarantined, never S3."""
+    from reportlab.pdfgen import canvas
+    import io
+
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf)
+    c.setEncrypt = None  # noqa: explicit: encryption set below
+    from reportlab.lib import pdfencrypt
+
+    enc = pdfencrypt.StandardEncryption("userpw", ownerPassword="ownerpw")
+    c = canvas.Canvas(buf, encrypt=enc)
+    c.drawString(72, 720, "locked")
+    c.save()
+    return buf.getvalue()
+
+
+def build_junk(out: Path, *, rng: random.Random) -> list[Path]:
+    """Write a realistic junk pile; return the created paths.
+
+    S3 drivers (#5a): a few files of each storage-blob family so all three
+    folders (미디어_Media / 압축파일_Archives / 백업_Backups) appear and
+    route to s3 deterministically. Honesty counter-examples (#5b): the
+    password-locked PDFs, zero-byte `.bin` files (a no-extractor type — an
+    empty `.txt` would extract ok and NOT quarantine), and an
+    unknown-extension `.xyz` binary are genuinely unreadable but NOT
+    storage-blob types — they must stay quarantined with no cloud
+    destination.
+    """
+    out.mkdir(parents=True, exist_ok=True)
+    made: list[Path] = []
+
+    # --- S3 drivers: storage-blob families (#5a) -----------------------
+    for i in range(3):  # media -> StorageBlobMedia
+        p = out / f"clip_{i:02d}.mp4"
+        p.write_bytes(b"\x00\x00\x00\x18ftypmp42" + rng.randbytes(64))
+        made.append(p)
+    for i in range(3):  # archive -> StorageBlobArchive
+        p = out / f"backup_{i:02d}.zip"
+        with zipfile.ZipFile(p, "w") as zf:
+            zf.writestr("inner.txt", f"x{i}")
+        made.append(p)
+    tgz = out / "release.tar.gz"  # archive (Path.suffix == ".gz")
+    with tarfile.open(tgz, "w:gz") as tf:
+        info = tarfile.TarInfo("inner.txt")
+        data = b"x"
+        info.size = len(data)
+        import io as _io
+
+        tf.addfile(info, _io.BytesIO(data))
+    made.append(tgz)
+    for i in range(2):  # backup -> StorageBlobBackup
+        p = out / f"db_dump_{i:02d}.sql"
+        p.write_text(
+            f"-- dump {i}\nINSERT INTO t VALUES ({i});\n", encoding="utf-8"
+        )
+        made.append(p)
+    for i in range(2):  # backup -> StorageBlobBackup
+        p = out / f"old_{i:02d}.bak"
+        p.write_bytes(rng.randbytes(256))
+        made.append(p)
+
+    # --- Honesty counter-examples: unreadable but NOT blobs (#5b) -------
+    for i in range(6):  # password-locked PDFs
+        p = out / f"locked_{i:02d}.pdf"
+        p.write_bytes(_locked_pdf_bytes())
+        made.append(p)
+    unknown = out / "mystery.xyz"  # unknown extension, no extractor
+    unknown.write_bytes(rng.randbytes(128))
+    made.append(unknown)
+    for i in range(2):  # zero-byte, NO-EXTRACTOR type. NOT .txt: an empty
+        p = out / f"empty_{i}.bin"  # .txt extracts as ok and would NOT
+        p.write_bytes(b"")          # quarantine -> false honesty signal.
+        made.append(p)
+
+    # --- Plain noise (readable / OS junk) ------------------------------
+    for i in range(3):
+        p = out / f"app_{i}.log"
+        p.write_text(f"[INFO] line {i}\n" * 50, encoding="utf-8")
+        made.append(p)
+    ds = out / ".DS_Store"
+    ds.write_bytes(b"\x00\x00\x00\x01Bud1")
+    made.append(ds)
+
+    return made
+
+
 def main() -> int:  # assembled in Task 4
     raise SystemExit("CLI assembled in Task 4")
 
