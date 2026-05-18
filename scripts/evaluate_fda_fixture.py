@@ -181,6 +181,10 @@ def metadata_check(fda_home: Path, *, query: str = "계약서") -> dict:
     return out
 
 
+def has_hangul(s: str) -> bool:
+    return any("가" <= ch <= "힣" for ch in s or "")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("fixture", help="Path to the organized fixture folder.")
@@ -188,6 +192,11 @@ def main() -> int:
         "--no-write",
         action="store_true",
         help="Print to stdout only; skip evaluation-report.md.",
+    )
+    parser.add_argument(
+        "--fda-home",
+        default=None,
+        help="Sandbox FDA_HOME dir holding metadata.db (Korean-search check).",
     )
     args = parser.parse_args()
 
@@ -333,6 +342,87 @@ def main() -> int:
         if len(missing) > 20:
             write_lines(report, f"- …and {len(missing)-20} more")
         write_lines(report, "")
+
+    write_lines(report, "## Bucket-size histogram (#4 signal)", "")
+    hist = bucket_histogram(by_bucket)
+    write_lines(report, f"- buckets: {len(hist)}")
+    write_lines(
+        report,
+        "- sizes: " + ", ".join(str(n) for _, n in hist) if hist else "- (none)",
+        "",
+    )
+
+    rdata = None
+    if routing_json.exists():
+        try:
+            rdata = json.loads(routing_json.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            rdata = None
+    a = blob_s3_check(rdata)
+    b = s3_honesty_ok(rdata)
+    write_lines(
+        report, "## #5 — storage-blob -> S3 + honesty", "",
+        f"- (a) blob->s3 high-confidence: {a['verdict']}"
+        + (f"  [{', '.join(f'{n}:lc={lc}' for n, lc in a['blob_s3'])}]"
+           if a["blob_s3"] else ""),
+        f"- (b) honesty (non-blob unreadables quarantined): {b['verdict']}"
+        f"  present={b['present']}"
+        + (f" missing={b['missing']}" if b.get("missing") else ""),
+        "",
+    )
+
+    mc = metadata_check(Path(args.fda_home)) if args.fda_home else None
+    if mc is not None:
+        write_lines(
+            report, "## Metadata layer", "",
+            f"- classified rows: {mc['rows']}",
+            f"- run success: {mc['classified']}/{mc['seen']} classified, "
+            f"{mc['failed']} failed (status: {mc['status']})",
+            f"- Korean search '계약서' hits: {mc['korean_hits']}",
+            (f"- error: {mc['error']}" if mc["error"] else ""),
+            "",
+        )
+
+    ko_buckets = sum(1 for b in by_bucket if has_hangul(b))
+    md_path = root / "routing-report.md"
+    md_ko = md_path.exists() and has_hangul(
+        md_path.read_text(encoding="utf-8", errors="ignore")
+    )
+    write_lines(
+        report, "## Korean-label presence (#goal 4)", "",
+        f"- buckets with Hangul names: {ko_buckets}/{len(by_bucket)}",
+        f"- routing-report.md contains Hangul: {'yes' if md_ko else 'no'}",
+        "",
+    )
+
+    # --- Consolidated Summary scoreboard, PREPENDED so the scorecard
+    #     opens with it (spec: "scorecard opens with a ## Summary"). All
+    #     pieces above are already computed; we just aggregate + prepend.
+    dest_counts: dict[str, int] = {}
+    for c in (rdata or {}).get("categories", []) or []:
+        d = c.get("destination", "?")
+        dest_counts[d] = dest_counts.get(d, 0) + 1
+    dest_str = ", ".join(
+        f"{k}={dest_counts[k]}" for k in sorted(dest_counts)
+    ) or "(none)"
+    md_line = (
+        f"{mc['classified']}/{mc['seen']} classified, {mc['failed']} "
+        f"failed (status {mc['status']}), searchable "
+        f"{'yes' if mc['korean_hits'] else 'no'}"
+        if mc is not None else "(no --fda-home; metadata not checked)"
+    )
+    summary = [
+        "## Summary", "",
+        f"- organized: {len(hist)} folders "
+        f"(incl. up to 3 expected blob folders — exclude for #4)",
+        f"- routed to cloud: {dest_str} | #5(a) blob->s3 {a['verdict']} | "
+        f"#5(b) honesty {b['verdict']}",
+        f"- metadata: {md_line}",
+        f"- Korean labels: {ko_buckets}/{len(by_bucket)} buckets, "
+        f"routing-report.md Hangul {'yes' if md_ko else 'no'}",
+        "",
+    ]
+    report[:0] = summary
 
     output = "\n".join(report) + "\n"
     print(output)

@@ -220,3 +220,9 @@ def test_metadata_check_counts_korean_hits_and_success_rate(
     assert missing["seen"] == 0
     assert missing["status"] == "no metadata.db"
     assert missing["error"]
+
+
+def test_has_hangul(evaluator):
+    assert evaluator.has_hangul("계약서") is True
+    assert evaluator.has_hangul("invoices/2024") is False
+    assert evaluator.has_hangul("") is False
