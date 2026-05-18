@@ -122,3 +122,39 @@ def test_bucket_histogram_sorts_by_size(evaluator):
     hist = evaluator.bucket_histogram(by_bucket)
     assert hist == [("c", 3), ("a", 2), ("b", 1)]
     assert evaluator.bucket_histogram({}) == []
+
+
+def test_blob_s3_check(evaluator):
+    fired = {"categories": [
+        {"name": "StorageBlobMedia", "destination": "s3",
+         "low_confidence": False},
+        {"name": "영업", "destination": "sharepoint",
+         "low_confidence": False},
+    ]}
+    only_misc = {"categories": [
+        {"name": "Misc", "destination": "s3", "low_confidence": True},
+    ]}
+    assert evaluator.blob_s3_check(fired)["verdict"] == "yes"
+    assert evaluator.blob_s3_check(only_misc)["verdict"] == "no"
+    assert evaluator.blob_s3_check(None)["verdict"].startswith(
+        "INCONCLUSIVE"
+    )
+
+
+def test_s3_honesty_ok(evaluator):
+    good = {"quarantine": [
+        {"bucket": "_ExtractionFailed", "ext": "pdf", "entries": [{}]},
+        {"bucket": "_NoExtractor", "ext": "xyz", "entries": [{}]},
+        {"bucket": "_NoExtractor", "ext": "bin", "entries": [{}]},
+    ]}
+    missing_bin = {"quarantine": [
+        {"bucket": "_ExtractionFailed", "ext": "pdf", "entries": [{}]},
+        {"bucket": "_NoExtractor", "ext": "xyz", "entries": [{}]},
+    ]}
+    assert evaluator.s3_honesty_ok(good)["verdict"] == "yes"
+    r = evaluator.s3_honesty_ok(missing_bin)
+    assert r["verdict"] == "no"
+    assert r["missing"] == ["bin"]
+    assert evaluator.s3_honesty_ok(None)["verdict"].startswith(
+        "INCONCLUSIVE"
+    )

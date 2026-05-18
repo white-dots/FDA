@@ -87,6 +87,53 @@ def bucket_histogram(by_bucket: dict) -> list[tuple[str, int]]:
     )
 
 
+def blob_s3_check(routing_data: dict | None) -> dict:
+    """#5(a): a StorageBlob* category reached s3 at high confidence.
+
+    Returns {"verdict": "yes"|"no"|"INCONCLUSIVE ...",
+             "blob_s3": [(name, low_confidence), ...]}.
+    None => routing-report.json missing/unreadable => the run cannot
+    answer #5 (router failures are swallowed by organize(); spec
+    precondition)."""
+    if routing_data is None:
+        return {"verdict": "INCONCLUSIVE (no routing-report.json)",
+                "blob_s3": []}
+    blob_s3 = [
+        (c.get("name", ""), bool(c.get("low_confidence")))
+        for c in routing_data.get("categories", []) or []
+        if c.get("destination") == "s3"
+        and str(c.get("name", "")).startswith("StorageBlob")
+    ]
+    ok = any(lc is False for _, lc in blob_s3)
+    return {"verdict": "yes" if ok else "no", "blob_s3": blob_s3}
+
+
+def s3_honesty_ok(
+    routing_data: dict | None,
+    *,
+    expect_ext: tuple[str, ...] = ("pdf", "xyz", "bin"),
+) -> dict:
+    """#5(b): the non-blob unreadables stayed quarantined (not S3-routed).
+
+    Proven by their quarantine buckets being present in the report:
+    password .pdf -> _ExtractionFailed/pdf, mystery.xyz ->
+    _NoExtractor/xyz, zero-byte .bin -> _NoExtractor/bin. Read from the
+    report alone. We do NOT inspect which categories reached s3 — the LLM
+    router and the all_extraction_failed short-circuit can legitimately
+    send normal categories there, so that is not a honesty signal."""
+    if routing_data is None:
+        return {"verdict": "INCONCLUSIVE (no routing-report.json)",
+                "present": [], "missing": list(expect_ext)}
+    q_exts = {
+        str(g.get("ext", "")).lower()
+        for g in routing_data.get("quarantine", []) or []
+    }
+    present = [e for e in expect_ext if e in q_exts]
+    missing = [e for e in expect_ext if e not in q_exts]
+    return {"verdict": "yes" if not missing else "no",
+            "present": present, "missing": missing}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("fixture", help="Path to the organized fixture folder.")
