@@ -345,12 +345,15 @@ def main() -> int:
 
     write_lines(report, "## Bucket-size histogram (#4 signal)", "")
     hist = bucket_histogram(by_bucket)
+    _BLOB_FOLDERS = {"미디어_Media", "압축파일_Archives", "백업_Backups"}
     write_lines(report, f"- buckets: {len(hist)}")
-    write_lines(
-        report,
-        "- sizes: " + ", ".join(str(n) for _, n in hist) if hist else "- (none)",
-        "",
-    )
+    if hist:
+        for _name, _n in hist:
+            _tag = "  (blob — exclude #4)" if _name in _BLOB_FOLDERS else ""
+            write_lines(report, f"- {_name}: {_n}{_tag}")
+    else:
+        write_lines(report, "- (none)")
+    write_lines(report, "")
 
     rdata = None
     if routing_json.exists():
@@ -413,7 +416,8 @@ def main() -> int:
     )
     summary = [
         "## Summary", "",
-        f"- organized: {len(hist)} folders "
+        f"- organized: {len(hist)} folders, "
+        f"{len(unknown) + len(missing)} discrepancies "
         f"(incl. up to 3 expected blob folders — exclude for #4)",
         f"- routed to cloud: {dest_str} | #5(a) blob->s3 {a['verdict']} | "
         f"#5(b) honesty {b['verdict']}",
