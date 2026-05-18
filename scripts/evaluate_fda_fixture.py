@@ -78,6 +78,15 @@ def write_lines(buf: list[str], *xs: str) -> None:
         buf.append(x)
 
 
+def bucket_histogram(by_bucket: dict) -> list[tuple[str, int]]:
+    """(bucket, file_count) sorted by count desc, then name. The #4
+    over-fragmentation signal: a human reads this list."""
+    return sorted(
+        ((b, len(v)) for b, v in by_bucket.items()),
+        key=lambda kv: (-kv[1], kv[0]),
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("fixture", help="Path to the organized fixture folder.")

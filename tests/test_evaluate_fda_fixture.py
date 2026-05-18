@@ -115,3 +115,10 @@ class TestMatchRouterCategoryBySubpath:
         assert evaluator._match_router_category(
             "Sales-Orders-Detailed", index,
         ) is None
+
+
+def test_bucket_histogram_sorts_by_size(evaluator):
+    by_bucket = {"a": [1, 2], "b": [1], "c": [1, 2, 3]}
+    hist = evaluator.bucket_histogram(by_bucket)
+    assert hist == [("c", 3), ("a", 2), ("b", 1)]
+    assert evaluator.bucket_histogram({}) == []
