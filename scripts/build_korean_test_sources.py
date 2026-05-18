@@ -105,6 +105,82 @@ def write_docx(path: Path, text: str) -> None:
     doc.save(str(path))
 
 
+_MACOS_FALLBACK_FONT = Path(
+    "/System/Library/Fonts/Supplemental/AppleGothic.ttf"
+)
+_VENDORED_FONT = _REPO / "tests" / "assets" / "NanumGothic.ttf"
+
+
+def resolve_korean_font(font_arg: str | None) -> Path:
+    """Resolve a usable single-face Korean .ttf.
+
+    Order: explicit arg -> vendored tests/assets/NanumGothic.ttf ->
+    macOS AppleGothic. .ttc collections are rejected. Hard error if none.
+    """
+    candidates: list[Path] = []
+    if font_arg:
+        candidates.append(Path(font_arg).expanduser())
+    candidates.append(_VENDORED_FONT)
+    candidates.append(_MACOS_FALLBACK_FONT)
+    for c in candidates:
+        if not c.exists():
+            continue
+        if c.suffix.lower() == ".ttc":
+            raise ValueError(
+                f"{c} is a .ttc collection; need a single-face .ttf "
+                f"(reportlab TTFont cannot embed a .ttc face)"
+            )
+        if c.suffix.lower() != ".ttf":
+            continue
+        return c
+    raise RuntimeError(
+        "No usable Korean .ttf found. Tried: "
+        + ", ".join(str(c) for c in candidates)
+        + ". Pass --korean-font PATH or vendor tests/assets/NanumGothic.ttf."
+    )
+
+
+def write_pdf(path: Path, text: str, *, font_path: Path) -> None:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    from reportlab.pdfgen import canvas
+
+    font_name = "KoreanBody"
+    pdfmetrics.registerFont(TTFont(font_name, str(font_path)))
+    c = canvas.Canvas(str(path), pagesize=A4)
+    c.setFont(font_name, 12)
+    y = 800
+    for line in text.split("\n"):
+        c.drawString(50, y, line)
+        y -= 18
+        if y < 50:
+            c.showPage()
+            c.setFont(font_name, 12)
+            y = 800
+    c.save()
+
+
+def assert_pdf_korean_ok(path: Path, *, must_contain: str) -> None:
+    """Self-verify a generated PDF using FDA's OWN extractor.
+
+    Faithful: the pipeline reads PDFs via fda.organize._extractors.extract
+    (pdftotext under the hood), so we verify against the same path. Raises
+    RuntimeError if extraction failed or the Korean marker is absent.
+    """
+    from fda.organize._extractors import extract
+
+    result = extract(path)
+    text = getattr(result, "text", "") or ""
+    status = getattr(result, "status", "")
+    if status != "ok" or must_contain not in text:
+        raise RuntimeError(
+            f"PDF self-verify failed for {path.name}: status={status!r} "
+            f"marker={must_contain!r} present={must_contain in text}. "
+            f"pdftotext (poppler) must be on PATH and the font must embed."
+        )
+
+
 def main() -> int:  # assembled in Task 4
     raise SystemExit("CLI assembled in Task 4")
 

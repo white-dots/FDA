@@ -49,3 +49,39 @@ def test_korean_body_contains_marker_for_each_type(gen):
 def test_korean_body_is_deterministic(gen):
     assert gen.korean_body("contract", 3) == gen.korean_body("contract", 3)
     assert gen.korean_body("contract", 3) != gen.korean_body("contract", 4)
+
+
+# append to tests/test_build_korean_test_sources.py
+
+APPLE_GOTHIC = Path("/System/Library/Fonts/Supplemental/AppleGothic.ttf")
+
+
+def test_resolve_font_rejects_ttc(gen, tmp_path):
+    ttc = tmp_path / "fake.ttc"
+    ttc.write_bytes(b"\x00")
+    with pytest.raises(ValueError, match="single-face .ttf"):
+        gen.resolve_korean_font(str(ttc))
+
+
+def test_resolve_font_falls_back_to_macos(gen):
+    if not APPLE_GOTHIC.exists():
+        pytest.skip("macOS Korean fallback font not present")
+    assert gen.resolve_korean_font(None) == APPLE_GOTHIC
+
+
+def test_pdf_roundtrips_korean_through_fda_extractor(gen, tmp_path):
+    if not APPLE_GOTHIC.exists():
+        pytest.skip("no Korean font available")
+    p = tmp_path / "k.pdf"
+    text = "계약서 라이온켐텍 분기보고서 회의록"
+    gen.write_pdf(p, text, font_path=gen.resolve_korean_font(None))
+    gen.assert_pdf_korean_ok(p, must_contain="계약서")  # raises on failure
+
+
+def test_self_verify_hard_fails_on_non_korean_pdf(gen, tmp_path):
+    if not APPLE_GOTHIC.exists():
+        pytest.skip("no Korean font available")
+    p = tmp_path / "latin.pdf"
+    gen.write_pdf(p, "no hangul here", font_path=gen.resolve_korean_font(None))
+    with pytest.raises(RuntimeError, match="self-verify"):
+        gen.assert_pdf_korean_ok(p, must_contain="계약서")
