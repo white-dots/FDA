@@ -27,6 +27,7 @@ import argparse
 import csv
 import hashlib
 import json
+import sqlite3
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -132,6 +133,52 @@ def s3_honesty_ok(
     missing = [e for e in expect_ext if e not in q_exts]
     return {"verdict": "yes" if not missing else "no",
             "present": present, "missing": missing}
+
+
+def metadata_check(fda_home: Path, *, query: str = "계약서") -> dict:
+    """Open <fda_home>/metadata.db; report classified-doc count, the run's
+    seen/classified/failed (+ derived status) from the `runs` audit row,
+    and Korean FTS hit count. Never raises — a missing/locked DB is a
+    reported finding, not a crash."""
+    out = {"rows": 0, "korean_hits": 0, "seen": 0, "classified": 0,
+           "failed": 0, "status": "unknown", "error": ""}
+    db = Path(fda_home) / "metadata.db"
+    if not db.exists():
+        out["error"] = f"metadata.db not found at {db}"
+        out["status"] = "no metadata.db"
+        return out
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            out["rows"] = conn.execute(
+                "SELECT count(*) FROM documents"
+            ).fetchone()[0]
+            out["korean_hits"] = conn.execute(
+                "SELECT count(*) FROM documents_fts "
+                "WHERE documents_fts MATCH ?",
+                (query,),
+            ).fetchone()[0]
+            row = conn.execute(
+                "SELECT files_seen, files_classified, files_failed "
+                "FROM runs ORDER BY started_at DESC LIMIT 1"
+            ).fetchone()
+            if row is None:
+                out["status"] = "no run row"
+            else:
+                out["seen"] = int(row[0] or 0)
+                out["classified"] = int(row[1] or 0)
+                out["failed"] = int(row[2] or 0)
+                out["status"] = (
+                    "ok"
+                    if out["failed"] == 0
+                    and out["classified"] == out["seen"]
+                    else "partial"
+                )
+        finally:
+            conn.close()
+    except Exception as e:  # noqa: BLE001
+        out["error"] = f"{type(e).__name__}: {e}"
+    return out
 
 
 def main() -> int:

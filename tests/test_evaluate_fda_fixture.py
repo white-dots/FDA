@@ -158,3 +158,65 @@ def test_s3_honesty_ok(evaluator):
     assert evaluator.s3_honesty_ok(None)["verdict"].startswith(
         "INCONCLUSIVE"
     )
+
+
+# append to tests/test_evaluate_fda_fixture.py
+import sqlite3
+
+
+def _seed_metadata_db(path, *, seen, classified, failed):
+    import sqlite3 as _s
+    conn = _s.connect(path)
+    conn.execute(
+        "CREATE VIRTUAL TABLE documents_fts USING fts5("
+        "summary, keywords, tokenize='trigram')"
+    )
+    conn.execute("CREATE TABLE documents (sha256 TEXT PRIMARY KEY)")
+    conn.execute(
+        "CREATE TABLE runs (run_id TEXT PRIMARY KEY, started_at TEXT, "
+        "finished_at TEXT, files_seen INT, files_classified INT, "
+        "files_failed INT)"
+    )
+    for i in range(classified):
+        conn.execute("INSERT INTO documents VALUES (?)", (f"sha{i}",))
+    conn.execute(
+        "INSERT INTO documents_fts(summary, keywords) "
+        "VALUES ('계약서 라이온켐텍 분기보고서', '계약')"
+    )
+    conn.execute(
+        "INSERT INTO runs VALUES ('r1','2026-05-17T00:00Z',"
+        "'2026-05-17T00:01Z',?,?,?)",
+        (seen, classified, failed),
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_metadata_check_counts_korean_hits_and_success_rate(
+    evaluator, tmp_path,
+):
+    ok_home = tmp_path / "ok"
+    ok_home.mkdir()
+    _seed_metadata_db(ok_home / "metadata.db", seen=5, classified=5, failed=0)
+    res = evaluator.metadata_check(ok_home, query="계약서")
+    assert res["rows"] == 5
+    assert res["korean_hits"] >= 1
+    assert (res["seen"], res["classified"], res["failed"]) == (5, 5, 0)
+    assert res["status"] == "ok"
+    assert not res["error"]
+
+    part_home = tmp_path / "part"
+    part_home.mkdir()
+    _seed_metadata_db(
+        part_home / "metadata.db", seen=10, classified=8, failed=2
+    )
+    part = evaluator.metadata_check(part_home, query="계약서")
+    assert (part["seen"], part["classified"], part["failed"]) == (10, 8, 2)
+    assert part["status"] == "partial"
+
+    missing = evaluator.metadata_check(tmp_path / "nope", query="계약서")
+    assert missing["rows"] == 0
+    assert missing["korean_hits"] == 0
+    assert missing["seen"] == 0
+    assert missing["status"] == "no metadata.db"
+    assert missing["error"]
