@@ -83,3 +83,66 @@ Needs:
   `bus.send(...)` then `bus.wait_for_response(...)` with a configurable timeout.
 
 Build that next session — current 8 tools are useful as-is.
+
+---
+
+## Remote HTTP MCP server: `aonebnh`
+
+A second MCP server, reached over HTTP through a Cloudflare tunnel rather than
+stdio-over-SSH. Registered at **project scope** so every session in this repo
+picks it up.
+
+### Files
+
+- `.mcp.json` — server definition (committed). The bearer token is *not* in it;
+  the header interpolates `${AONEBNH_TOKEN}`.
+- `.claude/settings.json` — pre-approves `aonebnh` via `enabledMcpjsonServers`,
+  so sessions don't prompt for the project-scoped server (committed).
+- `.claude/settings.local.json` — holds `AONEBNH_TOKEN` in its `env` block.
+  Gitignored (`.gitignore:52`); the token never reaches the repo.
+
+```jsonc
+// .mcp.json
+{
+  "mcpServers": {
+    "aonebnh": {
+      "type": "http",
+      "url": "https://pulse-meeting-phone-vista.trycloudflare.com/mcp",
+      "headers": { "Authorization": "Bearer ${AONEBNH_TOKEN}" }
+    }
+  }
+}
+```
+
+```jsonc
+// .claude/settings.local.json  (gitignored — create on each machine)
+{
+  "env": { "AONEBNH_TOKEN": "aonebnh_…" }
+}
+```
+
+Alternative to the settings file: export the variable in your shell profile
+(`export AONEBNH_TOKEN=aonebnh_…`) before launching `claude`. Either source
+satisfies the `${AONEBNH_TOKEN}` expansion.
+
+### Verify
+
+```bash
+claude mcp get aonebnh      # confirms scope, URL, header
+claude mcp list             # health check — should report ✓ Connected
+# then inside a session:
+/mcp                        # lists the server and its tools
+```
+
+First run in the repo may ask once to trust the project-scoped server; approve it.
+
+### Caveats
+
+- `trycloudflare.com` hostnames are **ephemeral** — a quick tunnel gets a new
+  subdomain every time `cloudflared` restarts. When the URL changes, edit the
+  `url` in `.mcp.json`; the token stays put.
+- The token is a long-lived bearer credential. Rotate it on the server side if
+  it leaks, and keep it out of `.mcp.json`, commits, and screenshots.
+- Cloud/remote Claude Code sessions may not reach the tunnel at all: their
+  egress proxy denies non-allowlisted hosts (`connect_rejected`). This server is
+  effectively local-machine only unless the host is allowlisted.

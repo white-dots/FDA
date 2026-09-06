@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "aonebnh": {
+      "type": "http",
+      "url": "https://pulse-meeting-phone-vista.trycloudflare.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${AONEBNH_TOKEN}"
+      }
+    }
+  }
+}
